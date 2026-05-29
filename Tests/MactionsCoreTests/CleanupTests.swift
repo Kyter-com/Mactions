@@ -14,9 +14,9 @@ final class CleanupTests: XCTestCase {
     XCTAssertEqual(HostCleanup.runsRoot().lastPathComponent, "runs")
   }
 
-  func testPurgeRunsIsIdempotentAndNonThrowing() {
-    // Safe to call when nothing exists and twice in a row.
-    HostCleanup.purgeRuns()
-    HostCleanup.purgeRuns()
-  }
+  // NOTE: we deliberately do NOT call purgeRuns()/purgeAll() from tests. They
+  // operate on the real ~/.mactions and, when the suite runs *inside* a
+  // Mactions-managed runner, the job itself lives in ~/.mactions/runs — so a
+  // purge would delete the running job out from under itself. Their logic is a
+  // one-line FileManager.removeItem; the path test above covers the addressing.
 }
