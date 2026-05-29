@@ -156,6 +156,8 @@ struct MenuContentView: View {
       Stepper("Runners per repo: \(app.runnersPerRepo)", value: $app.runnersPerRepo, in: 1...5)
         .disabled(app.state != .offline)
 
+      windowsSection
+
       Button {
         app.toggleOnline()
       } label: {
@@ -171,6 +173,54 @@ struct MenuContentView: View {
 
       if !app.runners.isEmpty { runnerList }
     }
+  }
+
+  // MARK: Windows (opt-in)
+
+  /// Windows support is OFF by default. The "Set up Windows runner" button is the
+  /// ONLY trigger for any ISO download / base-image build — nothing heavy ever
+  /// happens automatically. Once an image is built, a toggle adds a Windows fleet
+  /// (labels `[self-hosted, Windows, mactions]`) alongside the macOS one.
+  private var windowsSection: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      Divider()
+      Text("Windows runner (experimental)")
+        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+
+      if app.windowsImageReady {
+        Toggle(isOn: Binding(
+          get: { app.windowsEnabled },
+          set: { app.setWindowsEnabled($0) }
+        )) {
+          Text("Add a Windows fleet ([self-hosted, Windows, mactions])").font(.caption)
+        }
+        .toggleStyle(.switch)
+        .controlSize(.mini)
+        .disabled(app.state != .offline)
+        Button("Rebuild / update Windows image") { app.setUpWindowsRunner() }
+          .buttonStyle(.bordered).controlSize(.small)
+          .disabled(app.state != .offline || app.windowsSetupBusy)
+      } else {
+        Button {
+          app.setUpWindowsRunner()
+        } label: {
+          HStack(spacing: 6) {
+            if app.windowsSetupBusy { ProgressView().controlSize(.small) }
+            Label("Set up Windows runner", systemImage: "pc")
+          }
+        }
+        .buttonStyle(.bordered).controlSize(.small)
+        .disabled(app.state != .offline || app.windowsSetupBusy)
+        Text(
+          app.windowsBackendAvailable
+            ? "Downloads the latest Win11 ARM64 ISO and builds a throwaway base VM (multi-GB, one time). Not yet live-verified."
+            : "Needs Parallels (recommended) or UTM installed. Downloads the latest Win11 ARM64 ISO + builds a base VM when set up."
+        )
+        .font(.caption2).foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+      }
+    }
+    .onAppear { app.checkForWindowsImageUpdate() }
   }
 
   private var repoPicker: some View {

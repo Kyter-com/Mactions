@@ -59,6 +59,40 @@ public enum HostCleanup {
     }
   }
 
+  /// Best-effort: delete leftover ephemeral Windows VM clones from a crashed
+  /// session. The Windows provider names its throwaway clones `mactions-…`, the
+  /// same prefix we scope teardown to, so we never touch a non-Mactions VM.
+  /// No-op if neither `prlctl` (Parallels) nor `utmctl` (UTM) is present.
+  ///
+  /// Honors the ephemerality bar across crashes: if the app died mid-job the
+  /// hypervisor can leave a powered-down clone (with its `_work` checkout)
+  /// behind; this reaps it on the next go-online.
+  public static func purgeStrayWindowsClones() {
+    // Parallels: `prlctl list --all -o name` prints one VM name per line.
+    if let prlctl = Shell.which("prlctl"),
+      let list = try? Shell.run(prlctl, ["list", "--all", "-o", "name"]), list.ok {
+      for name in windowsCloneNames(in: list.stdout) {
+        _ = try? Shell.run(prlctl, ["stop", name, "--kill"])
+        _ = try? Shell.run(prlctl, ["delete", name])
+      }
+    }
+    // UTM: `utmctl list` prints a table whose rows include the VM name.
+    let utmctl = "/Applications/UTM.app/Contents/MacOS/utmctl"
+    if FileManager.default.isExecutableFile(atPath: utmctl),
+      let list = try? Shell.run(utmctl, ["list"]), list.ok {
+      for name in windowsCloneNames(in: list.stdout) {
+        _ = try? Shell.run(utmctl, ["stop", name])
+        _ = try? Shell.run(utmctl, ["delete", name])
+      }
+    }
+  }
+
+  /// Pull our `mactions-…` clone names out of a VM-CLI listing (pure → testable).
+  static func windowsCloneNames(in listing: String) -> Set<String> {
+    let tokens = listing.components(separatedBy: .whitespacesAndNewlines)
+    return Set(tokens.filter { $0.hasPrefix("mactions-") })
+  }
+
   /// Best-effort: kill leftover runner-agent processes (run.sh / Runner.Listener
   /// and their job children) from a crashed/force-quit session. On a hard exit
   /// the agents reparent to launchd and keep running (and holding their GitHub
@@ -75,5 +109,6 @@ public enum HostCleanup {
     killOrphanRunnerProcesses()
     purgeRuns()
     purgeStrayTartClones()
+    purgeStrayWindowsClones()
   }
 }
