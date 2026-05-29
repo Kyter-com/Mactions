@@ -22,12 +22,16 @@ public enum WindowsImage {
     public let arch: String
     /// UUP dump's update UUID (what the download/convert step keys off).
     public let uuid: String
+    /// Unix timestamp the row was published — a deterministic tiebreaker when two
+    /// rows share a build number. Optional: a malformed row may omit it.
+    public let created: Int?
 
-    public init(title: String, build: String, arch: String, uuid: String) {
+    public init(title: String, build: String, arch: String, uuid: String, created: Int? = nil) {
       self.title = title
       self.build = build
       self.arch = arch
       self.uuid = uuid
+      self.created = created
     }
   }
 
@@ -67,39 +71,98 @@ public enum WindowsImage {
   }
 
   /// Parse `listid.php`'s JSON into our `Build` rows, keeping only `arm64`
-  /// entries (the endpoint's free-text search can return amd64/x86 too). Order
-  /// is preserved — the API returns newest-first when `sortByDate=1`.
+  /// entries (the endpoint's free-text search can return amd64/x86 too).
+  ///
+  /// IMPORTANT: the live API sends `response.builds` as a JSON OBJECT keyed by
+  /// stringified ints (`"1","2","4",…`), NOT an array — decoding it as `[Row]`
+  /// silently yields `[]`. Order is therefore UNDEFINED here (a dictionary has
+  /// none); callers must SELECT by build number, not trust position. Use
+  /// `selectLatestGA` rather than `.first`.
   public static func parseBuilds(_ data: Data) -> [Build] {
     struct Row: Decodable {
       let title: String
       let build: String
       let arch: String
       let uuid: String
+      let created: Int?
     }
     struct Response: Decodable {
-      struct Inner: Decodable { let builds: [Row]? }
+      struct Inner: Decodable { let builds: [String: Row]? }
       let response: Inner?
     }
     guard let decoded = try? JSONDecoder().decode(Response.self, from: data),
-      let rows = decoded.response?.builds
+      let dict = decoded.response?.builds
     else { return [] }
     return
-      rows
+      Array(dict.values)
       .filter { $0.arch.lowercased() == "arm64" }
-      .map { Build(title: $0.title, build: $0.build, arch: $0.arch, uuid: $0.uuid) }
+      .map { Build(title: $0.title, build: $0.build, arch: $0.arch, uuid: $0.uuid, created: $0.created) }
   }
 
-  /// Resolve the single latest Win11 ARM64 build (the first arm64 row UUP dump
-  /// returns newest-first). Throws `noBuildFound` if the listing is empty.
+  /// Major build prefixes that have actually shipped as **retail GA** Win11
+  /// ARM64 media. A title-substring filter alone is unsafe: the not-yet-GA
+  /// 26H1/28000 branch carries a GA-style ", version 26H1" title, so we pin to
+  /// majors that have really GA'd.
+  ///
+  /// MAINTENANCE TOUCHPOINT (conflicts with the "no pinned values" preference):
+  /// bump when a new HNN label actually GAs. A fully-automated follow-up would
+  /// derive this from majors that ALSO appear on a clean retail GA title and
+  /// never only via Insider/Preview/.NET rows — see issue tracker.
+  public static let knownGAMajors: Set<Int> = [22000, 22621, 22631, 26100, 26200]
+
+  /// Substrings that mark a row as NOT a clean base image even when it carries a
+  /// "version" label (Insider, preview, cumulative/security/.NET updates, etc.).
+  static let nonBaseTitleSubstrings = [
+    "insider", "preview update", "cumulative update", ".net framework",
+    "feature update to windows", "oobe update", "security update",
+    "update for windows 11 (",
+  ]
+
+  /// A `listid.php` row usable as a runner base image: a clean Win11 GA feature
+  /// update (e.g. "Windows 11, version 25H2") on a known-GA major prefix. The
+  /// newest rows from the API are usually Insider/canary/preview, so this is
+  /// what keeps us off prerelease media.
+  public static func isGABase(_ b: Build) -> Bool {
+    guard b.arch.lowercased() == "arm64" else { return false }
+    let title = b.title.lowercased()
+    guard title.contains("windows 11, version ") else { return false }
+    guard !nonBaseTitleSubstrings.contains(where: { title.contains($0) }) else { return false }
+    guard let majorStr = b.build.split(separator: ".").first, let major = Int(majorStr) else {
+      return false
+    }
+    return knownGAMajors.contains(major)
+  }
+
+  /// Pick the single latest STABLE GA Win11 ARM64 build from parsed rows:
+  /// GA-filter, then the highest build by DOTTED-NUMERIC comparison (never
+  /// lexical, never API order), tie-broken by the newest `created` timestamp.
+  /// `nil` if no GA row is present (so the caller fails loudly rather than
+  /// shipping a preview image).
+  public static func selectLatestGA(_ builds: [Build]) -> Build? {
+    builds
+      .filter(isGABase)
+      .max { a, b in
+        switch compareBuilds(a.build, b.build) {
+        case .orderedAscending: return true
+        case .orderedDescending: return false
+        case .orderedSame: return (a.created ?? Int.min) < (b.created ?? Int.min)
+        }
+      }
+  }
+
+  /// Resolve the single latest STABLE GA Win11 ARM64 build. Selects by GA filter
+  /// + numeric build (NOT `.first` — the API order is mixed-channel and the
+  /// dict-decoded rows are unordered). Throws `noBuildFound` if no GA build is
+  /// present.
   public static func latestBuild(
     search: String = "Windows 11 arm64",
     session: URLSession = .shared
   ) async throws -> Build {
     let (data, _) = try await session.data(for: latestBuildsRequest(search: search))
-    guard let first = parseBuilds(data).first else {
+    guard let latest = selectLatestGA(parseBuilds(data)) else {
       throw ImageError.noBuildFound(search)
     }
-    return first
+    return latest
   }
 
   // MARK: - Build-id comparison (pure → unit-testable)

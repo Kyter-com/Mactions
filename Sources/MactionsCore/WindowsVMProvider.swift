@@ -33,24 +33,45 @@ public protocol WindowsVMCLI: Sendable {
   func ipArgs(clone: String) -> [String]
   /// Pull a single IPv4 address out of the `ip` command's stdout.
   func parseIP(from output: String) -> String?
+  /// Query the clone's power state. The provider parses it via `parseIsStopped`.
+  func statusArgs(clone: String) -> [String]
+  /// `true` when the status/list output shows the VM powered-off/stopped.
+  func parseIsStopped(from output: String) -> Bool
+  /// Force/kill power-off — escalation when a graceful `stop` doesn't settle.
+  func forceStopArgs(clone: String) -> [String]
+}
+
+/// True for a real, usable guest IPv4: four in-range octets, not 0.0.0.0, not
+/// APIPA (169.254/16), and not a netmask/broadcast-looking 255.x value (so a
+/// gateway/netmask token in a CLI dump can't masquerade as the lease).
+func isUsableIPv4(_ s: String) -> Bool {
+  let octs = s.split(separator: ".").compactMap { Int($0) }
+  guard octs.count == 4, octs.allSatisfy({ (0...255).contains($0) }) else { return false }
+  if octs.allSatisfy({ $0 == 0 }) { return false }      // 0.0.0.0 placeholder
+  if octs[0] == 169 && octs[1] == 254 { return false }  // APIPA link-local
+  if octs[0] == 255 { return false }                    // mask/broadcast
+  return true
 }
 
 extension WindowsVMCLI {
-  /// First IPv4-looking token in the output. `prlctl`/`utmctl` print the address
-  /// on its own (utmctl) or embedded in a list line (prlctl `-f`), so we scan.
+  /// First usable-IPv4 token in the output. `utmctl ip-address` prints the
+  /// address on its own line; the default scan handles that. (Parallels
+  /// overrides this with a JSON parse — see `ParallelsCLI`.)
   public func parseIP(from output: String) -> String? {
-    let tokens = output.components(separatedBy: CharacterSet(charactersIn: " \t\n\r,/"))
-    return tokens.first { token in
-      let parts = token.split(separator: ".")
-      guard parts.count == 4 else { return false }
-      // Skip the all-zero placeholder Parallels prints before DHCP completes.
-      if token == "0.0.0.0" { return false }
-      return parts.allSatisfy { part in
-        guard let n = Int(part), (0...255).contains(n) else { return false }
-        return true
-      }
-    }
+    output
+      .components(separatedBy: CharacterSet(charactersIn: " \t\n\r,/"))
+      .first(where: isUsableIPv4)
   }
+
+  /// Default power-state read: the listing/status mentions "stopped" and isn't
+  /// mid-transition ("stopping"). Both backends print one of these tokens.
+  public func parseIsStopped(from output: String) -> Bool {
+    let o = output.lowercased()
+    return o.contains("stopped") && !o.contains("stopping")
+  }
+
+  /// Default force-stop == the normal stop (override where a kill flag exists).
+  public func forceStopArgs(clone: String) -> [String] { stopArgs(clone: clone) }
 }
 
 /// Parallels Desktop Pro/Business via `prlctl` — the recommended backend.
@@ -73,8 +94,21 @@ public struct ParallelsCLI: WindowsVMCLI {
   // `--kill` forces an immediate power-off rather than a graceful ACPI shutdown,
   // matching the throwaway-PC model (we're about to delete the clone anyway).
   public func stopArgs(clone: String) -> [String] { ["stop", clone, "--kill"] }
+  public func forceStopArgs(clone: String) -> [String] { ["stop", clone, "--kill"] }
   public func deleteArgs(clone: String) -> [String] { ["delete", clone] }
-  public func ipArgs(clone: String) -> [String] { ["list", "-f", "--info", clone] }
+  public func statusArgs(clone: String) -> [String] { ["status", clone] }
+  // Query structured JSON and read the labeled lease field — scraping `-f --info`
+  // text yields a netmask/gateway/Tools-version as the "first IPv4 token". This
+  // mirrors what Parallels' own vagrant driver does.
+  public func ipArgs(clone: String) -> [String] { ["list", clone, "--full", "--json"] }
+  public func parseIP(from output: String) -> String? {
+    guard let data = output.data(using: .utf8),
+      let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+      let ip = arr.first?["ip_configured"] as? String,
+      ip != "-", !ip.isEmpty, isUsableIPv4(ip)
+    else { return nil }
+    return ip  // ip_configured is a bare address, no /mask
+  }
 }
 
 /// UTM via `utmctl` — the free/open-source fallback (QEMU backend).
@@ -98,6 +132,7 @@ public struct UTMCLI: WindowsVMCLI {
   public func startArgs(clone: String) -> [String] { ["start", clone, "--hide"] }
   public func stopArgs(clone: String) -> [String] { ["stop", clone] }
   public func deleteArgs(clone: String) -> [String] { ["delete", clone] }
+  public func statusArgs(clone: String) -> [String] { ["status", clone] }
   public func ipArgs(clone: String) -> [String] { ["ip-address", clone] }
 }
 
@@ -137,7 +172,12 @@ public final class WindowsVMProvider: RunnerProvider {
   /// purpose: Windows MAX_PATH (260 chars) bites deep `node_modules` trees.
   private let runnerPath: String
   private let ipTimeout: TimeInterval
+  private let sshTimeout: TimeInterval
   private let sshpassPath: String?
+  /// Teardown budget: how long to wait for a confirmed power-off before deleting
+  /// the clone, and the poll/escalation interval. Injectable so tests run fast.
+  private let stopSettleTimeout: TimeInterval
+  private let stopPollInterval: TimeInterval
 
   /// Clone name carries the same `mactions-` prefix `HostCleanup` and the
   /// orchestrator use to identify (and reap) our own VMs.
@@ -169,7 +209,10 @@ public final class WindowsVMProvider: RunnerProvider {
     sshPassword: String? = "P@ssw0rd-throwaway",
     runnerPath: String = "C:\\actions-runner",
     ipTimeout: TimeInterval = 240,
-    sshpassPath: String? = Shell.which("sshpass")
+    sshTimeout: TimeInterval = 120,
+    sshpassPath: String? = Shell.which("sshpass"),
+    stopSettleTimeout: TimeInterval = 12,
+    stopPollInterval: TimeInterval = 1.5
   ) {
     self.id = id
     self.baseImage = baseImage
@@ -178,7 +221,10 @@ public final class WindowsVMProvider: RunnerProvider {
     self.sshPassword = sshPassword
     self.runnerPath = runnerPath
     self.ipTimeout = ipTimeout
+    self.sshTimeout = sshTimeout
     self.sshpassPath = sshpassPath
+    self.stopSettleTimeout = stopSettleTimeout
+    self.stopPollInterval = stopPollInterval
   }
 
   public var isRunning: Bool {
@@ -197,6 +243,26 @@ public final class WindowsVMProvider: RunnerProvider {
       do {
         try Shell.runChecked(cli.executable, cli.startArgs(clone: cloneName))
         let ip = try waitForIP()
+        // A fresh Win11 clone's sshd isn't up the instant it gets a lease. Probe
+        // a no-op SSH until the transport is ready (exit != 255), bounded by
+        // sshTimeout, BEFORE running the job — and run the job exactly ONCE, so a
+        // transport race can never re-launch run.cmd (which would double-register
+        // the JIT runner).
+        let readyDeadline = Date().addingTimeInterval(sshTimeout)
+        let probe = sshArgs(ip: ip, remote: "exit 0")
+        var ready = false
+        while Date() < readyDeadline {
+          if let r = try? Shell.run(probe.executable, probe.arguments), r.status != 255 {
+            ready = true
+            break
+          }
+          Thread.sleep(forTimeInterval: 5)
+        }
+        guard ready else {
+          throw Shell.ShellError.nonZeroExit(
+            command: "ssh \(sshUser)@\(ip)", status: -1,
+            stderr: "guest sshd never accepted a connection within \(Int(sshTimeout))s")
+        }
         // SSH BLOCKS until run.cmd's single job finishes (then run.cmd exits).
         // This is how we observe job completion, since `start` did not block.
         let ssh = sshInvocation(ip: ip, jitConfig: jitConfig)
@@ -233,9 +299,34 @@ public final class WindowsVMProvider: RunnerProvider {
     tornDown = true
     running = false
     lock.unlock()
+    // `start`/`stop` on these CLIs are non-blocking, so a `delete` fired right
+    // after `stop` races a still-powering-off VM and refuses — leaking the
+    // throwaway disk (ephemerality broken). Poll for a confirmed stop on a
+    // SHORT bounded budget (so the quit path can't wedge), escalating to a
+    // force-kill if it lingers, then delete with a couple of retries. Any
+    // residual leak is reaped by `HostCleanup.purgeStrayWindowsClones` on the
+    // next go-online.
     _ = try? Shell.run(cli.executable, cli.stopArgs(clone: cloneName))
-    _ = try? Shell.run(cli.executable, cli.deleteArgs(clone: cloneName))
-    return true
+    let deadline = Date().addingTimeInterval(stopSettleTimeout)
+    var stopped = false
+    while Date() < deadline {
+      if let r = try? Shell.run(cli.executable, cli.statusArgs(clone: cloneName)), r.ok,
+        cli.parseIsStopped(from: r.stdout)
+      {
+        stopped = true
+        break
+      }
+      _ = try? Shell.run(cli.executable, cli.forceStopArgs(clone: cloneName))
+      Thread.sleep(forTimeInterval: stopPollInterval)
+    }
+    for _ in 0..<3 {
+      if let r = try? Shell.run(cli.executable, cli.deleteArgs(clone: cloneName)), r.ok {
+        return true
+      }
+      if !stopped { _ = try? Shell.run(cli.executable, cli.forceStopArgs(clone: cloneName)) }
+      Thread.sleep(forTimeInterval: stopPollInterval)
+    }
+    return true  // possible leak; purgeStrayWindowsClones reaps it next go-online
   }
 
   // MARK: Pure builders (unit-testable without a VM)
@@ -246,7 +337,10 @@ public final class WindowsVMProvider: RunnerProvider {
   /// is additionally wired to power the VM off after the agent exits, but we
   /// don't rely on that for `onExit` — the blocking SSH command is our signal.
   func remoteCommand(jitConfig: String) -> String {
-    "cd /d \(runnerPath) && run.cmd --jitconfig \(jitConfig)"
+    // Quote the base64 JIT config: it draws from the base64 alphabet (incl. `+`,
+    // `/`, `=`) and is interpolated straight into the cmd.exe command line, so an
+    // unquoted value risks cmd metacharacter/word-split surprises.
+    "cd /d \(runnerPath) && run.cmd --jitconfig \"\(jitConfig)\""
   }
 
   /// Full SSH invocation (executable + args), routed through `sshpass` when a
@@ -254,17 +348,23 @@ public final class WindowsVMProvider: RunnerProvider {
   /// `StrictHostKeyChecking=no` + `UserKnownHostsFile=/dev/null` because the
   /// throwaway clone's host key changes every run — matches `TartProvider`.
   func sshInvocation(ip: String, jitConfig: String) -> (executable: String, arguments: [String]) {
-    let sshArgs = [
+    sshArgs(ip: ip, remote: remoteCommand(jitConfig: jitConfig))
+  }
+
+  /// Build an SSH invocation for an arbitrary remote command (the job launch, or
+  /// a no-op readiness probe), routed through `sshpass` when a password is set.
+  func sshArgs(ip: String, remote: String) -> (executable: String, arguments: [String]) {
+    let args = [
       "-o", "StrictHostKeyChecking=no",
       "-o", "UserKnownHostsFile=/dev/null",
       "-o", "ConnectTimeout=15",
       "\(sshUser)@\(ip)",
-      remoteCommand(jitConfig: jitConfig),
+      remote,
     ]
     if let sshPassword, let sshpassPath {
-      return (sshpassPath, ["-p", sshPassword, "/usr/bin/ssh"] + sshArgs)
+      return (sshpassPath, ["-p", sshPassword, "/usr/bin/ssh"] + args)
     }
-    return ("/usr/bin/ssh", sshArgs)
+    return ("/usr/bin/ssh", args)
   }
 
   // MARK: IP polling
@@ -281,10 +381,14 @@ public final class WindowsVMProvider: RunnerProvider {
       }
       Thread.sleep(forTimeInterval: 3)
     }
+    let hint =
+      cli is UTMCLI
+      ? "UTM's `utmctl ip-address` reports a lease only via the QEMU guest agent, which has no first-class arm64-Windows build (UTM #5134) — discover the IP host-side from the vmnet DHCP lease, or install a qemu-ga workaround in the base image."
+      : "Check the guest's network/DHCP and that guest tools are installed."
     throw Shell.ShellError.nonZeroExit(
-      command: "\(cli.executable) ip \(cloneName)",
+      command: "\(cli.executable) \(cli.ipArgs(clone: cloneName).joined(separator: " "))",
       status: -1,
-      stderr: "timed out waiting for Windows VM IP after \(Int(ipTimeout))s")
+      stderr: "no guest IP after \(Int(ipTimeout))s. \(hint)")
   }
 }
 
@@ -355,5 +459,18 @@ public struct WindowsVMProviderFactory: RunnerProviderFactory {
       return ParallelsCLI(executable: path)
     }
     return nil
+  }
+
+  /// `true` iff a base VM named `name` exists AND is powered off — the only state
+  /// from which a per-job clone is reliable. Used to gate `windowsImageReady`
+  /// rather than trusting the prep script's exit code: the UTM path only prints
+  /// manual steps, and even on Parallels the OS install happens on first boot, so
+  /// "script exited 0" never means "bootable base image exists". A probe error
+  /// (e.g. utmctl outside an Aqua session) returns `false`, never throws.
+  public static func baseImagePoweredOff(name: String, cli: WindowsVMCLI) -> Bool {
+    guard let r = try? Shell.run(cli.executable, cli.statusArgs(clone: name)), r.ok else {
+      return false
+    }
+    return cli.parseIsStopped(from: r.stdout)
   }
 }

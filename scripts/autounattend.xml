@@ -35,6 +35,36 @@
     <component name="Microsoft-Windows-Setup"
                processorArchitecture="arm64"
                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <!--
+        Win11 hardware-requirement bypass. Setup runs the compatibility gate very
+        early in windowsPE; without these LabConfig keys it halts at the blue
+        "This PC can't run Windows 11" page and the unattended install hangs
+        forever. HKLM\SYSTEM\Setup\LabConfig is the live WinPE Setup hive the
+        check reads. Required for an Apple-Silicon VM guest (no real TPM 2.0 /
+        Secure Boot). wcm is declared inline because it isn't in scope here.
+      -->
+      <RunSynchronous xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassCPUCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassStorageCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
       <DiskConfiguration>
         <Disk wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
           <DiskID>0</DiskID>
@@ -85,6 +115,37 @@
     </component>
   </settings>
 
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Deployment"
+               processorArchitecture="arm64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <RunSynchronous>
+        <!--
+          Best-effort skip of the "Let's connect you to a network" OOBE gate. On
+          25H2 (build 26200) this key may be ignored — the provisioned LocalAccount
+          + AutoLogon below is what actually avoids the MSA/network OOBE; this is
+          belt-and-suspenders. NOTE: the 25H2 ConX setup path can still drop into
+          interactive OOBE; that handoff is NOT yet live-verified on a real boot.
+        -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg add HKLM\SYSTEM\CurrentControlSet\Control\OOBE /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <!--
+          Stage bootstrap.ps1 onto C:\setup\ from whichever removable drive holds
+          it, so first-logon doesn't depend on the unattend CD still being mounted
+          (it can be ejected/relettered post-install). FirstLogonCommands prefers
+          C:\setup\ and falls back to a full drive scan.
+        -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>cmd /c md C:\setup 2&gt;nul &amp; for %d in (D E F G H I) do @if exist %d:\setup\bootstrap.ps1 copy /y %d:\setup\bootstrap.ps1 C:\setup\</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+
   <settings pass="oobeSystem">
     <component name="Microsoft-Windows-Shell-Setup"
                processorArchitecture="arm64"
@@ -116,17 +177,15 @@
       </OOBE>
       <FirstLogonCommands>
         <!--
-          The unattend ISO stages bootstrap.ps1 at \setup\bootstrap.ps1 on a
-          REMOVABLE drive whose letter we can't predict (D:, E:, …), so we can't
-          hard-code "C:\setup\bootstrap.ps1" — nothing ever copies it to C:.
-          Instead, scan every drive root for \setup\bootstrap.ps1 and run the
-          first one found. (Robust against drive-letter shuffle and against the
-          unattend media being a CD vs a USB.) -ExecutionPolicy Bypass because a
+          The specialize pass copies bootstrap.ps1 to C:\setup\, so prefer that
+          (independent of the unattend CD still being mounted). Fall back to
+          scanning every drive root for \setup\bootstrap.ps1 (robust against
+          drive-letter shuffle and CD-vs-USB). -ExecutionPolicy Bypass because a
           fresh install's default policy would otherwise block the script.
         -->
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = Get-PSDrive -PSProvider FileSystem | ForEach-Object { Join-Path $_.Root 'setup\bootstrap.ps1' } | Where-Object { Test-Path $_ } | Select-Object -First 1; if ($s) { &amp; $s } else { Write-Host 'bootstrap.ps1 not found on any drive'; exit 1 }"</CommandLine>
+          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = if (Test-Path 'C:\setup\bootstrap.ps1') { 'C:\setup\bootstrap.ps1' } else { Get-PSDrive -PSProvider FileSystem | ForEach-Object { Join-Path $_.Root 'setup\bootstrap.ps1' } | Where-Object { Test-Path $_ } | Select-Object -First 1 }; if ($s) { &amp; $s } else { Write-Host 'bootstrap.ps1 not found on any drive'; exit 1 }"</CommandLine>
           <Description>Locate + run bootstrap.ps1 from the unattend media (OpenSSH + win-arm64 runner agent)</Description>
         </SynchronousCommand>
       </FirstLogonCommands>

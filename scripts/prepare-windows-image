@@ -93,8 +93,29 @@ fi
 # download package + run its convert script to produce an ISO. This is the only
 # automatable source for the official media (Microsoft's own ISO is a manual,
 # time-limited interactive download).
-UUP_API="https://api.uupdump.net"
+UUP_API="https://api.uupdump.net"   # JSON list endpoints (listid.php / listeditions.php)
+UUP_WWW="https://uupdump.net"        # autodl=2 convert ZIP is front-end-only; the api host 400s UNSUPPORTED_COMBINATION
 RECORDED_BUILD=""
+
+# Fetch a UUP dump URL with backoff, writing the body to OUTFILE. Retries on
+# network errors, HTTP 429 (UUP dump's ~20-25s per-IP throttle), and 5xx; fails
+# fast on other 4xx (e.g. a permanent 400). Progress goes to stderr so callers
+# capturing stdout stay clean.
+uup_curl() {                       # uup_curl OUTFILE URL [extra curl args...]
+  local out="$1" url="$2"; shift 2
+  local delay=5 attempt code
+  for attempt in 1 2 3 4 5; do
+    code="$(curl -sSL -o "$out" -w '%{http_code}' "$@" "$url" 2>/dev/null)" || code="000"
+    case "$code" in
+      2??) return 0 ;;
+      429 | 5?? | 000) : ;;                                  # transient -> retry
+      *) echo "    UUP request failed (HTTP $code), not retryable" >&2; return 1 ;;
+    esac
+    echo "    UUP request failed (attempt $attempt/5, HTTP $code); retrying in ${delay}s..." >&2
+    sleep "$delay"; delay=$((delay < 30 ? delay * 2 : 30))   # cap >observed throttle window
+  done
+  return 1
+}
 
 require_converter_deps() {
   # Mirrors WindowsImage.converterDependencies in MactionsCore. The upstream
@@ -127,37 +148,78 @@ auto_download_iso() {
   command -v python3 >/dev/null 2>&1 || die "python3 is required to parse the UUP dump JSON."
   require_converter_deps
 
-  echo "==> Resolving the latest Windows 11 ARM64 retail build from UUP dump" >&2
+  echo "==> Resolving the latest stable GA Windows 11 ARM64 build from UUP dump" >&2
   local listing uuid build
-  listing="$(curl -fsSL "$UUP_API/listid.php?search=Windows%2011%20arm64&sortByDate=1")" \
-    || die "couldn't reach the UUP dump API ($UUP_API)."
-  # First arm64 row (the API returns newest-first with sortByDate=1).
+  listing="$(mktemp)"
+  uup_curl "$listing" "$UUP_API/listid.php?search=Windows%2011%20arm64&sortByDate=1" \
+    || die "couldn't reach the UUP dump API after retries ($UUP_API)."
+  # listid.php returns response.builds as an OBJECT keyed by stringified ints
+  # (NOT an array), mixing channels — the newest rows are usually Insider/canary/
+  # preview. Walk the dict VALUES, keep clean GA arm64 feature updates on a
+  # known-GA major, and pick the highest build NUMERICALLY. Mirrors
+  # WindowsImage.selectLatestGA in MactionsCore (keep the two in sync).
   read -r uuid build < <(python3 - "$listing" <<'PY'
-import json, sys
+import json, sys, re
 try:
-    data = json.loads(sys.argv[1])
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
 except Exception:
     sys.exit("could not parse UUP dump JSON")
-builds = (data.get("response") or {}).get("builds") or []
-for b in builds:
-    if str(b.get("arch", "")).lower() == "arm64":
-        print(b.get("uuid", ""), b.get("build", ""))
-        break
+
+raw = (data.get("response") or {}).get("builds")
+# Real API: builds is a DICT keyed by stringified ints. Tolerate a list too.
+rows = list(raw.values()) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+
+ALLOWED_MAJORS = {22000, 22621, 22631, 26100, 26200}  # known-shipped GA majors; bump when a new HNN GAs
+EXCLUDE = ("insider", "preview update", "cumulative update", ".net framework",
+           "feature update to windows", "oobe update", "security update",
+           "update for windows 11 (")
+
+def ver(b):
+    return tuple(int(x) for x in re.findall(r"\d+", str(b or "")))
+
+best = None  # (sortkey, uuid, build)
+for r in rows:
+    if not isinstance(r, dict):
+        continue
+    if str(r.get("arch", "")).lower() != "arm64":
+        continue
+    title = str(r.get("title", "")).lower()
+    if "windows 11, version " not in title or any(x in title for x in EXCLUDE):
+        continue
+    v = ver(r.get("build", ""))
+    if not v or v[0] not in ALLOWED_MAJORS:
+        continue
+    uuid = str(r.get("uuid", "")).strip()
+    if not uuid:
+        continue
+    key = (v, int(r.get("created") or 0))
+    if best is None or key > best[0]:
+        best = (key, uuid, str(r.get("build", "")))
+
+if best is None:
+    sys.exit("no stable GA Win11 ARM64 build found in the UUP dump listing")
+print(best[1], best[2])
 PY
 )
-  [[ -n "$uuid" ]] || die "no Win11 ARM64 build found in the UUP dump listing."
+  rm -f "$listing"
+  [[ -n "$uuid" ]] || die "no stable GA Win11 ARM64 build found in the UUP dump listing."
   RECORDED_BUILD="$build"
   echo "    build $build  (uuid $uuid)" >&2
 
   local workdir
   workdir="$(mktemp -d)"
   echo "==> Fetching the UUP download package + converting to ISO (this is the slow, multi-GB step)" >&2
-  # UUP dump ships a ready-made download+convert package per uuid; the macOS/
-  # Linux convert script (uup_download_macos.sh / convert.sh) drives aria2c +
-  # wimlib + cabextract + chntpw to build the ISO. Edition: Professional.
-  curl -fsSL -o "$workdir/uup.zip" \
-    "$UUP_API/get.php?id=$uuid&pack=en-us&edition=professional&arch=arm64&autodl=2&updates=1" \
-    || die "couldn't download the UUP package for $uuid."
+  # The autodl=2 convert package (the ZIP holding uup_download_macos.sh + the
+  # aria2 download list) is served ONLY by the front-end host uupdump.net — the
+  # api host returns 400 UNSUPPORTED_COMBINATION for this query. edition stays
+  # lowercase ('professional'); that's what the www ZIP route accepts.
+  uup_curl "$workdir/uup.zip" \
+    "$UUP_WWW/get.php?id=$uuid&pack=en-us&edition=professional&arch=arm64&autodl=2&updates=1" \
+    || die "couldn't download the UUP package for $uuid after retries (host $UUP_WWW)."
+  # Guard: a JSON error/manifest body is not a ZIP — fail loudly before unzip.
+  unzip -tq "$workdir/uup.zip" >/dev/null 2>&1 \
+    || die "downloaded package isn't a valid ZIP (got $(file -b "$workdir/uup.zip")); UUP dump may have rate-limited or changed hosts."
   ( cd "$workdir" && unzip -oq uup.zip )
   local conv
   conv="$workdir/uup_download_macos.sh"
