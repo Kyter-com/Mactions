@@ -14,10 +14,14 @@ import Foundation
 ///
 /// Everything Mactions writes lives under one directory so it's all reapable.
 public enum HostCleanup {
-  /// `~/Library/Application Support/Mactions`.
+  /// `~/.mactions`. A dot-dir in $HOME on purpose: the GitHub Actions runner
+  /// breaks on spaces in its work path, and `~/Library/Application Support`
+  /// contains one ("Application Support") — which fails jobs with a bash
+  /// "is a directory" / exit 126 the moment a step runs. homerun uses
+  /// `~/.homerun` for exactly this reason.
   public static func mactionsRoot() -> URL {
-    FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-      .appendingPathComponent("Mactions", isDirectory: true)
+    FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent(".mactions", isDirectory: true)
   }
 
   /// Cached, pristine agent install (the template runs are cloned from).

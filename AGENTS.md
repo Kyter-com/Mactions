@@ -71,7 +71,7 @@ Friendly by design — no env vars, no hand-copied long tokens.
 - **Device flow:** show a short user code, open `github.com/login/device`, poll for approval. Needs a registered **OAuth App client id** (not a secret; device flow has none) — bake one in (or paste it in Settings). This is how homerun gives zero-per-user-setup sign-in once the client id ships.
 - **PAT fallback:** paste a token. Works immediately, no OAuth App needed.
 - **Scope:** `repo` (classic) or fine-grained **Administration: read & write** on the target repo — required to register/remove repo self-hosted runners.
-- **Storage:** a `0600` file at `~/Library/Application Support/Mactions/auth.token`, cached in memory — **not** the login keychain. An unsigned/dev build has no stable code identity, so the keychain re-prompts on every read, "Always Allow" won't stick, and the modal even steals focus from the popover (cancelling in-flight requests). homerun makes the same file-based choice. A signed/notarized build could move back to the keychain — see Roadmap.
+- **Storage:** a `0600` file at `~/.mactions/auth.token`, cached in memory — **not** the login keychain. An unsigned/dev build has no stable code identity, so the keychain re-prompts on every read, "Always Allow" won't stick, and the modal even steals focus from the popover (cancelling in-flight requests). homerun makes the same file-based choice. A signed/notarized build could move back to the keychain — see Roadmap.
 
 ## Build / run / test
 
@@ -87,7 +87,7 @@ swift run Mactions   # launches the menubar app for dev (look in the menubar)
 
 Ephemeral means the host is left as it was found. This is enforced, not hoped for — see `Cleanup.swift` and `LocalProcessProvider`:
 
-- **Everything Mactions writes lives under one directory:** `~/Library/Application Support/Mactions/` (the cached agent template + a `runs/` dir). One `rm -rf` reaps it all.
+- **Everything Mactions writes lives under one directory:** `~/.mactions/` (the cached agent template + a `runs/` dir + the token). A dot-dir in `$HOME`, **not** `~/Library/Application Support` — the Actions runner breaks on the space in "Application Support" (`exit 126`), so the work path must be space-free. One `rm -rf` reaps it all.
 - **Per run:** each job runs in its own **APFS clone** of the cached agent at `runs/<runner-name>`. The job's `_work` checkout, `_tool`/`_actions` caches, `_diag` logs, and `.credentials` all live inside that clone, which is deleted the instant the agent exits. Nothing accumulates across runs. (APFS copy-on-write makes the clone near-instant and almost free on disk; non-APFS volumes fall back to a plain copy.)
 - **On go-online:** `HostCleanup.sweepOrphans()` deletes any `runs/` leftovers and stray `mactions-*` Tart clones from a previous crash/force-quit.
 - **On go-offline / quit:** `purgeRuns()` sweeps again (defensive).
