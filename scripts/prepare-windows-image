@@ -149,7 +149,7 @@ auto_download_iso() {
   require_converter_deps
 
   echo "==> Resolving the latest stable GA Windows 11 ARM64 build from UUP dump" >&2
-  local listing uuid build
+  local listing uuid build resolved
   listing="$(mktemp)"
   uup_curl "$listing" "$UUP_API/listid.php?search=Windows%2011%20arm64&sortByDate=1" \
     || die "couldn't reach the UUP dump API after retries ($UUP_API)."
@@ -158,7 +158,10 @@ auto_download_iso() {
   # preview. Walk the dict VALUES, keep clean GA arm64 feature updates on a
   # known-GA major, and pick the highest build NUMERICALLY. Mirrors
   # WindowsImage.selectLatestGA in MactionsCore (keep the two in sync).
-  read -r uuid build < <(python3 - "$listing" <<'PY'
+  # NOTE: capture via $(...) — NOT `read < <(python3 … <<'PY')`. macOS ships bash
+  # 3.2, which mis-parses a heredoc nested inside `<(…)` process substitution
+  # ("ambiguous redirect" + garbled stdin). Plain command substitution is safe.
+  resolved="$(python3 - "$listing" <<'PY'
 import json, sys, re
 try:
     with open(sys.argv[1]) as f:
@@ -201,8 +204,10 @@ if best is None:
     sys.exit("no stable GA Win11 ARM64 build found in the UUP dump listing")
 print(best[1], best[2])
 PY
-)
+)" || { rm -f "$listing"; die "no stable GA Win11 ARM64 build found in the UUP dump listing."; }
   rm -f "$listing"
+  uuid="${resolved%% *}"     # everything before the first space
+  build="${resolved##* }"    # everything after the last space
   [[ -n "$uuid" ]] || die "no stable GA Win11 ARM64 build found in the UUP dump listing."
   RECORDED_BUILD="$build"
   echo "    build $build  (uuid $uuid)" >&2
