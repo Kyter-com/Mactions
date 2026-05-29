@@ -430,13 +430,41 @@ final class AppState: ObservableObject {
       let result = await Self.runPrepScript(script, name: image)
       windowsSetupBusy = false
       if let result, result.ok {
-        windowsImageReady = true
-        saveConfig()
-        statusMessage =
-          "Windows base image prep started. Finish the one-time install per the script's printed steps, then toggle Windows on."
+        // Exit 0 means the prep RAN, not that a bootable base VM exists: the UTM
+        // path only prints manual steps, and even on Parallels the unattended OS
+        // install happens on first boot. Only flip ready when a powered-off base
+        // VM is actually verifiable, so goOnline never clones a missing/running VM.
+        let cli = WindowsVMProviderFactory.detectFreeFirstCLI()
+        if let cli, WindowsVMProviderFactory.baseImagePoweredOff(name: image, cli: cli) {
+          windowsImageReady = true
+          saveConfig()
+          statusMessage = "Windows base image '\(image)' is ready."
+        } else {
+          windowsImageReady = false  // never persist a stale-true
+          saveConfig()
+          statusMessage =
+            "Windows prep finished. Complete the one-time install per the printed steps, shut the VM down, then run \"Set up Windows runner\" again to confirm."
+        }
       } else {
-        statusMessage =
-          "Windows setup failed: \(result?.stderr.trimmingCharacters(in: .whitespacesAndNewlines) ?? "couldn't run the prep script")."
+        if let result {
+          NSLog(
+            "prepare-windows-image failed (status \(result.status))\nstdout:\n\(result.stdout)\nstderr:\n\(result.stderr)"
+          )
+        }
+        // The script tags its own failures via die(): `error: <msg>`. Surface the
+        // first such line (a concise human summary); never echo a raw Python
+        // traceback or set -e abort into the one-line status — the full transcript
+        // is in Console.app via the NSLog above.
+        let stderr = result?.stderr ?? ""
+        let errorLine =
+          stderr
+          .split(whereSeparator: \.isNewline)
+          .map(String.init)
+          .first { $0.hasPrefix("error: ") }
+        let detail =
+          errorLine.map { String($0.dropFirst("error: ".count)).trimmingCharacters(in: .whitespaces) }
+          ?? "the prep script failed — see Console.app for details"
+        statusMessage = "Windows setup failed: \(detail)"
       }
     }
   }
@@ -446,7 +474,21 @@ final class AppState: ObservableObject {
   private nonisolated static func runPrepScript(_ script: String, name: String) async
     -> Shell.Result?
   {
-    await Task.detached { try? Shell.run(script, ["--name", name]) }.value
+    await Task.detached {
+      // A Finder/login-item launched .app inherits a launchd PATH WITHOUT
+      // /opt/homebrew/bin, so the script's own `command -v` checks for python3 +
+      // the converter tools (aria2c/cabextract/wimlib-imagex/mkisofs/chntpw) would
+      // miss and it would die before downloading anything. Prepend the Homebrew
+      // bins (matching Shell.which / WindowsPreflight) while preserving the rest
+      // of the inherited env.
+      var env = ProcessInfo.processInfo.environment
+      let existing = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+      let have = Set(existing.split(separator: ":").map(String.init))
+      let prepend = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"]
+        .filter { !have.contains($0) }
+      env["PATH"] = (prepend + [existing]).joined(separator: ":")
+      return try? Shell.run(script, ["--name", name], environment: env)
+    }.value
   }
 
   func setWindowsEnabled(_ on: Bool) {

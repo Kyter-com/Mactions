@@ -62,34 +62,90 @@ final class WindowsImageTests: XCTestCase {
 
   // MARK: Listing parsing
 
-  func testParseBuildsKeepsOnlyArm64AndPreservesOrder() {
-    let json = """
-      {
-        "response": {
-          "apiVersion": "1.0",
-          "builds": [
-            {"title": "Feature update to Windows 11 24H2 (arm64)", "build": "26100.1742",
-             "arch": "arm64", "uuid": "aaa-111"},
-            {"title": "Feature update to Windows 11 24H2 (amd64)", "build": "26100.1742",
-             "arch": "amd64", "uuid": "bbb-222"},
-            {"title": "Cumulative update (arm64)", "build": "26100.1300",
-             "arch": "ARM64", "uuid": "ccc-333"}
-          ]
-        },
-        "jsonApiVersion": "1.0"
+  /// Build a listid.php fixture in the REAL API shape: `response.builds` is an
+  /// OBJECT keyed by stringified ints, NOT an array. Each tuple is
+  /// (key, title, build, arch, uuid). `created` is filled in deterministically.
+  private func buildsFixture(_ rows: [(String, String, String, String, String)]) -> Data {
+    let entries =
+      rows
+      .enumerated()
+      .map { i, r in
+        let (k, title, build, arch, uuid) = r
+        return
+          "\"\(k)\":{\"title\":\"\(title)\",\"build\":\"\(build)\",\"arch\":\"\(arch)\",\"created\":\(1_780_000_000 + i),\"uuid\":\"\(uuid)\"}"
       }
-      """.data(using: .utf8)!
+      .joined(separator: ",")
+    return Data(
+      "{\"response\":{\"apiVersion\":\"1.0\",\"builds\":{\(entries)}},\"jsonApiVersion\":\"1.0\"}".utf8
+    )
+  }
+
+  func testParseBuildsDecodesDictShapeAndKeepsOnlyArm64() {
+    // Dict keyed by stringified ints (the shape the live API actually sends).
+    let json = buildsFixture([
+      ("1", "Windows 11, version 24H2 (arm64)", "26100.1742", "arm64", "aaa-111"),
+      ("2", "Windows 11, version 24H2 (amd64)", "26100.1742", "amd64", "bbb-222"),
+      ("4", "Cumulative update (arm64)", "26100.1300", "ARM64", "ccc-333"),
+    ])
     let builds = WindowsImage.parseBuilds(json)
     XCTAssertEqual(builds.count, 2)  // amd64 row dropped
-    XCTAssertEqual(builds.first?.uuid, "aaa-111")  // newest-first order preserved
-    XCTAssertEqual(builds.first?.build, "26100.1742")
-    XCTAssertEqual(builds[1].uuid, "ccc-333")  // "ARM64" matches case-insensitively
+    // Dict iteration is UNORDERED — assert membership, never position.
+    XCTAssertEqual(Set(builds.map(\.uuid)), ["aaa-111", "ccc-333"])  // "ARM64" matched case-insensitively
+    XCTAssertEqual(builds.first(where: { $0.uuid == "aaa-111" })?.created, 1_780_000_000)
+  }
+
+  func testParseBuildsRejectsTheArrayShapeTheApiNeverSends() {
+    // Regression guard: the old `[Row]` decoder accepted this; the dict decoder
+    // must NOT — an array decode now fails → []. (This is the bug that shipped.)
+    let arrayShape = Data(
+      #"{"response":{"builds":[{"title":"Windows 11, version 25H2 (arm64)","build":"26200.1","arch":"arm64","uuid":"z"}]}}"#
+        .utf8)
+    XCTAssertTrue(WindowsImage.parseBuilds(arrayShape).isEmpty)
   }
 
   func testParseBuildsReturnsEmptyOnGarbageOrNoBuilds() {
     XCTAssertTrue(WindowsImage.parseBuilds(Data("not json".utf8)).isEmpty)
     XCTAssertTrue(WindowsImage.parseBuilds(Data(#"{"response":{}}"#.utf8)).isEmpty)
-    XCTAssertTrue(WindowsImage.parseBuilds(Data(#"{"response":{"builds":[]}}"#.utf8)).isEmpty)
+    // The REAL empty response is an empty DICT, not an empty array.
+    XCTAssertTrue(WindowsImage.parseBuilds(Data(#"{"response":{"builds":{}}}"#.utf8)).isEmpty)
+  }
+
+  // MARK: GA / stable-channel selection (the wrong-channel bug)
+
+  func testIsGABaseExcludesInsiderPreviewAndNotYetGA26H1() {
+    let json = buildsFixture([
+      ("1", "Windows 11 Insider Preview Feature Update (26220.8544)", "26220.8544", "arm64", "insider"),
+      ("2", "Preview Update for Windows 11 (28000.2179)", "28000.2179", "arm64", "preview"),
+      ("3", "Windows 11, version 26H1 (28000.2113)", "28000.2113", "arm64", "26h1-not-ga"),
+      ("4", "Cumulative Update for .NET Framework (26100.1)", "26100.1", "arm64", "dotnet"),
+      ("5", "Windows 11, version 25H2 (26200.8524)", "26200.8524", "arm64", "648c682d"),
+    ])
+    let ga = WindowsImage.parseBuilds(json).filter(WindowsImage.isGABase)
+    XCTAssertEqual(ga.map(\.uuid), ["648c682d"])  // only the real GA survives
+  }
+
+  func testSelectLatestGAPicksHighestNumericGANotApiOrderNorRawMax() {
+    // 26200.8524 (25H2 GA) must beat the lexically/numerically larger 28000.2113
+    // (26H1 preview) and the newest-by-date Insider decoy. Order-independent.
+    let json = buildsFixture([
+      ("1", "Windows 11 Insider Preview (26300.1)", "26300.1", "arm64", "insider-decoy"),
+      ("2", "Windows 11, version 26H1 (28000.2113)", "28000.2113", "arm64", "26h1"),
+      ("3", "Windows 11, version 25H2 (26200.8524)", "26200.8524", "arm64", "648c682d"),
+      ("4", "Windows 11, version 24H2 (26100.793)", "26100.793", "arm64", "24h2"),
+    ])
+    let chosen = WindowsImage.selectLatestGA(WindowsImage.parseBuilds(json))
+    XCTAssertEqual(chosen?.uuid, "648c682d")
+    XCTAssertEqual(chosen?.build, "26200.8524")
+  }
+
+  func testSelectLatestGAReturnsNilWhenNoStableBuildPresent() {
+    // All Insider/preview → nil, so latestBuild() throws rather than shipping a
+    // prerelease base image.
+    let json = buildsFixture([
+      ("1", "Windows 11 Insider Preview Feature Update (26220.8544)", "26220.8544", "arm64", "ins"),
+      ("2", "Preview Update for Windows 11 (28000.2179)", "28000.2179", "arm64", "prev"),
+    ])
+    XCTAssertNil(WindowsImage.selectLatestGA(WindowsImage.parseBuilds(json)))
   }
 
   // MARK: Converter dependency check

@@ -21,8 +21,11 @@ final class WindowsVMProviderTests: XCTestCase {
     XCTAssertEqual(cli.startArgs(clone: "mactions-abc"), ["start", "mactions-abc"])
     // Force power-off, then permanent delete (the ephemerality bar).
     XCTAssertEqual(cli.stopArgs(clone: "mactions-abc"), ["stop", "mactions-abc", "--kill"])
+    XCTAssertEqual(cli.forceStopArgs(clone: "mactions-abc"), ["stop", "mactions-abc", "--kill"])
     XCTAssertEqual(cli.deleteArgs(clone: "mactions-abc"), ["delete", "mactions-abc"])
-    XCTAssertEqual(cli.ipArgs(clone: "mactions-abc"), ["list", "-f", "--info", "mactions-abc"])
+    XCTAssertEqual(cli.statusArgs(clone: "mactions-abc"), ["status", "mactions-abc"])
+    // Structured JSON, not `-f --info` text (text scraping picked up a netmask).
+    XCTAssertEqual(cli.ipArgs(clone: "mactions-abc"), ["list", "mactions-abc", "--full", "--json"])
   }
 
   // MARK: UTM (utmctl) verb shapes
@@ -35,6 +38,7 @@ final class WindowsVMProviderTests: XCTestCase {
     XCTAssertEqual(cli.startArgs(clone: "mactions-xyz"), ["start", "mactions-xyz", "--hide"])
     XCTAssertEqual(cli.stopArgs(clone: "mactions-xyz"), ["stop", "mactions-xyz"])
     XCTAssertEqual(cli.deleteArgs(clone: "mactions-xyz"), ["delete", "mactions-xyz"])
+    XCTAssertEqual(cli.statusArgs(clone: "mactions-xyz"), ["status", "mactions-xyz"])
     XCTAssertEqual(cli.ipArgs(clone: "mactions-xyz"), ["ip-address", "mactions-xyz"])
   }
 
@@ -45,18 +49,27 @@ final class WindowsVMProviderTests: XCTestCase {
     XCTAssertEqual(UTMCLI().parseIP(from: "192.168.64.7\n"), "192.168.64.7")
   }
 
-  func testParseIPFromParallelsListLine() {
-    // prlctl list -f --info embeds the address in a status line.
+  func testParseIPFromParallelsJSON() {
+    // prlctl list --full --json returns an array; read the labeled lease field
+    // (ip_configured is a bare address, no /mask).
     let out = """
-      UUID      STATUS       IP_ADDR        NAME
-      {abc}     running      10.211.55.12   mactions-abc
+      [{"uuid":"{abc}","status":"running","ip_configured":"10.211.55.12","name":"mactions-abc"}]
       """
     XCTAssertEqual(ParallelsCLI().parseIP(from: out), "10.211.55.12")
   }
 
+  func testParseIPParallelsIgnoresTextDumpAndUnleased() {
+    // The old `-f --info` text dump is NOT what we parse now — a non-JSON body
+    // yields nil instead of scraping a netmask/gateway as "the IP".
+    XCTAssertNil(ParallelsCLI().parseIP(from: "ip=10.0.0.5/255.255.255.0 gw=10.0.0.1"))
+    // ip_configured "-" / "" means no lease yet.
+    XCTAssertNil(ParallelsCLI().parseIP(from: #"[{"ip_configured":"-"}]"#))
+    XCTAssertNil(ParallelsCLI().parseIP(from: #"[{"ip_configured":""}]"#))
+  }
+
   func testParseIPSkipsZeroPlaceholderBeforeDHCP() {
-    // Parallels prints 0.0.0.0 before the guest gets a lease — not a real IP.
-    XCTAssertNil(ParallelsCLI().parseIP(from: "running 0.0.0.0 mactions-abc"))
+    // utmctl token-scan: 0.0.0.0 before a lease is not a real IP.
+    XCTAssertNil(UTMCLI().parseIP(from: "0.0.0.0\n"))
   }
 
   func testParseIPReturnsNilWhenNoAddressYet() {
@@ -64,21 +77,24 @@ final class WindowsVMProviderTests: XCTestCase {
     XCTAssertNil(UTMCLI().parseIP(from: ""))
   }
 
-  func testParseIPRejectsOutOfRangeOctets() {
-    // 999 is not a valid octet; a version string must not be mistaken for an IP.
-    XCTAssertNil(ParallelsCLI().parseIP(from: "999.1.1.1"))
-    XCTAssertNil(ParallelsCLI().parseIP(from: "version 2.334.0 build"))
+  func testParseIPUTMRejectsOutOfRangeMaskAndApipa() {
+    // utmctl's token-scan parseIP must reject non-lease values.
+    XCTAssertNil(UTMCLI().parseIP(from: "999.1.1.1"))             // out-of-range octet
+    XCTAssertNil(UTMCLI().parseIP(from: "version 2.334.0 build")) // not an IP
+    XCTAssertNil(UTMCLI().parseIP(from: "169.254.10.5"))         // APIPA link-local
+    XCTAssertNil(UTMCLI().parseIP(from: "255.255.255.0"))        // netmask/broadcast
+    XCTAssertEqual(UTMCLI().parseIP(from: "192.168.64.7"), "192.168.64.7")
   }
 
   // MARK: Remote command + SSH invocation
 
   func testRemoteCommandLaunchesWinArm64AgentWithJIT() {
     let p = WindowsVMProvider(id: "abc", baseImage: "win11-runner-base", sshPassword: nil)
-    // run.cmd (Windows), NOT ./run.sh; short C:\ root path; the OS-agnostic
-    // base64 JIT string is passed straight through.
+    // run.cmd (Windows), NOT ./run.sh; short C:\ root path; the base64 JIT string
+    // is QUOTED (its `+`/`/`/`=` alphabet is interpolated into a cmd.exe line).
     XCTAssertEqual(
       p.remoteCommand(jitConfig: "BASE64JIT=="),
-      "cd /d C:\\actions-runner && run.cmd --jitconfig BASE64JIT==")
+      "cd /d C:\\actions-runner && run.cmd --jitconfig \"BASE64JIT==\"")
   }
 
   func testCloneNameCarriesMactionsPrefix() {
@@ -95,7 +111,7 @@ final class WindowsVMProviderTests: XCTestCase {
     XCTAssertTrue(inv.arguments.contains("StrictHostKeyChecking=no"))
     XCTAssertTrue(inv.arguments.contains("UserKnownHostsFile=/dev/null"))
     XCTAssertEqual(inv.arguments[safe: inv.arguments.count - 2], "runner@10.0.0.5")
-    XCTAssertEqual(inv.arguments.last, "cd /d C:\\actions-runner && run.cmd --jitconfig J")
+    XCTAssertEqual(inv.arguments.last, "cd /d C:\\actions-runner && run.cmd --jitconfig \"J\"")
   }
 
   func testSSHInvocationWithPasswordRoutesThroughSSHPass() {
@@ -179,7 +195,8 @@ final class WindowsVMProviderTests: XCTestCase {
     // see WindowsVMProvider.teardown.)
     let p = WindowsVMProvider(
       id: "abc", baseImage: "base",
-      cli: ParallelsCLI(executable: "/nonexistent/prlctl"), sshPassword: nil)
+      cli: ParallelsCLI(executable: "/nonexistent/prlctl"), sshPassword: nil,
+      stopSettleTimeout: 0.05, stopPollInterval: 0.01)
     XCTAssertFalse(p.isRunning)
     p.stop()
     XCTAssertFalse(p.isRunning)
