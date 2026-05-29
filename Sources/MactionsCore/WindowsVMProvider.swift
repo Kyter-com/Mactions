@@ -2,19 +2,20 @@ import Foundation
 
 // MARK: - Windows VM CLI abstraction
 
-/// The clone/boot/ip/stop/delete verbs a Windows-VM provider drives, expressed
-/// as **pure command builders** so the per-tool argument shapes are unit-testable
-/// without a live VM (mirrors the `jitConfigRequest`-style split the rest of the
-/// core uses). A concrete tool (`prlctl` for Parallels, `utmctl` for UTM) is just
-/// a struct that fills these in.
+/// The clone/boot/status/stop/delete + per-clone-config-injection verbs a
+/// Windows-VM provider drives, expressed as **pure command builders** so the
+/// per-tool shapes are unit-testable without a live VM (mirrors the
+/// `jitConfigRequest`-style split the rest of the core uses). A concrete tool
+/// (`prlctl` for Parallels, `utmctl` for UTM) fills these in.
 ///
-/// Why an abstraction instead of hard-coding `tart`-style calls like
-/// `TartProvider` does: Tart cannot boot Windows guests at all (no Secure
-/// Boot/TPM via Virtualization.framework), so a Windows runner needs a different
-/// hypervisor CLI. The two viable Apple-Silicon options have *different* verbs
-/// (`prlctl clone --linked` vs `utmctl clone`), and the research recommends
-/// Parallels for robustness but keeps UTM as a free fallback — so we keep the
-/// provider tool-agnostic and pick the backend at construction time.
+/// HEADLESS / OUTBOUND-REGISTRATION model (see AGENTS.md): there is no inbound
+/// SSH and no guest-IP discovery. Per job we deliver a per-clone **config ISO**
+/// carrying the JIT registration into the guest; the in-guest runtime reads it,
+/// runs `run.cmd --jitconfig` (registering OUTBOUND to GitHub) for ONE job, then
+/// powers the VM off. The host learns completion purely by polling VM **power
+/// state**. The two backends differ only in how the config ISO is delivered:
+/// Parallels has a real attach verb; UTM has none, so we overwrite a fixed
+/// in-bundle disk image in the clone bundle while it's powered off.
 public protocol WindowsVMCLI: Sendable {
   /// Absolute path to the CLI binary (e.g. `/usr/local/bin/prlctl`).
   var executable: String { get }
@@ -29,7 +30,8 @@ public protocol WindowsVMCLI: Sendable {
   func stopArgs(clone: String) -> [String]
   /// Permanently delete the clone and all its files (the ephemerality bar).
   func deleteArgs(clone: String) -> [String]
-  /// Discover the guest's IP. The provider parses stdout via `parseIP`.
+  /// Discover the guest's IP. UNUSED on the outbound-registration flow; kept for
+  /// the Parallels diagnostics / any future direct-connect path.
   func ipArgs(clone: String) -> [String]
   /// Pull a single IPv4 address out of the `ip` command's stdout.
   func parseIP(from output: String) -> String?
@@ -39,11 +41,34 @@ public protocol WindowsVMCLI: Sendable {
   func parseIsStopped(from output: String) -> Bool
   /// Force/kill power-off — escalation when a graceful `stop` doesn't settle.
   func forceStopArgs(clone: String) -> [String]
+  /// How this backend delivers the per-clone config ISO into the guest.
+  func injectionPlan(clone: String, clonePath: String?, configISO: String) -> WindowsInjectionPlan
+  /// Absolute path to the clone's on-disk bundle, for backends that inject by
+  /// overwriting an in-bundle file (UTM). `nil` when injection is via the CLI
+  /// (Parallels), so the provider skips path resolution.
+  func cloneBundlePath(clone: String) -> String?
 }
 
+/// How a backend delivers the per-clone config ISO into a powered-off clone.
+public enum WindowsInjectionPlan: Equatable, Sendable {
+  /// Overwrite a fixed in-bundle disk image (absolute `target`) with the config
+  /// ISO while the clone is powered off — UTM has no CLI attach verb, but a
+  /// fixed in-bundle drive travels byte-for-byte through `utmctl clone`, so
+  /// replacing that one file delivers the payload. (UNVERIFIED: hinges on UTM
+  /// re-reading the replaced image on start rather than a cached fd — see the
+  /// live-verification checklist in AGENTS.md / issue tracker.)
+  case overwriteInBundleDrive(target: String)
+  /// Attach the config ISO as a CD via the CLI (Parallels' real attach verb).
+  case attachCommands([[String]])
+}
+
+/// Coarse VM power phase, used to gate completion detection. We must observe
+/// `.running` once before treating `.stopped` as "the job finished and the guest
+/// powered itself off" — a freshly cloned (not-yet-started) VM also reads stopped.
+public enum VMPhase: Equatable, Sendable { case starting, running, stopped }
+
 /// True for a real, usable guest IPv4: four in-range octets, not 0.0.0.0, not
-/// APIPA (169.254/16), and not a netmask/broadcast-looking 255.x value (so a
-/// gateway/netmask token in a CLI dump can't masquerade as the lease).
+/// APIPA (169.254/16), and not a netmask/broadcast-looking 255.x value.
 func isUsableIPv4(_ s: String) -> Bool {
   let octs = s.split(separator: ".").compactMap { Int($0) }
   guard octs.count == 4, octs.allSatisfy({ (0...255).contains($0) }) else { return false }
@@ -54,17 +79,15 @@ func isUsableIPv4(_ s: String) -> Bool {
 }
 
 extension WindowsVMCLI {
-  /// First usable-IPv4 token in the output. `utmctl ip-address` prints the
-  /// address on its own line; the default scan handles that. (Parallels
-  /// overrides this with a JSON parse — see `ParallelsCLI`.)
+  /// First usable-IPv4 token in the output (`utmctl ip-address` prints a bare
+  /// address per line). Parallels overrides this with a JSON parse.
   public func parseIP(from output: String) -> String? {
     output
       .components(separatedBy: CharacterSet(charactersIn: " \t\n\r,/"))
       .first(where: isUsableIPv4)
   }
 
-  /// Default power-state read: the listing/status mentions "stopped" and isn't
-  /// mid-transition ("stopping"). Both backends print one of these tokens.
+  /// Default power-state read: mentions "stopped" and isn't mid-transition.
   public func parseIsStopped(from output: String) -> Bool {
     let o = output.lowercased()
     return o.contains("stopped") && !o.contains("stopping")
@@ -72,15 +95,18 @@ extension WindowsVMCLI {
 
   /// Default force-stop == the normal stop (override where a kill flag exists).
   public func forceStopArgs(clone: String) -> [String] { stopArgs(clone: clone) }
+
+  /// Backends that attach via the CLI don't need a bundle path.
+  public func cloneBundlePath(clone: String) -> String? { nil }
 }
 
-/// Parallels Desktop Pro/Business via `prlctl` — the recommended backend.
+/// Parallels Desktop Pro/Business via `prlctl` — the **proven** backend.
 ///
 /// The only Microsoft-authorized hypervisor for Windows 11 ARM on Apple Silicon
-/// with full hardware acceleration, a true background-service headless mode, and
-/// a complete CLI lifecycle. `clone --linked` is the cheap copy-on-write analog
-/// to Tart's clone + the local provider's APFS clone; `delete` removes the clone
-/// and every file it owns.
+/// with full hardware acceleration, a true background-service headless mode (no
+/// GUI-login dependency), CoW linked clones, and a complete CLI lifecycle
+/// including a **real attach verb** — so the per-clone config ISO is attached
+/// directly, with no in-bundle-overwrite dance.
 public struct ParallelsCLI: WindowsVMCLI {
   public let executable: String
   public init(executable: String = "/usr/local/bin/prlctl") {
@@ -98,8 +124,7 @@ public struct ParallelsCLI: WindowsVMCLI {
   public func deleteArgs(clone: String) -> [String] { ["delete", clone] }
   public func statusArgs(clone: String) -> [String] { ["status", clone] }
   // Query structured JSON and read the labeled lease field — scraping `-f --info`
-  // text yields a netmask/gateway/Tools-version as the "first IPv4 token". This
-  // mirrors what Parallels' own vagrant driver does.
+  // text yields a netmask/gateway as the "first IPv4 token".
   public func ipArgs(clone: String) -> [String] { ["list", clone, "--full", "--json"] }
   public func parseIP(from output: String) -> String? {
     guard let data = output.data(using: .utf8),
@@ -109,19 +134,40 @@ public struct ParallelsCLI: WindowsVMCLI {
     else { return nil }
     return ip  // ip_configured is a bare address, no /mask
   }
+  // Real attach verb: connect the per-clone config ISO to the base's empty
+  // cdrom0 slot while the clone is stopped, then boot.
+  public func injectionPlan(clone: String, clonePath: String?, configISO: String) -> WindowsInjectionPlan {
+    .attachCommands([["set", clone, "--device-set", "cdrom0", "--image", configISO, "--connect"]])
+  }
 }
 
-/// UTM via `utmctl` — the free/open-source fallback (QEMU backend).
+/// UTM via `utmctl` — the free/open-source default (QEMU backend).
 ///
 /// CAVEAT (see AGENTS.md): `utmctl` uses Apple's ScriptingBridge, which needs an
 /// active GUI (Aqua) login session and does NOT work over SSH or from a pure
-/// launchd/headless context. Fine when Mactions runs in the foreground; fragile
-/// for an unattended host. Prefer `ParallelsCLI` unless the license cost is a
-/// non-starter.
+/// launchd/headless context. Its verb set is clone/start/stop/delete/status/
+/// ip-address — there is **no attach-drive verb**, and `file`/`exec` need the
+/// QEMU guest agent (no first-class arm64-Windows build, UTM #5134). So the
+/// per-clone config ISO is delivered by OVERWRITING a fixed in-bundle disk image
+/// in the clone bundle while powered off (`injectionPlan`). UNVERIFIED end to end
+/// — see the live-verification checklist before trusting this backend.
 public struct UTMCLI: WindowsVMCLI {
   public let executable: String
-  public init(executable: String = "/Applications/UTM.app/Contents/MacOS/utmctl") {
+  /// Directory UTM stores VM bundles in. The clone bundle is `<dir>/<clone>.utm`.
+  public let documentsDir: String
+  /// Filename of the fixed in-bundle data disk we overwrite per clone (the
+  /// `<UUID>` recorded for the second drive added during base-image prep). The
+  /// guest reads the config off this disk by volume label.
+  public let inBundleImageName: String
+  public init(
+    executable: String = "/Applications/UTM.app/Contents/MacOS/utmctl",
+    documentsDir: String = NSString(
+      string: "~/Library/Containers/com.utmapp.UTM/Data/Documents").expandingTildeInPath,
+    inBundleImageName: String = "mactions-config.img"
+  ) {
     self.executable = executable
+    self.documentsDir = documentsDir
+    self.inBundleImageName = inBundleImageName
   }
   public var displayName: String { "UTM (utmctl)" }
   public func cloneArgs(base: String, clone: String) -> [String] {
@@ -134,46 +180,52 @@ public struct UTMCLI: WindowsVMCLI {
   public func deleteArgs(clone: String) -> [String] { ["delete", clone] }
   public func statusArgs(clone: String) -> [String] { ["status", clone] }
   public func ipArgs(clone: String) -> [String] { ["ip-address", clone] }
+  // Deterministic bundle path: UTM names bundles by VM name under documentsDir.
+  // (Verify against a real `utmctl clone` — see AGENTS.md live checklist.)
+  public func cloneBundlePath(clone: String) -> String? {
+    documentsDir + "/" + clone + ".utm"
+  }
+  // No attach verb: overwrite the fixed in-bundle drive at <bundle>/Data/<name>.
+  public func injectionPlan(clone: String, clonePath: String?, configISO: String) -> WindowsInjectionPlan {
+    let bundle = clonePath ?? cloneBundlePath(clone: clone) ?? ""
+    return .overwriteInBundleDrive(target: bundle + "/Data/" + inBundleImageName)
+  }
 }
 
 // MARK: - Windows VM provider
 
 /// Runs each ephemeral runner inside a **throwaway Windows 11 ARM VM** cloned
 /// from a prepared base image, then destroys the clone — the only way to hit the
-/// ephemerality bar on Windows (there is no APFS-clone HOME-redirect trick like
-/// the local provider uses; the entire guest disk is discarded per job).
+/// ephemerality bar on Windows (the entire guest disk is discarded per job).
 ///
-/// Control flow mirrors `TartProvider` (clone → boot → SSH in → launch agent →
-/// destroy on exit) with one behavioral divergence baked in: the VM CLIs'
-/// `start` returns immediately (it does NOT block until the VM powers off, the
-/// way `tart run` does), so we cannot key `onExit` off a long-lived run process.
-/// Instead the **SSH command blocks** while the in-guest `run.cmd --jitconfig`
-/// runs its single job; when SSH returns (agent exited), we force-stop and delete
-/// the clone, then fire `onExit`.
+/// HEADLESS / OUTBOUND-REGISTRATION flow (no SSH, no IP discovery):
+///   1. **Clone** the pristine base to a throwaway `mactions-<id>` clone.
+///   2. **Build** a tiny per-clone **config ISO** carrying the JIT config.
+///   3. **Inject** it into the (powered-off) clone: Parallels attaches it as a
+///      CD; UTM overwrites a fixed in-bundle disk image in the clone bundle.
+///   4. **Start** headless. The base image's in-guest runtime (a logon Scheduled
+///      Task from `bootstrap.ps1`) reads the JIT off the disc, runs
+///      `run.cmd --jitconfig` for ONE job (registering OUTBOUND to GitHub), then
+///      `shutdown /s`.
+///   5. **Detect completion by power state**: poll `status` until the guest has
+///      powered itself off (after first confirming it reached `.running`).
+///   6. **Destroy** the clone on every path, then fire `onExit`.
 ///
-/// Base image requirements (built once by `scripts/prepare-windows-image`):
-///   - Windows 11 ARM64 with the `actions-runner-win-arm64` agent at
-///     `C:\actions-runner`.
-///   - OpenSSH Server enabled, with a `runner` login and **cmd.exe** as the
-///     default shell, reachable on the VM's IP. (cmd.exe is required: the
-///     launch command `remoteCommand` builds is CMD syntax — `&&` and `cd /d`
-///     are PowerShell 5.1 parse errors. `bootstrap.ps1` sets this.)
-///   - (Parallels only, if you use `prlctl exec` instead of SSH) Parallels Tools.
-///
-/// EXPERIMENTAL: depends on a hand-prepared base image + a Windows-capable
-/// hypervisor CLI (`prlctl`/`utmctl`) that is NOT bundled. Not live-verified.
+/// EXPERIMENTAL, not live-verified end to end. The UTM in-bundle injection hinges
+/// on an assumption that needs a live test (see AGENTS.md); Parallels is the
+/// proven backend.
 public final class WindowsVMProvider: RunnerProvider {
   public let id: String
   private let baseImage: String
   private let cli: WindowsVMCLI
-  private let sshUser: String
-  private let sshPassword: String?
-  /// Absolute path to the runner agent inside the guest. Short root path on
-  /// purpose: Windows MAX_PATH (260 chars) bites deep `node_modules` trees.
-  private let runnerPath: String
-  private let ipTimeout: TimeInterval
-  private let sshTimeout: TimeInterval
-  private let sshpassPath: String?
+  /// Volume label the in-guest runtime locates the config disc by.
+  private let configVolumeName: String
+  /// How long to wait for the clone to reach `.running` before giving up, and
+  /// how long to then wait for it to power itself off (job done). The JIT token
+  /// expires ~60 min from mint, so jobTimeout stays under that budget.
+  private let bootTimeout: TimeInterval
+  private let jobTimeout: TimeInterval
+  private let pollInterval: TimeInterval
   /// Teardown budget: how long to wait for a confirmed power-off before deleting
   /// the clone, and the poll/escalation interval. Injectable so tests run fast.
   private let stopSettleTimeout: TimeInterval
@@ -184,45 +236,33 @@ public final class WindowsVMProvider: RunnerProvider {
   var cloneName: String { "mactions-\(id)" }
 
   private var running = false
-  /// Set the first (and only) time the clone is torn down. Mirrors
-  /// `LocalProcessProvider.cleaned`: guards against the background thread and
-  /// `stop()` both racing to stop+delete the VM and fire `onExit` twice (the
-  /// orchestrator treats a second `onExit` as a real second exit and would
-  /// re-provision against a fleet the user already took offline).
+  /// Set the first (and only) time the clone is torn down. Guards the background
+  /// thread and `stop()` from racing to delete the VM / fire `onExit` twice.
   private var tornDown = false
+  /// Per-clone scratch dir (config ISO + staging); removed on teardown. For
+  /// Parallels the attached CD references the ISO until the VM is gone, so we
+  /// can't delete it earlier.
+  private var configWorkdir: String?
   private let lock = NSLock()
 
-  /// - Parameters:
-  ///   - baseImage: name of the pristine Win11-ARM base VM to clone per job.
-  ///   - cli: the hypervisor backend (`ParallelsCLI` recommended; `UTMCLI` free
-  ///     fallback). Defaults to Parallels.
-  ///   - sshUser/sshPassword: the in-guest login the base image was prepared
-  ///     with. A password is used for the throwaway VM (key injection per clone
-  ///     is more plumbing); pass `nil` to rely on an SSH key/agent instead.
-  ///   - sshpassPath: path to `sshpass` for non-interactive password auth; if
-  ///     `nil`, password auth is skipped (SSH will use keys).
   public init(
     id: String,
     baseImage: String,
     cli: WindowsVMCLI = ParallelsCLI(),
-    sshUser: String = "runner",
-    sshPassword: String? = "P@ssw0rd-throwaway",
-    runnerPath: String = "C:\\actions-runner",
-    ipTimeout: TimeInterval = 240,
-    sshTimeout: TimeInterval = 120,
-    sshpassPath: String? = Shell.which("sshpass"),
+    configVolumeName: String = "MACTIONS",
+    bootTimeout: TimeInterval = 300,
+    jobTimeout: TimeInterval = 3000,
+    pollInterval: TimeInterval = 5,
     stopSettleTimeout: TimeInterval = 12,
     stopPollInterval: TimeInterval = 1.5
   ) {
     self.id = id
     self.baseImage = baseImage
     self.cli = cli
-    self.sshUser = sshUser
-    self.sshPassword = sshPassword
-    self.runnerPath = runnerPath
-    self.ipTimeout = ipTimeout
-    self.sshTimeout = sshTimeout
-    self.sshpassPath = sshpassPath
+    self.configVolumeName = configVolumeName
+    self.bootTimeout = bootTimeout
+    self.jobTimeout = jobTimeout
+    self.pollInterval = pollInterval
     self.stopSettleTimeout = stopSettleTimeout
     self.stopPollInterval = stopPollInterval
   }
@@ -233,79 +273,146 @@ public final class WindowsVMProvider: RunnerProvider {
   }
 
   public func start(jitConfig: String, onExit: @escaping (Int32) -> Void) throws {
+    // 1. Clone (throwaway), 2. build the per-clone config ISO, 3. inject it into
+    // the still-powered-off clone, 4. boot. Steps 1-4 happen synchronously so a
+    // failure surfaces from start(); the completion poll runs on a thread.
     try Shell.runChecked(cli.executable, cli.cloneArgs(base: baseImage, clone: cloneName))
     lock.lock(); running = true; lock.unlock()
 
-    // Boot + SSH-launch-agent + teardown run on a background thread so `start`
-    // returns promptly; `onExit` fires when the single job (and the VM) is done.
+    do {
+      let iso = try buildConfigISO(jitConfig: jitConfig)
+      try inject(configISO: iso)
+      try Shell.runChecked(cli.executable, cli.startArgs(clone: cloneName))
+    } catch {
+      // Clone exists but couldn't be prepared/started — reclaim it and report.
+      if teardown() { onExit(1) }
+      throw error
+    }
+
     Thread.detachNewThread { [self] in
       var status: Int32 = 0
-      do {
-        try Shell.runChecked(cli.executable, cli.startArgs(clone: cloneName))
-        let ip = try waitForIP()
-        // A fresh Win11 clone's sshd isn't up the instant it gets a lease. Probe
-        // a no-op SSH until the transport is ready (exit != 255), bounded by
-        // sshTimeout, BEFORE running the job — and run the job exactly ONCE, so a
-        // transport race can never re-launch run.cmd (which would double-register
-        // the JIT runner).
-        let readyDeadline = Date().addingTimeInterval(sshTimeout)
-        let probe = sshArgs(ip: ip, remote: "exit 0")
-        var ready = false
-        while Date() < readyDeadline {
-          if let r = try? Shell.run(probe.executable, probe.arguments), r.status != 255 {
-            ready = true
+      // PHASE 1 — confirm the clone actually reached `.running` (defeats the
+      // just-cloned 'stopped' false positive) within bootTimeout.
+      let bootDeadline = Date().addingTimeInterval(bootTimeout)
+      var sawRunning = false
+      while Date() < bootDeadline {
+        if let r = try? Shell.run(cli.executable, cli.statusArgs(clone: cloneName)), r.ok,
+          phase(from: r.stdout) == .running
+        {
+          sawRunning = true
+          break
+        }
+        Thread.sleep(forTimeInterval: pollInterval)
+      }
+      if sawRunning {
+        // PHASE 2 — the guest runs its single job, then `shutdown /s`. Wait for
+        // the self power-off (the only completion signal — no SSH/exit code; the
+        // authoritative job result is on GitHub).
+        let jobDeadline = Date().addingTimeInterval(jobTimeout)
+        var done = false
+        while Date() < jobDeadline {
+          if let r = try? Shell.run(cli.executable, cli.statusArgs(clone: cloneName)), r.ok,
+            phase(from: r.stdout) == .stopped
+          {
+            done = true
             break
           }
-          Thread.sleep(forTimeInterval: 5)
+          Thread.sleep(forTimeInterval: pollInterval)
         }
-        guard ready else {
-          throw Shell.ShellError.nonZeroExit(
-            command: "ssh \(sshUser)@\(ip)", status: -1,
-            stderr: "guest sshd never accepted a connection within \(Int(sshTimeout))s")
-        }
-        // SSH BLOCKS until run.cmd's single job finishes (then run.cmd exits).
-        // This is how we observe job completion, since `start` did not block.
-        let ssh = sshInvocation(ip: ip, jitConfig: jitConfig)
-        let result = try Shell.run(ssh.executable, ssh.arguments)
-        status = result.status
-      } catch {
-        status = 1
+        status = done ? 0 : 1  // timeout (hung guest) -> failure; teardown force-kills
+      } else {
+        status = 1  // never booted
       }
-      // Teardown — MUST run on every path (success, SSH failure, boot failure)
-      // so no clone, snapshot, or _work checkout survives. `teardown` is
-      // idempotent: if `stop()` already raced in and tore the clone down (user
-      // went offline mid-job), this is a no-op and `onExit` does NOT fire a
-      // second time.
       if teardown() { onExit(status) }
     }
   }
 
   public func stop() {
     // User went offline / quit: tear the clone down now. We deliberately do NOT
-    // call `onExit` here — `stop()` is the orchestrator's own teardown path, and
-    // a second `onExit` would look like a real exit to re-provision against.
+    // call `onExit` here — `stop()` is the orchestrator's own teardown path.
     _ = teardown()
   }
+
+  // MARK: Completion-state classifier (pure → unit-testable)
+
+  /// Classify a backend `status` string. We require an observed `.running`
+  /// before treating `.stopped` as job-complete, so a fresh clone reading
+  /// "stopped" (between clone and start, or at the very start of boot) is not a
+  /// false completion.
+  func phase(from status: String) -> VMPhase {
+    if cli.parseIsStopped(from: status) { return .stopped }
+    let s = status.lowercased()
+    if s.contains("running") || s.contains("started") || s.contains("starting")
+      || s.contains("stopping") || s.contains("paused") || s.contains("suspend")
+      || s.contains("resum")
+    {
+      return .running
+    }
+    return .starting
+  }
+
+  // MARK: Per-clone config ISO + injection
+
+  /// Build the per-clone config ISO carrying the JIT at `mactions/jitconfig`
+  /// (base64, no trailing newline so `run.cmd --jitconfig` reads it byte-exact).
+  /// Returns the ISO path; the scratch dir is cleaned on teardown.
+  private func buildConfigISO(jitConfig: String) throws -> String {
+    let work = NSTemporaryDirectory() + "mactions-cfg-\(cloneName)"
+    let staging = work + "/payload"
+    let macDir = staging + "/mactions"
+    let iso = work + "/config.iso"
+    lock.lock(); configWorkdir = work; lock.unlock()
+    let fm = FileManager.default
+    try? fm.removeItem(atPath: work)
+    try fm.createDirectory(atPath: macDir, withIntermediateDirectories: true)
+    try Data(jitConfig.utf8).write(to: URL(fileURLWithPath: macDir + "/jitconfig"))
+    try Shell.runChecked(
+      WindowsImage.hdiutilPath(),
+      WindowsImage.configISOArgs(sourceDir: staging, output: iso, volumeName: configVolumeName))
+    return iso
+  }
+
+  /// Deliver the config ISO into the powered-off clone per the backend's plan.
+  private func inject(configISO: String) throws {
+    let clonePath = cli.cloneBundlePath(clone: cloneName)
+    switch cli.injectionPlan(clone: cloneName, clonePath: clonePath, configISO: configISO) {
+    case let .overwriteInBundleDrive(target):
+      // Overwrite the fixed in-bundle drive in the (powered-off) clone bundle.
+      let fm = FileManager.default
+      guard fm.fileExists(atPath: target) else {
+        throw Shell.ShellError.nonZeroExit(
+          command: "cp \(configISO) \(target)", status: -1,
+          stderr:
+            "config-drive target not found in the clone bundle: \(target). The base image needs a fixed "
+            + "in-bundle data disk at that path (added once during image prep). See the UTM "
+            + "live-verification steps in AGENTS.md.")
+      }
+      try? fm.removeItem(atPath: target)
+      try fm.copyItem(atPath: configISO, toPath: target)
+    case let .attachCommands(commands):
+      for cmd in commands { try Shell.runChecked(cli.executable, cmd) }
+    }
+  }
+
+  // MARK: Teardown
 
   /// Force-stop + permanently delete the clone, exactly once. Returns `true` the
   /// first time (the caller owns firing `onExit`), `false` on every subsequent
   /// call so the natural-exit thread and a racing `stop()` can't double-delete
-  /// the VM or fire `onExit` twice. Mirrors `LocalProcessProvider.cleanup()`'s
-  /// `cleaned` guard.
+  /// the VM or fire `onExit` twice.
   @discardableResult
   private func teardown() -> Bool {
     lock.lock()
     if tornDown { lock.unlock(); return false }
     tornDown = true
     running = false
+    let work = configWorkdir
     lock.unlock()
-    // `start`/`stop` on these CLIs are non-blocking, so a `delete` fired right
-    // after `stop` races a still-powering-off VM and refuses — leaking the
-    // throwaway disk (ephemerality broken). Poll for a confirmed stop on a
-    // SHORT bounded budget (so the quit path can't wedge), escalating to a
-    // force-kill if it lingers, then delete with a couple of retries. Any
-    // residual leak is reaped by `HostCleanup.purgeStrayWindowsClones` on the
-    // next go-online.
+    // `start`/`stop` are non-blocking, so a `delete` fired right after `stop`
+    // races a still-powering-off VM and refuses — leaking the throwaway disk.
+    // Poll for a confirmed stop on a SHORT bounded budget (so the quit path
+    // can't wedge), escalating to a force-kill, then delete with retries. Any
+    // residual leak is reaped by `HostCleanup.purgeStrayWindowsClones`.
     _ = try? Shell.run(cli.executable, cli.stopArgs(clone: cloneName))
     let deadline = Date().addingTimeInterval(stopSettleTimeout)
     var stopped = false
@@ -321,117 +428,37 @@ public final class WindowsVMProvider: RunnerProvider {
     }
     for _ in 0..<3 {
       if let r = try? Shell.run(cli.executable, cli.deleteArgs(clone: cloneName)), r.ok {
-        return true
+        break
       }
       if !stopped { _ = try? Shell.run(cli.executable, cli.forceStopArgs(clone: cloneName)) }
       Thread.sleep(forTimeInterval: stopPollInterval)
     }
+    if let work { try? FileManager.default.removeItem(atPath: work) }
     return true  // possible leak; purgeStrayWindowsClones reaps it next go-online
-  }
-
-  // MARK: Pure builders (unit-testable without a VM)
-
-  /// The remote command run inside the guest: launch the win-arm64 agent with
-  /// the single-use JIT config. With `--jitconfig`, `run.cmd` takes exactly one
-  /// job then EXITS (and the JIT registration auto-deregisters). The base image
-  /// is additionally wired to power the VM off after the agent exits, but we
-  /// don't rely on that for `onExit` — the blocking SSH command is our signal.
-  func remoteCommand(jitConfig: String) -> String {
-    // Quote the base64 JIT config: it draws from the base64 alphabet (incl. `+`,
-    // `/`, `=`) and is interpolated straight into the cmd.exe command line, so an
-    // unquoted value risks cmd metacharacter/word-split surprises.
-    "cd /d \(runnerPath) && run.cmd --jitconfig \"\(jitConfig)\""
-  }
-
-  /// Full SSH invocation (executable + args), routed through `sshpass` when a
-  /// password is configured so the agent can authenticate non-interactively.
-  /// `StrictHostKeyChecking=no` + `UserKnownHostsFile=/dev/null` because the
-  /// throwaway clone's host key changes every run — matches `TartProvider`.
-  func sshInvocation(ip: String, jitConfig: String) -> (executable: String, arguments: [String]) {
-    sshArgs(ip: ip, remote: remoteCommand(jitConfig: jitConfig))
-  }
-
-  /// Build an SSH invocation for an arbitrary remote command (the job launch, or
-  /// a no-op readiness probe), routed through `sshpass` when a password is set.
-  func sshArgs(ip: String, remote: String) -> (executable: String, arguments: [String]) {
-    let args = [
-      "-o", "StrictHostKeyChecking=no",
-      "-o", "UserKnownHostsFile=/dev/null",
-      "-o", "ConnectTimeout=15",
-      "\(sshUser)@\(ip)",
-      remote,
-    ]
-    if let sshPassword, let sshpassPath {
-      return (sshpassPath, ["-p", sshPassword, "/usr/bin/ssh"] + args)
-    }
-    return ("/usr/bin/ssh", args)
-  }
-
-  // MARK: IP polling
-
-  /// Poll the VM CLI until the guest reports a usable IP, or time out. A fresh
-  /// Win11 clone takes appreciably longer to get an address than a Tart Linux/
-  /// macOS guest, hence the longer default timeout.
-  private func waitForIP() throws -> String {
-    let deadline = Date().addingTimeInterval(ipTimeout)
-    while Date() < deadline {
-      if let r = try? Shell.run(cli.executable, cli.ipArgs(clone: cloneName)), r.ok,
-        let ip = cli.parseIP(from: r.stdout) {
-        return ip
-      }
-      Thread.sleep(forTimeInterval: 3)
-    }
-    let hint =
-      cli is UTMCLI
-      ? "UTM's `utmctl ip-address` reports a lease only via the QEMU guest agent, which has no first-class arm64-Windows build (UTM #5134) — discover the IP host-side from the vmnet DHCP lease, or install a qemu-ga workaround in the base image."
-      : "Check the guest's network/DHCP and that guest tools are installed."
-    throw Shell.ShellError.nonZeroExit(
-      command: "\(cli.executable) \(cli.ipArgs(clone: cloneName).joined(separator: " "))",
-      status: -1,
-      stderr: "no guest IP after \(Int(ipTimeout))s. \(hint)")
   }
 }
 
 // MARK: - Factory
 
-/// Builds `WindowsVMProvider`s for the orchestrator. Mirrors
-/// `LocalProcessProviderFactory`: holds the per-fleet config (base image, CLI
-/// backend, SSH login) and stamps a provider per runner name.
+/// Builds `WindowsVMProvider`s for the orchestrator. Holds the per-fleet config
+/// (base image + CLI backend) and stamps a provider per runner name.
 public struct WindowsVMProviderFactory: RunnerProviderFactory {
   public var kind: String { "Windows VM — \(cli.displayName) (throwaway clone, destroyed each run)" }
   private let baseImage: String
   private let cli: WindowsVMCLI
-  private let sshUser: String
-  private let sshPassword: String?
 
-  public init(
-    baseImage: String,
-    cli: WindowsVMCLI = ParallelsCLI(),
-    sshUser: String = "runner",
-    sshPassword: String? = "P@ssw0rd-throwaway"
-  ) {
+  public init(baseImage: String, cli: WindowsVMCLI = ParallelsCLI()) {
     self.baseImage = baseImage
     self.cli = cli
-    self.sshUser = sshUser
-    self.sshPassword = sshPassword
   }
 
   public func makeProvider(name: String) -> RunnerProvider {
-    WindowsVMProvider(
-      id: name, baseImage: baseImage, cli: cli, sshUser: sshUser, sshPassword: sshPassword)
+    WindowsVMProvider(id: name, baseImage: baseImage, cli: cli)
   }
 
   /// Pick the best installed Windows-VM backend, or `nil` if none is present.
   /// Parallels (`prlctl`) is preferred for an unattended host (UTM's `utmctl`
-  /// needs a GUI login session). The app can call this to decide whether the
-  /// Windows provider is even offerable before building a factory.
-  ///
-  /// Mirrors `Shell.which`-style detection used elsewhere in the core; checks
-  /// the Homebrew/SDK install locations a Finder-launched GUI app won't have on
-  /// its inherited PATH.
-  ///
-  /// NOTE: this is the *robustness*-first order (Parallels first). For the
-  /// interactive app's default we prefer FREE/OSS — see `detectFreeFirstCLI`.
+  /// needs a GUI login session). Mirrors `Shell.which`-style detection.
   public static func detectInstalledCLI() -> WindowsVMCLI? {
     let prlctlCandidates = ["/usr/local/bin/prlctl", "/opt/homebrew/bin/prlctl"]
     if let path = prlctlCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
@@ -445,10 +472,7 @@ public struct WindowsVMProviderFactory: RunnerProviderFactory {
   }
 
   /// Pick the installed backend FREE-FIRST: UTM (free, the default) if present,
-  /// else Parallels (paid — only honored if the user already has it), else
-  /// `nil`. This is the default the interactive app uses; it lines up with
-  /// `WindowsPreflight.Report.recommendedBackend` (QEMU isn't wired to a
-  /// `WindowsVMCLI` here, so a QEMU-only host returns `nil`).
+  /// else Parallels (paid — only if already installed), else `nil`.
   public static func detectFreeFirstCLI() -> WindowsVMCLI? {
     let utmctl = "/Applications/UTM.app/Contents/MacOS/utmctl"
     if FileManager.default.isExecutableFile(atPath: utmctl) {
@@ -463,10 +487,8 @@ public struct WindowsVMProviderFactory: RunnerProviderFactory {
 
   /// `true` iff a base VM named `name` exists AND is powered off — the only state
   /// from which a per-job clone is reliable. Used to gate `windowsImageReady`
-  /// rather than trusting the prep script's exit code: the UTM path only prints
-  /// manual steps, and even on Parallels the OS install happens on first boot, so
-  /// "script exited 0" never means "bootable base image exists". A probe error
-  /// (e.g. utmctl outside an Aqua session) returns `false`, never throws.
+  /// rather than trusting the prep script's exit code. A probe error (e.g. utmctl
+  /// outside an Aqua session) returns `false`, never throws.
   public static func baseImagePoweredOff(name: String, cli: WindowsVMCLI) -> Bool {
     guard let r = try? Shell.run(cli.executable, cli.statusArgs(clone: name)), r.ok else {
       return false
