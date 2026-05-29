@@ -58,10 +58,29 @@ public final class LocalProcessProvider: RunnerProvider {
     try? FileManager.default.removeItem(at: runDirectory)
     try cloneAgent()
 
+    // Full ephemerality: point the job's HOME, every cache, and TMPDIR INSIDE
+    // the per-run clone. When the clone is wiped on exit, NOTHING the job did
+    // survives — no npm cache in the user's ~/.npm, no tool cache, no temp
+    // files, no dotfiles. Each job runs as if on a throwaway machine. (The
+    // cost is no cross-run cache reuse — deps re-download each run — which is
+    // the whole point of "separate PC every time".)
+    let jobHome = runDirectory.appendingPathComponent("_home", isDirectory: true)
+    let jobTmp = runDirectory.appendingPathComponent("_tmp", isDirectory: true)
+    for dir in [jobHome, jobTmp] {
+      try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    }
+    var env = ProcessInfo.processInfo.environment
+    env["HOME"] = jobHome.path
+    env["npm_config_cache"] = jobHome.appendingPathComponent(".npm").path
+    env["RUNNER_TOOL_CACHE"] = runDirectory.appendingPathComponent("_tool").path
+    env["XDG_CACHE_HOME"] = jobHome.appendingPathComponent(".cache").path
+    env["TMPDIR"] = jobTmp.path
+
     let process = Process()
     process.executableURL = runDirectory.appendingPathComponent("run.sh")
     process.arguments = ["--jitconfig", jitConfig]
     process.currentDirectoryURL = runDirectory
+    process.environment = env
     process.terminationHandler = { [weak self] proc in
       self?.cleanup()
       onExit(proc.terminationStatus)
