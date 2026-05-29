@@ -11,8 +11,8 @@
 # script sets up for you.
 #
 # Auto-download path needs a few brew-installable converter tools (aria2c,
-# cabextract, wimlib, chntpw); the script checks for them and prints an exact
-# `brew install …` line if any are missing.
+# cabextract, wimlib-imagex, mkisofs, chntpw); the script checks for them and
+# prints an exact `brew install …` line if any are missing.
 #
 # After this finishes you'll have a powered-off VM named (by default)
 # "win11-runner-base". Point Mactions' WindowsVMProviderFactory at that name.
@@ -97,13 +97,22 @@ UUP_API="https://api.uupdump.net"
 RECORDED_BUILD=""
 
 require_converter_deps() {
-  # Mirrors WindowsImage.converterDependencies in MactionsCore. Map binary ->
-  # brew formula (wimlib-imagex lives in the `wimlib` formula).
-  local -a bins=(aria2c cabextract wimlib-imagex chntpw)
+  # Mirrors WindowsImage.converterDependencies in MactionsCore. The upstream
+  # convert.sh hard-requires ALL of these. Map binary -> brew formula: aria2c
+  # ships in `aria2`, wimlib-imagex in `wimlib`, mkisofs in `cdrtools`, and
+  # chntpw isn't in homebrew-core (the minacle tap has a native-arm64 build;
+  # `brew install` auto-taps it).
+  local -a bins=(aria2c cabextract wimlib-imagex mkisofs chntpw)
   local -a missing=()
   for b in "${bins[@]}"; do
     command -v "$b" >/dev/null 2>&1 || {
-      case "$b" in wimlib-imagex) missing+=("wimlib") ;; *) missing+=("$b") ;; esac
+      case "$b" in
+        aria2c) missing+=("aria2") ;;
+        wimlib-imagex) missing+=("wimlib") ;;
+        mkisofs) missing+=("cdrtools") ;;
+        chntpw) missing+=("minacle/chntpw/chntpw") ;;
+        *) missing+=("$b") ;;
+      esac
     }
   done
   if [[ ${#missing[@]} -gt 0 ]]; then

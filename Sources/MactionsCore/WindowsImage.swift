@@ -162,27 +162,55 @@ public enum WindowsImage {
 
   // MARK: - ISO-converter dependency check (pure → unit-testable)
 
-  /// CLIs the UUP-dump → ISO conversion needs (all brew-installable). Checked
-  /// before kicking off an auto-download so we fail with a clear, actionable
-  /// message instead of midway through a multi-GB download.
-  ///   - aria2c:    parallel downloader UUP dump's convert scripts use.
-  ///   - cabextract: unpacks the .cab payloads.
-  ///   - wimlib-imagex: builds/edits the install.wim (the `wimlib` formula).
-  ///   - chntpw:    edits the offline registry during conversion.
-  public static let converterDependencies = ["aria2c", "cabextract", "wimlib-imagex", "chntpw"]
-
-  /// Brew formula name for a given dependency binary (the binary name and the
-  /// formula differ for wimlib-imagex → `wimlib`).
-  static func brewFormula(for binary: String) -> String {
-    binary == "wimlib-imagex" ? "wimlib" : binary
+  /// One ISO-converter dependency: the command the UUP-dump convert script
+  /// invokes (what we probe for on PATH) paired with the Homebrew formula that
+  /// provides it. They're kept together so the binary→formula mapping is
+  /// data-driven and can't drift (the bug where `aria2c` was passed to `brew
+  /// install` as a formula name — there is no `aria2c` formula, it's `aria2`).
+  public struct ConverterDependency: Equatable, Sendable {
+    /// The command the converter calls; what `Shell.which` looks for.
+    public let binary: String
+    /// The `brew install` argument that provides `binary`. May be tap-qualified
+    /// for formulae outside homebrew-core (chntpw).
+    public let formula: String
+    public init(binary: String, formula: String) {
+      self.binary = binary
+      self.formula = formula
+    }
   }
 
-  /// Which converter deps are NOT installed (resolved via `Shell.which`, which
-  /// also checks the Homebrew dirs a Finder-launched GUI app won't have on its
-  /// PATH). Empty array == all present.
+  /// CLIs the UUP-dump → ISO conversion needs — the upstream converter
+  /// (`convert.sh`) hard-requires ALL of these (a missing one aborts it before
+  /// the multi-GB download), so we check them up front and install via Homebrew.
+  /// Binary and formula names differ for several, hence the explicit pairing:
+  ///   - aria2c        ← `aria2`      (parallel downloader the convert script uses)
+  ///   - cabextract    ← `cabextract` (unpacks the .cab payloads)
+  ///   - wimlib-imagex ← `wimlib`     (builds/edits install.wim)
+  ///   - mkisofs       ← `cdrtools`   (writes the final bootable ISO)
+  ///   - chntpw        ← `minacle/chntpw/chntpw` (edits the offline registry;
+  ///     not in homebrew-core — this tap ships a maintained native-arm64 build,
+  ///     verified building cleanly on Apple Silicon. `brew install` auto-taps it.)
+  public static let converterDependencies: [ConverterDependency] = [
+    .init(binary: "aria2c", formula: "aria2"),
+    .init(binary: "cabextract", formula: "cabextract"),
+    .init(binary: "wimlib-imagex", formula: "wimlib"),
+    .init(binary: "mkisofs", formula: "cdrtools"),
+    .init(binary: "chntpw", formula: "minacle/chntpw/chntpw"),
+  ]
+
+  /// Brew formula (the `brew install` argument) that provides a converter
+  /// `binary`. Data-driven from `converterDependencies`; falls back to the
+  /// binary name itself for anything not listed.
+  static func brewFormula(for binary: String) -> String {
+    converterDependencies.first { $0.binary == binary }?.formula ?? binary
+  }
+
+  /// Which converter deps are NOT installed, as the brew formula names to
+  /// install (resolved via `Shell.which`, which also checks the Homebrew dirs a
+  /// Finder-launched GUI app won't have on its PATH). Empty array == all present.
   public static func missingConverterDependencies(
     lookup: (String) -> Bool = { Shell.which($0) != nil }
   ) -> [String] {
-    converterDependencies.filter { !lookup($0) }.map(brewFormula(for:))
+    converterDependencies.filter { !lookup($0.binary) }.map(\.formula)
   }
 }

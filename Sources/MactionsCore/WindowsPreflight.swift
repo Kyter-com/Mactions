@@ -57,7 +57,8 @@ public enum WindowsPreflight {
     public let homebrew: Tool
     /// Every hypervisor backend we probed (UTM, Parallels, QEMU), installed-or-not.
     public let hypervisors: [Hypervisor: Tool]
-    /// The UUP-dump → ISO converter tools (aria2c, cabextract, wimlib-imagex, chntpw).
+    /// The UUP-dump → ISO converter tools (aria2c, cabextract, wimlib-imagex,
+    /// mkisofs, chntpw) — the convert script hard-requires all of them.
     public let converters: [Tool]
 
     public init(homebrew: Tool, hypervisors: [Hypervisor: Tool], converters: [Tool]) {
@@ -150,10 +151,11 @@ public enum WindowsPreflight {
       .utm: utm, .parallels: parallels, .qemu: qemu,
     ]
 
-    // Converter tools for the no-ISO auto-download path (binary names; the brew
-    // formula for wimlib-imagex is `wimlib`, mapped by WindowsImage.brewFormula).
+    // Converter tools for the no-ISO auto-download path. Probe by binary name;
+    // the brew formula that provides each (e.g. aria2c→aria2, mkisofs→cdrtools,
+    // chntpw→tap) is carried on the dependency and resolved by WindowsImage.brewFormula.
     let converters = WindowsImage.converterDependencies.map {
-      Tool(name: $0, path: whichLookup($0))
+      Tool(name: $0.binary, path: whichLookup($0.binary))
     }
 
     return Report(homebrew: homebrew, hypervisors: hypervisors, converters: converters)
