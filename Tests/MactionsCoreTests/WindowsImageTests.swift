@@ -97,14 +97,30 @@ final class WindowsImageTests: XCTestCase {
   func testMissingConverterDependenciesMapsBinaryToBrewFormula() {
     // All present -> nothing missing.
     XCTAssertTrue(WindowsImage.missingConverterDependencies(lookup: { _ in true }).isEmpty)
-    // None present -> the brew formula names (wimlib-imagex -> wimlib).
+    // None present -> the brew FORMULA names, not the binary names: aria2c→aria2,
+    // wimlib-imagex→wimlib, mkisofs→cdrtools, chntpw→its tap. (The old expectation
+    // hard-coded the binary names, which is exactly why `brew install aria2c …`
+    // failed in the field.)
     let none = WindowsImage.missingConverterDependencies(lookup: { _ in false })
-    XCTAssertEqual(none, ["aria2c", "cabextract", "wimlib", "chntpw"])
+    XCTAssertEqual(none, ["aria2", "cabextract", "wimlib", "cdrtools", "minacle/chntpw/chntpw"])
   }
 
   func testMissingConverterDependenciesReportsOnlyTheAbsentOnes() {
     let missing = WindowsImage.missingConverterDependencies(lookup: { $0 != "chntpw" })
-    XCTAssertEqual(missing, ["chntpw"])
+    XCTAssertEqual(missing, ["minacle/chntpw/chntpw"])
+  }
+
+  func testEveryConverterFormulaIsADistinctRealHomebrewArg() {
+    // Guard against the shipped bug class: a binary name leaking through as a
+    // formula. None of the formulae may equal a binary name that differs from it.
+    for dep in WindowsImage.converterDependencies where dep.binary != dep.formula {
+      XCTAssertNotEqual(
+        dep.binary, dep.formula,
+        "\(dep.binary) must map to its real formula, not itself")
+    }
+    XCTAssertEqual(WindowsImage.brewFormula(for: "aria2c"), "aria2")
+    XCTAssertEqual(WindowsImage.brewFormula(for: "wimlib-imagex"), "wimlib")
+    XCTAssertEqual(WindowsImage.brewFormula(for: "mkisofs"), "cdrtools")
   }
 
   // MARK: Recorded base-image build round-trips off the run-sweep path

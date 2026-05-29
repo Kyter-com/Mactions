@@ -56,10 +56,11 @@ final class WindowsPreflightTests: XCTestCase {
   }
 
   func testConvertersMapMissingBinariesToBrewFormulae() {
-    // wimlib-imagex binary -> wimlib formula; only the absent ones are reported.
+    // Binary→formula differs for most: wimlib-imagex→wimlib, mkisofs→cdrtools,
+    // chntpw→its tap. Only the absent ones are reported, as install args.
     let r = report(which: ["aria2c", "cabextract"])
-    XCTAssertEqual(r.missingConverterFormulae, ["wimlib", "chntpw"])
-    let allPresent = report(which: Set(WindowsImage.converterDependencies))
+    XCTAssertEqual(r.missingConverterFormulae, ["wimlib", "cdrtools", "minacle/chntpw/chntpw"])
+    let allPresent = report(which: Set(WindowsImage.converterDependencies.map(\.binary)))
     XCTAssertTrue(allPresent.missingConverterFormulae.isEmpty)
   }
 
@@ -112,7 +113,8 @@ final class WindowsPreflightTests: XCTestCase {
     XCTAssertEqual(commands[0].executable, "/opt/homebrew/bin/brew")
     XCTAssertEqual(commands[0].arguments, ["install", "--cask", "utm"])
     XCTAssertEqual(
-      commands[1].arguments, ["install", "aria2c", "cabextract", "wimlib", "chntpw"])
+      commands[1].arguments,
+      ["install", "aria2", "cabextract", "wimlib", "cdrtools", "minacle/chntpw/chntpw"])
   }
 
   func testInstallPlanNeverInstallsParallelsAndSkipsHypervisorWhenOnePresent() {
@@ -124,7 +126,7 @@ final class WindowsPreflightTests: XCTestCase {
       return XCTFail("expected .install, got \(plan)")
     }
     XCTAssertEqual(commands.count, 1)
-    XCTAssertEqual(commands[0].arguments, ["install", "chntpw"])
+    XCTAssertEqual(commands[0].arguments, ["install", "cdrtools", "minacle/chntpw/chntpw"])
     XCTAssertFalse(
       commands.contains { $0.arguments.contains("parallels") },
       "must never plan to install paid Parallels")
@@ -143,7 +145,7 @@ final class WindowsPreflightTests: XCTestCase {
 
   func testInstallPlanNothingToInstallWhenEverythingPresent() {
     let everything = report(
-      which: Set(["brew", "prlctl"] + WindowsImage.converterDependencies))
+      which: Set(["brew", "prlctl"] + WindowsImage.converterDependencies.map(\.binary)))
     XCTAssertTrue(everything.ready)
     XCTAssertEqual(WindowsPreflight.installPlan(for: everything), .nothingToInstall)
   }
@@ -172,7 +174,7 @@ final class WindowsPreflightTests: XCTestCase {
     XCTAssertEqual(result, .installed)
     XCTAssertEqual(ran, [
       ["install", "--cask", "utm"],
-      ["install", "aria2c", "cabextract", "wimlib", "chntpw"],
+      ["install", "aria2", "cabextract", "wimlib", "cdrtools", "minacle/chntpw/chntpw"],
     ])
   }
 
@@ -201,7 +203,7 @@ final class WindowsPreflightTests: XCTestCase {
 
   func testRunInstallNothingToInstallWhenAllPresent() {
     let everything = report(
-      which: Set(["brew", "prlctl"] + WindowsImage.converterDependencies))
+      which: Set(["brew", "prlctl"] + WindowsImage.converterDependencies.map(\.binary)))
     let result = WindowsPreflight.runInstall(for: everything) { _ in
       XCTFail("should not run any command")
       return (0, "")
