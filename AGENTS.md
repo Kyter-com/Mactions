@@ -22,7 +22,7 @@ Proof-of-concept. Honest accounting:
 - ✅ **Local-process provider**: runs the actions-runner agent directly on the Mac (no VM isolation, but each run is an isolated clone that's wiped on exit — see Host hygiene). This is the runnable MVP path.
 - ✅ **SwiftUI menubar app**: status, config, online/offline, live runner list; deregisters on quit.
 - 🧪 **Tart provider** (VM isolation): implemented against the `tart` CLI but **experimental** — depends on a prepared base image + SSH bootstrap (see Providers).
-- 🧪 **Windows provider** (`WindowsVMProvider`): implemented + unit-tested, but **experimental and not yet live-verified end to end**. Clones a throwaway Win11-ARM VM per job (Parallels `prlctl` recommended; UTM `utmctl` fallback), SSHes in to launch the win-arm64 runner agent, and destroys the clone on exit. Needs a one-time base image you build with `scripts/prepare-windows-image` (you supply the ISO). See [Windows support](#windows-support).
+- 🧪 **Windows provider** (`WindowsVMProvider`): implemented + unit-tested, but **experimental and not yet live-verified end to end**. **Opt-in only** — OFF by default and gated behind a **"Set up Windows runner"** button; nothing heavy (ISO download, VM build) ever happens automatically. Clones a throwaway Win11-ARM VM per job (Parallels `prlctl` recommended; UTM `utmctl` fallback), SSHes in to launch the win-arm64 runner agent, and destroys the clone on exit. The one-time base image is built by `scripts/prepare-windows-image`, which **auto-downloads the latest Win11 ARM64 ISO** (UUP dump) when you don't supply one, and an **auto-update** check (`WindowsImage`) tells you when a newer Windows build is out. See [Windows support](#windows-support).
 
 ## Architecture
 
@@ -66,7 +66,11 @@ MactionsCore (library, pure Foundation)        Mactions (executable, SwiftUI/App
 
 ## Windows support
 
-🧪 **Experimental, and not yet live-verified end to end.** The control-plane code (provider, factory, stray-clone reaping) compiles and is unit-tested; the actual VM boot + a green Windows job have **not** been run here because that needs a hand-built base image (which needs an ISO download + a multi-minute Windows install). Treat "a Windows job ran on a Mactions runner" as unproven until you complete the image prep and watch one go green.
+🧪 **Experimental, and not yet live-verified end to end.** The control-plane code (provider, factory, stray-clone reaping, the image build-id auto-update logic) compiles and is unit-tested; the actual ISO auto-download/convert, the VM boot, + a green Windows job have **not** been run here because that needs a hand-built base image (an ISO download + a multi-minute Windows install) and a hypervisor (neither is present in this dev env). Treat "a Windows job ran on a Mactions runner" as unproven until you complete the image prep and watch one go green.
+
+**Opt-in, button-gated (important).** Windows support is OFF by default. The **"Set up Windows runner"** button in the popover's Windows section is the *only* trigger for any ISO download or base-image build — nothing heavy ever runs automatically. The button: checks a Windows hypervisor CLI is installed (`WindowsVMProviderFactory.detectInstalledCLI()`), checks the ISO-converter deps are present (`WindowsImage.missingConverterDependencies()`), then shells out to `scripts/prepare-windows-image`. Once the base image is built it flips a persisted `windowsImageReady` flag (UserDefaults) and reveals a **Windows toggle** that adds a fleet labeled `[self-hosted, Windows, mactions]` alongside the macOS one on go-online.
+
+**Auto-download-latest + auto-update.** `--iso` is now *optional*: with no ISO, `prepare-windows-image` resolves + downloads the **latest Win11 ARM64 retail build** via UUP dump (the only automatable source), converts it to an ISO, and records the build id at `~/.mactions/windows-base.build`. `WindowsImage` (pure, unit-tested) resolves the latest available build and compares it to that recorded id (`compareBuilds`/`updateAvailable`, numeric dotted-segment ordering so `26100.9 < 26100.10`), so the app can nudge a rebuild when Microsoft ships a newer Windows. The base image is the one cached/auto-refreshed artifact; per-job clones stay throwaway.
 
 ### Why Windows is its own provider
 
@@ -94,24 +98,26 @@ A throwaway VM discards the **entire guest disk** per job — npm cache, `%TEMP%
 
 `WindowsVMProviderFactory.detectInstalledCLI()` picks Parallels if present, else UTM, else `nil`.
 
-### One-time base image prep (the manual step)
+### One-time base image prep (the button / the script)
 
-The single unavoidable manual step is acquiring the official **Windows 11 ARM64 ISO** (Microsoft only offers it as a time-limited interactive download, so it can't be hard-coded). Then:
+In the app this is the **"Set up Windows runner"** button — the only thing that triggers it. From the CLI:
 
 ```bash
-# 1. Download the ISO (manual):
-open https://www.microsoft.com/en-us/software-download/windows11arm64
+# Auto-download the LATEST Win11 ARM64 ISO (UUP dump) + build the base VM:
+scripts/prepare-windows-image --name win11-runner-base
 
-# 2. Build the base VM (automated as far as the tooling allows):
+# …or supply your own ISO (skips the UUP-dump download/convert):
 scripts/prepare-windows-image --iso ~/Downloads/Win11_ARM64.iso --name win11-runner-base
 ```
+
+`--iso` is **optional**: with none, the script queries UUP dump's JSON API for the latest *retail* Win11 arm64 build and converts the download package to an ISO. That conversion needs a few brew-installable tools — **`aria2c`, `cabextract`, `wimlib`, `chntpw`** — and the script (and `WindowsImage.missingConverterDependencies()`) fails with an exact `brew install …` line if any are missing. The built build id is recorded at `~/.mactions/windows-base.build` for the auto-update check. (Microsoft offers the ISO only as a time-limited interactive download, so a direct URL can't be hard-coded — UUP dump is the automatable path.)
 
 `prepare-windows-image` builds a small unattend ISO from `scripts/autounattend.xml` + `scripts/bootstrap.ps1`, then:
 
 - **Parallels:** creates + boots the VM and drives the install from the CLI; you let `autounattend.xml` + `bootstrap.ps1` finish, detach the install media, and shut it down.
 - **UTM:** `utmctl` has **no `create` verb**, so the first template must be built once in the UTM GUI; the script prints the exact steps and the path to the unattend ISO.
 
-`autounattend.xml` lays down a UEFI/GPT Win11 Pro ARM install, creates a throwaway local-admin `runner` with auto-login, skips OOBE, and runs `bootstrap.ps1` on first logon. `bootstrap.ps1` enables OpenSSH Server, makes PowerShell the default SSH shell, and installs the `actions-runner-win-arm64` agent to `C:\actions-runner` (short root path to dodge Windows MAX_PATH on deep `node_modules` trees). Power the VM off when bootstrap finishes — that powered-off VM is the pristine base; point `WindowsVMProviderFactory(baseImage:)` at its name.
+`autounattend.xml` lays down a UEFI/GPT Win11 Pro ARM install, creates a throwaway local-admin `runner` with auto-login, skips OOBE, and runs `bootstrap.ps1` on first logon. Its `FirstLogonCommands` **scans every drive root for `\setup\bootstrap.ps1`** (the unattend media's drive letter isn't predictable, and nothing copies the script to `C:\`), so provisioning reliably finds it. `bootstrap.ps1` enables OpenSSH Server, sets the SSH **DefaultShell to `cmd.exe`** (the provider's launch command `cd /d C:\actions-runner && run.cmd …` is CMD syntax — `&&`/`cd /d` are PowerShell 5.1 parse errors, so provider and image are kept in lockstep on cmd), and installs the `actions-runner-win-arm64` agent to `C:\actions-runner` (short root path to dodge Windows MAX_PATH on deep `node_modules` trees). Power the VM off when bootstrap finishes — that powered-off VM is the pristine base; point `WindowsVMProviderFactory(baseImage:)` at its name.
 
 ### Workflow change (sweep-collector)
 
@@ -145,7 +151,7 @@ Friendly by design — no env vars, no hand-copied long tokens.
 
 ```bash
 swift build          # compiles MactionsCore + the app
-swift test           # 11 unit tests (requests, device-flow guard, repo lister, orchestrator, cleanup)
+swift test           # 40 unit tests (requests, device-flow guard, repo lister, orchestrator, cleanup, Windows VM command shapes, Windows image build-id/UUP-dump logic)
 swift run Mactions   # launches the menubar app for dev (look in the menubar)
 ```
 
@@ -183,7 +189,7 @@ Crucially, **your repos don't change.** Workflows target **labels** (`runs-on: [
 
 ## Roadmap
 
-- **Windows** support: scaffolded (`WindowsVMProvider` + `scripts/prepare-windows-image`, see [Windows support](#windows-support)). Remaining: live-verify a real Win11-ARM base image + a green Windows job, wire the provider into the UI (backend pick + base-image name), and consider a QEMU+hvf backend so there's a fully-free, no-GUI-session path.
+- **Windows** support: scaffolded + wired into the UI (`WindowsVMProvider`, `WindowsImage`, `scripts/prepare-windows-image`, the opt-in "Set up Windows runner" button + Windows toggle — see [Windows support](#windows-support)). Auto-download-latest (UUP dump) and the build-id auto-update check are implemented + unit-tested. **Remaining (NOT live-verified here):** the ISO auto-download/convert actually producing a bootable ISO, a real Win11-ARM base image, the VM boot, and a green Windows job. Also: a backend picker (Parallels vs UTM) in the UI, and a QEMU+hvf backend for a fully-free, no-GUI-session path.
 - **Scale-from-zero:** instead of N idle runners, listen for `workflow_job` queued events (webhook or API poll) and provision on demand. This is what ARC does.
 - **Distributable `.app`:** Xcode/`xcodebuild` bundle step, `LSUIElement`, Developer ID + notarization, and a Login Item so it can auto-start.
 - **Tart image automation:** a `mactions prepare-image` flow that bakes the runner + SSH into a base image.

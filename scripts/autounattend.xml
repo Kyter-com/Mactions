@@ -115,10 +115,19 @@
         <SkipUserOOBE>true</SkipUserOOBE>
       </OOBE>
       <FirstLogonCommands>
+        <!--
+          The unattend ISO stages bootstrap.ps1 at \setup\bootstrap.ps1 on a
+          REMOVABLE drive whose letter we can't predict (D:, E:, …), so we can't
+          hard-code "C:\setup\bootstrap.ps1" — nothing ever copies it to C:.
+          Instead, scan every drive root for \setup\bootstrap.ps1 and run the
+          first one found. (Robust against drive-letter shuffle and against the
+          unattend media being a CD vs a USB.) -ExecutionPolicy Bypass because a
+          fresh install's default policy would otherwise block the script.
+        -->
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -File C:\setup\bootstrap.ps1</CommandLine>
-          <Description>Provision OpenSSH + the win-arm64 actions-runner agent</Description>
+          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = Get-PSDrive -PSProvider FileSystem | ForEach-Object { Join-Path $_.Root 'setup\bootstrap.ps1' } | Where-Object { Test-Path $_ } | Select-Object -First 1; if ($s) { &amp; $s } else { Write-Host 'bootstrap.ps1 not found on any drive'; exit 1 }"</CommandLine>
+          <Description>Locate + run bootstrap.ps1 from the unattend media (OpenSSH + win-arm64 runner agent)</Description>
         </SynchronousCommand>
       </FirstLogonCommands>
     </component>

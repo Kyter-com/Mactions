@@ -23,6 +23,20 @@ final class AppState: ObservableObject {
   /// OAuth App client id for device-flow sign-in. Optional.
   @Published var clientId = ""
 
+  // Windows runner (OPT-IN — nothing heavy happens until the user clicks the
+  // "Set up Windows runner" button). All persisted to UserDefaults.
+  /// Set once the one-time base-image build has succeeded. Gates the Windows
+  /// toggle: no Windows fleet is offerable until an image exists.
+  @Published var windowsImageReady = false
+  /// When on (and an image is ready), go-online also brings up a Windows fleet
+  /// labeled `[self-hosted, Windows, mactions]` for each selected repo.
+  @Published var windowsEnabled = false
+  /// Name of the base VM `prepare-windows-image` built (what we clone per job).
+  @Published var windowsBaseImage = "win11-runner-base"
+  /// True while the (long, multi-GB) image-prep flow is running. Disables the
+  /// button so it can't be double-fired.
+  @Published var windowsSetupBusy = false
+
   // Repo discovery (for the searchable picker).
   @Published var availableRepos: [RepoRef] = []
   @Published var reposLoading = false
@@ -50,6 +64,9 @@ final class AppState: ObservableObject {
     labelsText = defaults.string(forKey: "labels") ?? labelsText
     runnersPerRepo = max(1, defaults.integer(forKey: "runnersPerRepo"))
     clientId = defaults.string(forKey: "clientId") ?? ""
+    windowsImageReady = defaults.bool(forKey: "windowsImageReady")
+    windowsEnabled = defaults.bool(forKey: "windowsEnabled")
+    windowsBaseImage = defaults.string(forKey: "windowsBaseImage") ?? windowsBaseImage
     isSignedIn = TokenStore.load() != nil
   }
 
@@ -66,6 +83,9 @@ final class AppState: ObservableObject {
     defaults.set(labelsText, forKey: "labels")
     defaults.set(runnersPerRepo, forKey: "runnersPerRepo")
     defaults.set(clientId, forKey: "clientId")
+    defaults.set(windowsImageReady, forKey: "windowsImageReady")
+    defaults.set(windowsEnabled, forKey: "windowsEnabled")
+    defaults.set(windowsBaseImage, forKey: "windowsBaseImage")
   }
 
   var labels: [String] {
@@ -199,6 +219,14 @@ final class AppState: ObservableObject {
         guard fleetEpoch == myEpoch else { return } // went offline during download
         let factory = LocalProcessProviderFactory(
           templateDirectory: template, runsRoot: HostCleanup.runsRoot())
+        // Windows fleet (opt-in): only when the user enabled it AND a base image
+        // exists AND a hypervisor CLI is installed. Never spun up automatically.
+        let windowsFactory: WindowsVMProviderFactory? =
+          (windowsEnabled && windowsImageReady)
+          ? WindowsVMProviderFactory.detectInstalledCLI().map {
+            WindowsVMProviderFactory(baseImage: windowsBaseImage, cli: $0)
+          }
+          : nil
         for repo in repos {
           guard fleetEpoch == myEpoch else { break }
           let client = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
@@ -209,6 +237,18 @@ final class AppState: ObservableObject {
           orchestrators[repo.fullName] = orch
           created.append(orch)
           await orch.start()
+
+          if let windowsFactory {
+            let winClient = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
+            let winFleet = FleetConfig(
+              owner: repo.owner, repo: repo.name, labels: windowsLabels, desiredCount: 1)
+            let winOrch = RunnerOrchestrator(
+              controlPlane: winClient, factory: windowsFactory, config: winFleet)
+            winOrch.onChange = { [weak self] in self?.sync() }
+            orchestrators["\(repo.fullName) (Windows)"] = winOrch
+            created.append(winOrch)
+            await winOrch.start()
+          }
         }
         guard fleetEpoch == myEpoch else {
           for orch in created { await orch.stop() } // user went offline; undo
@@ -252,6 +292,105 @@ final class AppState: ObservableObject {
     guard state == .offline else { statusMessage = "Go offline first."; return }
     HostCleanup.purgeAll()
     statusMessage = "Removed the cached agent and all run files."
+  }
+
+  // MARK: Windows runner (opt-in)
+
+  /// True only if a Windows-capable hypervisor CLI (Parallels `prlctl`, or UTM
+  /// `utmctl`) is installed. Windows runners aren't offerable without one.
+  var windowsBackendAvailable: Bool { WindowsVMProviderFactory.detectInstalledCLI() != nil }
+
+  /// Labels a Windows fleet registers with. Mirrors the macOS arm of a CI
+  /// matrix: `runs-on: [self-hosted, Windows, mactions]`.
+  private let windowsLabels = ["self-hosted", "Windows", "mactions"]
+
+  /// The ONLY trigger for any Windows ISO download / base-image build. Nothing
+  /// heavy ever happens automatically — this runs `scripts/prepare-windows-image`
+  /// (which auto-downloads the latest Win11 ARM64 ISO if none is supplied, then
+  /// builds the base VM) and surfaces progress in `statusMessage`.
+  ///
+  /// EXPERIMENTAL + LONG: the conversion/install is multi-GB and multi-minute,
+  /// and the live VM path is not yet verified end to end. The button only kicks
+  /// off the prep; a human still completes the one-time install per the script's
+  /// printed next steps.
+  func setUpWindowsRunner() {
+    guard state == .offline else { statusMessage = "Go offline first."; return }
+    guard !windowsSetupBusy else { return }
+    guard let script = Self.prepareWindowsImageScript() else {
+      statusMessage = "Couldn't find scripts/prepare-windows-image."
+      return
+    }
+    guard windowsBackendAvailable else {
+      statusMessage =
+        "No Windows hypervisor found. Install Parallels (recommended) or UTM, then try again."
+      return
+    }
+    // Fail fast on missing ISO-converter deps so we don't start a multi-GB
+    // download that can't finish.
+    let missing = WindowsImage.missingConverterDependencies()
+    if !missing.isEmpty {
+      statusMessage = "Install the ISO converter tools first: brew install \(missing.joined(separator: " "))"
+      return
+    }
+    windowsSetupBusy = true
+    statusMessage = "Setting up the Windows runner (downloading + building the base image — this takes a while)…"
+    let image = windowsBaseImage
+    Task {
+      // prepare-windows-image auto-resolves + downloads the latest Win11 ARM64
+      // ISO (UUP dump) when no --iso is passed, then drives the base-VM build.
+      // The blocking shell-out runs off the main actor so the UI stays live.
+      let result = await Self.runPrepScript(script, name: image)
+      windowsSetupBusy = false
+      if let result, result.ok {
+        windowsImageReady = true
+        saveConfig()
+        statusMessage =
+          "Windows base image prep started. Finish the one-time install per the script's printed steps, then toggle Windows on."
+      } else {
+        statusMessage =
+          "Windows setup failed: \(result?.stderr.trimmingCharacters(in: .whitespacesAndNewlines) ?? "couldn't run the prep script")."
+      }
+    }
+  }
+
+  /// Run the (long-blocking) prep script off the main actor so the popover stays
+  /// responsive, returning the result back on the caller's actor.
+  private nonisolated static func runPrepScript(_ script: String, name: String) async
+    -> Shell.Result?
+  {
+    await Task.detached { try? Shell.run(script, ["--name", name]) }.value
+  }
+
+  func setWindowsEnabled(_ on: Bool) {
+    guard state == .offline else { return }
+    windowsEnabled = on
+    saveConfig()
+  }
+
+  /// Check whether a newer Win11 ARM64 build is available than the one the base
+  /// image was built from, and surface it (the auto-update nudge). Pure compare
+  /// logic lives in `WindowsImage`; this just wires it to the status line.
+  func checkForWindowsImageUpdate() {
+    guard windowsImageReady else { return }
+    Task {
+      guard let latest = try? await WindowsImage.latestBuild() else { return }
+      let installed = WindowsImage.recordedBaseImageBuild()
+      if WindowsImage.updateAvailable(installed: installed, latest: latest.build) {
+        statusMessage =
+          "A newer Windows 11 ARM64 build (\(latest.build)) is available — re-run \"Set up Windows runner\" to rebuild the base image."
+      }
+    }
+  }
+
+  /// Locate `scripts/prepare-windows-image`. In `swift run` dev the cwd is the
+  /// package root; in a bundled app it'd ship in Resources. Search both.
+  static func prepareWindowsImageScript() -> String? {
+    let candidates = [
+      FileManager.default.currentDirectoryPath + "/scripts/prepare-windows-image",
+      Bundle.main.path(forResource: "prepare-windows-image", ofType: nil) ?? "",
+      Bundle.main.bundlePath + "/Contents/Resources/scripts/prepare-windows-image",
+    ]
+    return candidates.first { !$0.isEmpty && FileManager.default.isExecutableFile(atPath: $0) }
   }
 
   private func sync() {

@@ -4,7 +4,8 @@
 
   Turns a fresh Win11-ARM install into a Mactions runner base image:
     1. Enable OpenSSH Server (so the Mac host can SSH in to launch the agent),
-       open the firewall, and make PowerShell the default SSH shell.
+       open the firewall, and make cmd.exe the default SSH shell (the host's
+       launch command is CMD syntax — see step "Make cmd.exe the default shell").
     2. Download + extract the win-arm64 actions-runner agent to C:\actions-runner
        (short root path to dodge Windows MAX_PATH on deep node_modules trees).
 
@@ -39,12 +40,17 @@ if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction Silentl
     -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22
 }
 
-# Make PowerShell the default shell for SSH sessions so the remote command runs
-# in a real shell (the runner's run.cmd is a batch file; cmd works too, but
-# PowerShell is the documented default-shell choice).
+# Make cmd.exe the default shell for SSH sessions. The host launches the agent
+# with `cd /d C:\actions-runner && run.cmd --jitconfig <JIT>` (see
+# WindowsVMProvider.remoteCommand), which is CMD syntax: `&&` chaining and the
+# `cd /d` drive-switch flag are BOTH PowerShell 5.1 parse errors, so the SSH
+# DefaultShell MUST be cmd.exe for that command to run. (run.cmd is a batch file
+# anyway, so cmd is the natural host shell.) The provider and this image are kept
+# in lockstep on cmd; if you ever switch the DefaultShell to PowerShell, rewrite
+# remoteCommand to PowerShell syntax too.
 New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force | Out-Null
 New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell `
-  -Value 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' `
+  -Value 'C:\Windows\System32\cmd.exe' `
   -PropertyType String -Force | Out-Null
 
 # --- 2. win-arm64 actions-runner agent --------------------------------------

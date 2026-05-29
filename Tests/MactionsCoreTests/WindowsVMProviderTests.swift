@@ -150,6 +150,24 @@ final class WindowsVMProviderTests: XCTestCase {
     }
   }
 
+  // MARK: Teardown guard
+
+  func testStopIsIdempotentAndClearsRunning() {
+    // `stop()` tears the clone down via a (here non-existent) CLI path, which is
+    // harmless. The `tornDown` guard means a second `stop()` is a safe no-op and
+    // `isRunning` stays false. (The double-onExit guard itself needs a live VM
+    // to exercise the start() path, so it's verified by inspection + this guard;
+    // see WindowsVMProvider.teardown.)
+    let p = WindowsVMProvider(
+      id: "abc", baseImage: "base",
+      cli: ParallelsCLI(executable: "/nonexistent/prlctl"), sshPassword: nil)
+    XCTAssertFalse(p.isRunning)
+    p.stop()
+    XCTAssertFalse(p.isRunning)
+    p.stop()  // second call must not crash / re-run teardown effects
+    XCTAssertFalse(p.isRunning)
+  }
+
   // MARK: Stray-clone reaping (HostCleanup)
 
   func testWindowsCloneNameExtractionOnlyMatchesOurPrefix() {

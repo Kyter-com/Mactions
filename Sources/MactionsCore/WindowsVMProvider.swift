@@ -119,8 +119,10 @@ public struct UTMCLI: WindowsVMCLI {
 /// Base image requirements (built once by `scripts/prepare-windows-image`):
 ///   - Windows 11 ARM64 with the `actions-runner-win-arm64` agent at
 ///     `C:\actions-runner`.
-///   - OpenSSH Server enabled, with a `runner` login and PowerShell as the
-///     default shell, reachable on the VM's IP.
+///   - OpenSSH Server enabled, with a `runner` login and **cmd.exe** as the
+///     default shell, reachable on the VM's IP. (cmd.exe is required: the
+///     launch command `remoteCommand` builds is CMD syntax — `&&` and `cd /d`
+///     are PowerShell 5.1 parse errors. `bootstrap.ps1` sets this.)
 ///   - (Parallels only, if you use `prlctl exec` instead of SSH) Parallels Tools.
 ///
 /// EXPERIMENTAL: depends on a hand-prepared base image + a Windows-capable
@@ -142,6 +144,12 @@ public final class WindowsVMProvider: RunnerProvider {
   var cloneName: String { "mactions-\(id)" }
 
   private var running = false
+  /// Set the first (and only) time the clone is torn down. Mirrors
+  /// `LocalProcessProvider.cleaned`: guards against the background thread and
+  /// `stop()` both racing to stop+delete the VM and fire `onExit` twice (the
+  /// orchestrator treats a second `onExit` as a real second exit and would
+  /// re-provision against a fleet the user already took offline).
+  private var tornDown = false
   private let lock = NSLock()
 
   /// - Parameters:
@@ -198,19 +206,36 @@ public final class WindowsVMProvider: RunnerProvider {
         status = 1
       }
       // Teardown — MUST run on every path (success, SSH failure, boot failure)
-      // so no clone, snapshot, or _work checkout survives. This is the
-      // ephemerality bar.
-      _ = try? Shell.run(cli.executable, cli.stopArgs(clone: cloneName))
-      _ = try? Shell.run(cli.executable, cli.deleteArgs(clone: cloneName))
-      lock.lock(); running = false; lock.unlock()
-      onExit(status)
+      // so no clone, snapshot, or _work checkout survives. `teardown` is
+      // idempotent: if `stop()` already raced in and tore the clone down (user
+      // went offline mid-job), this is a no-op and `onExit` does NOT fire a
+      // second time.
+      if teardown() { onExit(status) }
     }
   }
 
   public func stop() {
-    lock.lock(); running = false; lock.unlock()
+    // User went offline / quit: tear the clone down now. We deliberately do NOT
+    // call `onExit` here — `stop()` is the orchestrator's own teardown path, and
+    // a second `onExit` would look like a real exit to re-provision against.
+    _ = teardown()
+  }
+
+  /// Force-stop + permanently delete the clone, exactly once. Returns `true` the
+  /// first time (the caller owns firing `onExit`), `false` on every subsequent
+  /// call so the natural-exit thread and a racing `stop()` can't double-delete
+  /// the VM or fire `onExit` twice. Mirrors `LocalProcessProvider.cleanup()`'s
+  /// `cleaned` guard.
+  @discardableResult
+  private func teardown() -> Bool {
+    lock.lock()
+    if tornDown { lock.unlock(); return false }
+    tornDown = true
+    running = false
+    lock.unlock()
     _ = try? Shell.run(cli.executable, cli.stopArgs(clone: cloneName))
     _ = try? Shell.run(cli.executable, cli.deleteArgs(clone: cloneName))
+    return true
   }
 
   // MARK: Pure builders (unit-testable without a VM)

@@ -3,11 +3,16 @@
 # prepare-windows-image — build the pristine Win11-ARM base VM that Mactions'
 # WindowsVMProvider clones (throwaway) per job.
 #
-# This is the ONE part of Windows support with an unavoidable manual step: you
-# supply the official Windows 11 ARM64 ISO (Microsoft only offers it as a
-# time-limited, ~6-7 GB interactive download — it cannot be hard-coded here).
-# Everything else (the autounattend answer file, the bootstrap ISO, and the
-# guided install) this script sets up for you.
+# You can supply the official Windows 11 ARM64 ISO yourself (--iso), or omit it
+# and let this script AUTO-RESOLVE + download the LATEST Win11 ARM64 retail build
+# via UUP dump (the only automatable source — Microsoft only offers the ISO as a
+# time-limited interactive download, so it can't be hard-coded). Everything else
+# (the autounattend answer file, the bootstrap ISO, the guided install) this
+# script sets up for you.
+#
+# Auto-download path needs a few brew-installable converter tools (aria2c,
+# cabextract, wimlib, chntpw); the script checks for them and prints an exact
+# `brew install …` line if any are missing.
 #
 # After this finishes you'll have a powered-off VM named (by default)
 # "win11-runner-base". Point Mactions' WindowsVMProviderFactory at that name.
@@ -20,10 +25,12 @@
 # provider.
 #
 # Usage:
-#   scripts/prepare-windows-image --iso /path/to/Win11_ARM64.iso [options]
+#   scripts/prepare-windows-image [--iso /path/to/Win11_ARM64.iso] [options]
 #
 # Options:
-#   --iso PATH        Path to the official Win11 ARM64 ISO (required).
+#   --iso PATH        Path to an official Win11 ARM64 ISO. OPTIONAL — if omitted,
+#                     the latest Win11 ARM64 retail build is auto-downloaded via
+#                     UUP dump and converted to an ISO.
 #   --name NAME       Base VM name to create (default: win11-runner-base).
 #   --tool TOOL       parallels | utm   (default: auto-detect).
 #   --disk GB         Guest disk size in GB (default: 64).
@@ -81,14 +88,95 @@ EOF
   exit 1
 fi
 
-[[ -n "$ISO" ]] || die "missing --iso. Download the official Win11 ARM64 ISO first:
-  open https://www.microsoft.com/en-us/software-download/windows11arm64
-  (choose 'Windows 11 (multi-edition ISO for Arm64)')."
-[[ -f "$ISO" ]] || die "ISO not found at: $ISO"
+# --- Resolve the ISO: user-supplied, or auto-download the latest -------------
+# UUP dump JSON API: list arm64 builds newest-first, take the first, fetch the
+# download package + run its convert script to produce an ISO. This is the only
+# automatable source for the official media (Microsoft's own ISO is a manual,
+# time-limited interactive download).
+UUP_API="https://api.uupdump.net"
+RECORDED_BUILD=""
+
+require_converter_deps() {
+  # Mirrors WindowsImage.converterDependencies in MactionsCore. Map binary ->
+  # brew formula (wimlib-imagex lives in the `wimlib` formula).
+  local -a bins=(aria2c cabextract wimlib-imagex chntpw)
+  local -a missing=()
+  for b in "${bins[@]}"; do
+    command -v "$b" >/dev/null 2>&1 || {
+      case "$b" in wimlib-imagex) missing+=("wimlib") ;; *) missing+=("$b") ;; esac
+    }
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    die "auto-download needs these tools first:
+  brew install ${missing[*]}
+Or supply your own ISO with --iso /path/to/Win11_ARM64.iso (skips the converter)."
+  fi
+}
+
+auto_download_iso() {
+  command -v curl   >/dev/null 2>&1 || die "curl is required to query UUP dump."
+  command -v python3 >/dev/null 2>&1 || die "python3 is required to parse the UUP dump JSON."
+  require_converter_deps
+
+  echo "==> Resolving the latest Windows 11 ARM64 retail build from UUP dump" >&2
+  local listing uuid build
+  listing="$(curl -fsSL "$UUP_API/listid.php?search=Windows%2011%20arm64&sortByDate=1")" \
+    || die "couldn't reach the UUP dump API ($UUP_API)."
+  # First arm64 row (the API returns newest-first with sortByDate=1).
+  read -r uuid build < <(python3 - "$listing" <<'PY'
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    sys.exit("could not parse UUP dump JSON")
+builds = (data.get("response") or {}).get("builds") or []
+for b in builds:
+    if str(b.get("arch", "")).lower() == "arm64":
+        print(b.get("uuid", ""), b.get("build", ""))
+        break
+PY
+)
+  [[ -n "$uuid" ]] || die "no Win11 ARM64 build found in the UUP dump listing."
+  RECORDED_BUILD="$build"
+  echo "    build $build  (uuid $uuid)" >&2
+
+  local workdir
+  workdir="$(mktemp -d)"
+  echo "==> Fetching the UUP download package + converting to ISO (this is the slow, multi-GB step)" >&2
+  # UUP dump ships a ready-made download+convert package per uuid; the macOS/
+  # Linux convert script (uup_download_macos.sh / convert.sh) drives aria2c +
+  # wimlib + cabextract + chntpw to build the ISO. Edition: Professional.
+  curl -fsSL -o "$workdir/uup.zip" \
+    "$UUP_API/get.php?id=$uuid&pack=en-us&edition=professional&arch=arm64&autodl=2&updates=1" \
+    || die "couldn't download the UUP package for $uuid."
+  ( cd "$workdir" && unzip -oq uup.zip )
+  local conv
+  conv="$workdir/uup_download_macos.sh"
+  [[ -f "$conv" ]] || conv="$workdir/convert.sh"
+  [[ -f "$conv" ]] || die "UUP package didn't contain a macOS convert script — convert manually, then re-run with --iso."
+  chmod +x "$conv"
+  ( cd "$workdir" && "./$(basename "$conv")" ) || die "ISO conversion failed (see output above)."
+  ISO="$(find "$workdir" -maxdepth 1 -name '*.ISO' -o -maxdepth 1 -name '*.iso' | head -n1)"
+  [[ -n "$ISO" && -f "$ISO" ]] || die "converter finished but produced no ISO in $workdir."
+  echo "==> Built ISO: $ISO" >&2
+}
+
+if [[ -z "$ISO" ]]; then
+  auto_download_iso
+else
+  [[ -f "$ISO" ]] || die "ISO not found at: $ISO"
+  # User-supplied ISO: try to record its build id from the filename if present,
+  # else leave the recorded build empty (the app's auto-update check treats an
+  # empty recorded build as "an update is available" until you rebuild).
+  RECORDED_BUILD="$(printf '%s' "$(basename "$ISO")" | grep -Eo '[0-9]{5}\.[0-9]+' | head -n1 || true)"
+fi
 
 # --- Build the autounattend ISO ---------------------------------------------
 # Windows Setup auto-reads autounattend.xml from removable media. We also place
-# bootstrap.ps1 under \setup so FirstLogonCommands can run it.
+# bootstrap.ps1 under \setup; autounattend.xml's FirstLogonCommands SCANS every
+# drive root for \setup\bootstrap.ps1 (the unattend media's drive letter isn't
+# predictable) and runs the first match — so provisioning finds it regardless of
+# whether the ISO mounts as D:, E:, …
 build_unattend_iso() {
   local staging out
   staging="$(mktemp -d)"
@@ -107,10 +195,21 @@ echo "==> Building unattended-install ISO (autounattend.xml + bootstrap.ps1)"
 UNATTEND_ISO="$(build_unattend_iso)"
 echo "    $UNATTEND_ISO"
 
+# Record the build id this base image is built from so the app's auto-update
+# check (WindowsImage.recordedBaseImageBuild) can compare it to the latest
+# available and nudge a rebuild when Microsoft ships a newer Win11. Lives at the
+# mactions root (NOT under runs/, which is swept every go-online).
+MACTIONS_ROOT="${HOME}/.mactions"
+if [[ -n "${RECORDED_BUILD:-}" ]]; then
+  mkdir -p "$MACTIONS_ROOT"
+  printf '%s\n' "$RECORDED_BUILD" > "$MACTIONS_ROOT/windows-base.build"
+fi
+
 echo
 echo "Tool:        $TOOL"
 echo "Base VM:     $NAME"
 echo "Win11 ISO:   $ISO"
+echo "Win11 build: ${RECORDED_BUILD:-unknown}"
 echo "Unattend:    $UNATTEND_ISO"
 echo "Disk/RAM/CPU: ${DISK_GB}GB / ${RAM_MB}MB / ${CPUS}"
 echo
