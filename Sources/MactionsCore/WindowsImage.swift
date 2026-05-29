@@ -276,4 +276,29 @@ public enum WindowsImage {
   ) -> [String] {
     converterDependencies.filter { !lookup($0.binary) }.map(\.formula)
   }
+
+  // MARK: - Per-clone config ISO (the headless JIT-delivery payload)
+
+  /// `hdiutil makehybrid` arguments to build a tiny per-clone **config ISO** that
+  /// carries the JIT registration into a headless Windows guest (the guest reads
+  /// it off the disc by volume label and registers OUTBOUND to GitHub — no SSH /
+  /// IP discovery needed). Pure builder, unit-tested like the `WindowsVMCLI` verb
+  /// shapes; the real run is a `Shell.runChecked` at provision time.
+  ///
+  /// Flags mirror the proven unattend-ISO build in `scripts/prepare-windows-image`:
+  ///   - `-iso -joliet`: ISO9660 + Joliet so Windows reads exact lowercase names
+  ///     (the primary tree mangles to 8.3); do NOT add Rock Ridge (Windows ignores it).
+  ///   - `-ov`: overwrite — required for an idempotent rebuild.
+  ///   - `-default-volume-name`: a stable label so the guest finds the disc
+  ///     regardless of drive letter.
+  /// `sourceDir` holds `mactions/jitconfig` (the base64 JIT, no trailing newline).
+  public static func configISOArgs(
+    sourceDir: String, output: String, volumeName: String = "MACTIONS"
+  ) -> [String] {
+    ["makehybrid", "-iso", "-joliet", "-ov", "-default-volume-name", volumeName, "-o", output, sourceDir]
+  }
+
+  /// `hdiutil` for the config-ISO build (PATH first, then the system path a
+  /// Finder-launched app always has).
+  public static func hdiutilPath() -> String { Shell.which("hdiutil") ?? "/usr/bin/hdiutil" }
 }

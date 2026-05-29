@@ -300,55 +300,60 @@ case "$TOOL" in
     echo
     echo "==> Booting for the unattended install (this takes a while)."
     echo "    Watch progress in the Parallels window; autounattend.xml drives it"
-    echo "    and bootstrap.ps1 installs OpenSSH + the win-arm64 runner agent."
+    echo "    and bootstrap.ps1 installs the win-arm64 runner agent + the per-clone"
+    echo "    run-once Scheduled Task (outbound registration — no SSH)."
     prlctl start "$NAME"
     cat <<EOF
 
 NEXT (one time):
   1. Let the install + first-logon bootstrap finish (the guest prints
      "Bootstrap complete" and asks you to shut down).
-  2. Detach the install media so future clones don't try to reinstall:
-       prlctl set "$NAME" --device-del cdrom0
-       prlctl set "$NAME" --device-del cdrom1
+  2. Detach the install media, but KEEP cdrom0 as the empty per-clone config
+     slot (the provider attaches the per-job JIT ISO there with --device-set):
+       prlctl set "$NAME" --device-del cdrom1        # unattend ISO
+       prlctl set "$NAME" --device-set cdrom0 --disconnect --image ""  # free the Win ISO, keep the slot
   3. Shut the VM down (pristine base):
        prlctl stop "$NAME"
-  4. Verify SSH reachability once from a throwaway clone:
-       prlctl clone "$NAME" --linked --name mactions-smoke
-       prlctl start mactions-smoke
-       prlctl list -f --info mactions-smoke      # grab the IP
-       ssh runner@<ip> 'echo \$env:RUNNER_ARCH'  # expect ARM64
-       prlctl stop mactions-smoke --kill && prlctl delete mactions-smoke
+  4. (Headless smoke — no SSH) The provider clones, attaches a config ISO to
+     cdrom0, boots; the guest runs ONE job then powers itself off. Confirm a
+     clone boots + self-powers-off; Mactions detects completion via power state.
   5. Point Mactions at base image name "$NAME" (WindowsVMProviderFactory).
 EOF
     ;;
 
   utm)
-    # utmctl has NO 'create' verb (ScriptingBridge exposes only clone/start/
-    # stop/delete/ip-address). The first template MUST be built in the UTM GUI.
+    # utmctl has NO 'create'/attach verb (ScriptingBridge exposes only clone/
+    # start/stop/delete/status/ip-address). The template MUST be built in the GUI,
+    # and the per-clone JIT is delivered by OVERWRITING a FIXED in-bundle data
+    # disk in the clone bundle (UNVERIFIED — see the live-verification checklist
+    # in AGENTS.md / issue #5 before trusting this backend; Parallels is proven).
     cat <<EOF
-==> UTM has no CLI 'create' verb — build the template ONCE in the UTM app:
+==> UTM has no CLI 'create'/attach verb — build the template ONCE in the UTM app:
 
   1. Open UTM -> Create a New Virtual Machine -> Virtualize -> Windows.
   2. Disable "Import VHDX Image"; instead attach the Windows ISO:
        Boot ISO Image:  $ISO
   3. Set: ${RAM_MB} MB RAM, ${CPUS} CPUs, ${DISK_GB} GB disk.
      Enable TPM 2.0 + UEFI (required, or Win11 Setup fails its hardware check).
-  4. After creating, add a SECOND CD/USB drive pointing at the unattend ISO:
+  4. Add a SECOND CD pointing at the unattend ISO (removed after install):
        $UNATTEND_ISO
-  5. Name the VM exactly:  $NAME
-  6. Start it; autounattend.xml drives the install and bootstrap.ps1 provisions
-     OpenSSH + the win-arm64 runner agent. When it prints "Bootstrap complete":
-       - remove BOTH ISO drives (so clones don't reinstall),
+  5. Add a small FIXED data disk (Add Drive -> New, NOT "New External") — this
+     is the per-clone CONFIG slot the provider overwrites with the JIT each job.
+     Confirm config.plist gives it an ImageName under Data/<UUID> (a CD records an
+     external bookmark with no in-bundle file, which the overwrite needs). Note
+     that ImageName for UTMCLI(inBundleImageName:).
+  6. Name the VM exactly:  $NAME
+  7. Start it; autounattend.xml drives the install and bootstrap.ps1 installs the
+     win-arm64 runner agent + the run-once Scheduled Task (outbound, no SSH).
+     When it prints "Bootstrap complete":
+       - remove the TWO install ISOs (keep the fixed config disk),
        - (optional) remove the display device for a truly headless clone,
        - shut the VM down. That powered-off VM is your pristine base.
-  7. Verify from a clone (NOTE: utmctl needs an active GUI login session):
-       /Applications/UTM.app/Contents/MacOS/utmctl clone "$NAME" --name mactions-smoke
-       /Applications/UTM.app/Contents/MacOS/utmctl start mactions-smoke --hide
-       /Applications/UTM.app/Contents/MacOS/utmctl ip-address mactions-smoke
-       ssh runner@<ip> 'echo \$env:RUNNER_ARCH'   # expect ARM64
-       /Applications/UTM.app/Contents/MacOS/utmctl stop mactions-smoke
-       /Applications/UTM.app/Contents/MacOS/utmctl delete mactions-smoke
-  8. Point Mactions at base image name "$NAME" (WindowsVMProviderFactory with UTMCLI()).
+  8. LIVE-VERIFY (AGENTS.md): clone it, overwrite <clone>.utm/Data/<ImageName>
+     with a config ISO while powered off, start --hide, and confirm the guest
+     mounts the NEW contents + the job runs + the VM self-powers-off. If UTM
+     serves a cached image instead, fall back to Parallels.
+  9. Point Mactions at base image name "$NAME" (WindowsVMProviderFactory with UTMCLI()).
 
 The unattend ISO is ready at: $UNATTEND_ISO
 EOF

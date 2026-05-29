@@ -3,28 +3,24 @@ import XCTest
 @testable import MactionsCore
 
 /// Unit tests for the *pure* logic of the Windows VM provider: command/argument
-/// construction, IP parsing, SSH invocation, and clone-name extraction. These do
-/// NOT boot a VM (none is available in CI / on the dev host) — they pin the
-/// shapes the provider hands to `prlctl`/`utmctl`/`ssh`, the same way
-/// `GitHubRequestTests` pins the request builders.
+/// construction, IP parsing, the per-clone config-ISO + injection plans, the
+/// power-state completion classifier, and clone-name extraction. These do NOT
+/// boot a VM (none is available in CI / on the dev host) — they pin the shapes
+/// the provider hands to `prlctl`/`utmctl`/`hdiutil`.
 final class WindowsVMProviderTests: XCTestCase {
 
   // MARK: Parallels (prlctl) verb shapes
 
   func testParallelsCloneIsLinkedCopyOnWrite() {
     let cli = ParallelsCLI(executable: "/usr/local/bin/prlctl")
-    // `--linked` is the cheap CoW clone (analog to Tart/APFS clone). The clone
-    // name carries the `mactions-` prefix for scoped teardown.
     XCTAssertEqual(
       cli.cloneArgs(base: "win11-runner-base", clone: "mactions-abc"),
       ["clone", "win11-runner-base", "--linked", "--name", "mactions-abc"])
     XCTAssertEqual(cli.startArgs(clone: "mactions-abc"), ["start", "mactions-abc"])
-    // Force power-off, then permanent delete (the ephemerality bar).
     XCTAssertEqual(cli.stopArgs(clone: "mactions-abc"), ["stop", "mactions-abc", "--kill"])
     XCTAssertEqual(cli.forceStopArgs(clone: "mactions-abc"), ["stop", "mactions-abc", "--kill"])
     XCTAssertEqual(cli.deleteArgs(clone: "mactions-abc"), ["delete", "mactions-abc"])
     XCTAssertEqual(cli.statusArgs(clone: "mactions-abc"), ["status", "mactions-abc"])
-    // Structured JSON, not `-f --info` text (text scraping picked up a netmask).
     XCTAssertEqual(cli.ipArgs(clone: "mactions-abc"), ["list", "mactions-abc", "--full", "--json"])
   }
 
@@ -34,7 +30,6 @@ final class WindowsVMProviderTests: XCTestCase {
     let cli = UTMCLI(executable: "/Applications/UTM.app/Contents/MacOS/utmctl")
     XCTAssertEqual(cli.cloneArgs(base: "Win11-ARM-Base", clone: "mactions-xyz"),
       ["clone", "Win11-ARM-Base", "--name", "mactions-xyz"])
-    // `--hide` boots headless (no surfaced window).
     XCTAssertEqual(cli.startArgs(clone: "mactions-xyz"), ["start", "mactions-xyz", "--hide"])
     XCTAssertEqual(cli.stopArgs(clone: "mactions-xyz"), ["stop", "mactions-xyz"])
     XCTAssertEqual(cli.deleteArgs(clone: "mactions-xyz"), ["delete", "mactions-xyz"])
@@ -42,16 +37,62 @@ final class WindowsVMProviderTests: XCTestCase {
     XCTAssertEqual(cli.ipArgs(clone: "mactions-xyz"), ["ip-address", "mactions-xyz"])
   }
 
-  // MARK: IP parsing
+  // MARK: Per-clone config ISO (the headless JIT-delivery payload)
 
-  func testParseIPFromUTMBareAddress() {
-    // utmctl ip-address prints one address per line.
-    XCTAssertEqual(UTMCLI().parseIP(from: "192.168.64.7\n"), "192.168.64.7")
+  func testConfigISOArgsFlagOrder() {
+    XCTAssertEqual(
+      WindowsImage.configISOArgs(sourceDir: "/tmp/stage", output: "/tmp/config.iso"),
+      ["makehybrid", "-iso", "-joliet", "-ov", "-default-volume-name", "MACTIONS", "-o", "/tmp/config.iso", "/tmp/stage"])
+    // Custom volume name flows through (right after -default-volume-name).
+    XCTAssertEqual(
+      WindowsImage.configISOArgs(sourceDir: "/s", output: "/o.iso", volumeName: "MX"),
+      ["makehybrid", "-iso", "-joliet", "-ov", "-default-volume-name", "MX", "-o", "/o.iso", "/s"])
   }
 
+  // MARK: Injection plans (how each backend delivers the config ISO)
+
+  func testUTMInjectionOverwritesAFixedInBundleDrive() {
+    // UTM has no attach verb: the clone bundle path is derived deterministically
+    // and the plan overwrites the fixed in-bundle drive at <bundle>/Data/<name>.
+    let cli = UTMCLI(documentsDir: "/docs", inBundleImageName: "cfg.img")
+    XCTAssertEqual(cli.cloneBundlePath(clone: "mactions-abc"), "/docs/mactions-abc.utm")
+    XCTAssertEqual(
+      cli.injectionPlan(clone: "mactions-abc", clonePath: nil, configISO: "/tmp/c.iso"),
+      .overwriteInBundleDrive(target: "/docs/mactions-abc.utm/Data/cfg.img"))
+    // An explicitly-resolved clonePath is honored over the derived default.
+    XCTAssertEqual(
+      cli.injectionPlan(clone: "mactions-abc", clonePath: "/elsewhere/x.utm", configISO: "/tmp/c.iso"),
+      .overwriteInBundleDrive(target: "/elsewhere/x.utm/Data/cfg.img"))
+  }
+
+  func testParallelsInjectionAttachesViaCLI() {
+    // Parallels has a real attach verb — no in-bundle dance, and no bundle path.
+    let cli = ParallelsCLI()
+    XCTAssertNil(cli.cloneBundlePath(clone: "mactions-abc"))
+    XCTAssertEqual(
+      cli.injectionPlan(clone: "mactions-abc", clonePath: nil, configISO: "/tmp/c.iso"),
+      .attachCommands([["set", "mactions-abc", "--device-set", "cdrom0", "--image", "/tmp/c.iso", "--connect"]]))
+  }
+
+  // MARK: Power-state completion classifier
+
+  func testPhaseClassifierRequiresRunningBeforeStopped() {
+    let p = WindowsVMProvider(id: "abc", baseImage: "base", cli: UTMCLI())
+    // 'stopped' (fresh clone or self-powered-off) classifies as .stopped...
+    XCTAssertEqual(p.phase(from: "stopped"), .stopped)
+    // ...but live/transitional states are .running (so the boot gate passes)...
+    XCTAssertEqual(p.phase(from: "started"), .running)
+    XCTAssertEqual(p.phase(from: "VM 'x' is running"), .running)
+    XCTAssertEqual(p.phase(from: "stopping"), .running)  // mid power-off, NOT yet stopped
+    XCTAssertEqual(p.phase(from: "suspended"), .running)
+    // ...and an unknown/empty read is .starting (keep polling, don't conclude).
+    XCTAssertEqual(p.phase(from: ""), .starting)
+    XCTAssertEqual(p.phase(from: "???"), .starting)
+  }
+
+  // MARK: IP parsing (unused on the outbound flow; kept for diagnostics)
+
   func testParseIPFromParallelsJSON() {
-    // prlctl list --full --json returns an array; read the labeled lease field
-    // (ip_configured is a bare address, no /mask).
     let out = """
       [{"uuid":"{abc}","status":"running","ip_configured":"10.211.55.12","name":"mactions-abc"}]
       """
@@ -59,83 +100,26 @@ final class WindowsVMProviderTests: XCTestCase {
   }
 
   func testParseIPParallelsIgnoresTextDumpAndUnleased() {
-    // The old `-f --info` text dump is NOT what we parse now — a non-JSON body
-    // yields nil instead of scraping a netmask/gateway as "the IP".
     XCTAssertNil(ParallelsCLI().parseIP(from: "ip=10.0.0.5/255.255.255.0 gw=10.0.0.1"))
-    // ip_configured "-" / "" means no lease yet.
     XCTAssertNil(ParallelsCLI().parseIP(from: #"[{"ip_configured":"-"}]"#))
     XCTAssertNil(ParallelsCLI().parseIP(from: #"[{"ip_configured":""}]"#))
   }
 
-  func testParseIPSkipsZeroPlaceholderBeforeDHCP() {
-    // utmctl token-scan: 0.0.0.0 before a lease is not a real IP.
-    XCTAssertNil(UTMCLI().parseIP(from: "0.0.0.0\n"))
-  }
-
-  func testParseIPReturnsNilWhenNoAddressYet() {
-    XCTAssertNil(ParallelsCLI().parseIP(from: "STATUS\nstopped\n"))
-    XCTAssertNil(UTMCLI().parseIP(from: ""))
-  }
-
   func testParseIPUTMRejectsOutOfRangeMaskAndApipa() {
-    // utmctl's token-scan parseIP must reject non-lease values.
-    XCTAssertNil(UTMCLI().parseIP(from: "999.1.1.1"))             // out-of-range octet
-    XCTAssertNil(UTMCLI().parseIP(from: "version 2.334.0 build")) // not an IP
+    XCTAssertNil(UTMCLI().parseIP(from: "999.1.1.1"))
+    XCTAssertNil(UTMCLI().parseIP(from: "version 2.334.0 build"))
     XCTAssertNil(UTMCLI().parseIP(from: "169.254.10.5"))         // APIPA link-local
     XCTAssertNil(UTMCLI().parseIP(from: "255.255.255.0"))        // netmask/broadcast
+    XCTAssertNil(UTMCLI().parseIP(from: "0.0.0.0\n"))            // pre-lease placeholder
     XCTAssertEqual(UTMCLI().parseIP(from: "192.168.64.7"), "192.168.64.7")
   }
 
-  // MARK: Remote command + SSH invocation
-
-  func testRemoteCommandLaunchesWinArm64AgentWithJIT() {
-    let p = WindowsVMProvider(id: "abc", baseImage: "win11-runner-base", sshPassword: nil)
-    // run.cmd (Windows), NOT ./run.sh; short C:\ root path; the base64 JIT string
-    // is QUOTED (its `+`/`/`/`=` alphabet is interpolated into a cmd.exe line).
-    XCTAssertEqual(
-      p.remoteCommand(jitConfig: "BASE64JIT=="),
-      "cd /d C:\\actions-runner && run.cmd --jitconfig \"BASE64JIT==\"")
-  }
+  // MARK: Clone naming + factory
 
   func testCloneNameCarriesMactionsPrefix() {
-    let p = WindowsVMProvider(id: "host-9f2", baseImage: "base", sshPassword: nil)
+    let p = WindowsVMProvider(id: "host-9f2", baseImage: "base")
     XCTAssertEqual(p.cloneName, "mactions-host-9f2")
   }
-
-  func testSSHInvocationWithoutPasswordUsesPlainSSH() {
-    // No password configured -> rely on an SSH key/agent, invoke ssh directly.
-    let p = WindowsVMProvider(id: "abc", baseImage: "base", sshPassword: nil)
-    let inv = p.sshInvocation(ip: "10.0.0.5", jitConfig: "J")
-    XCTAssertEqual(inv.executable, "/usr/bin/ssh")
-    XCTAssertEqual(inv.arguments.first, "-o")
-    XCTAssertTrue(inv.arguments.contains("StrictHostKeyChecking=no"))
-    XCTAssertTrue(inv.arguments.contains("UserKnownHostsFile=/dev/null"))
-    XCTAssertEqual(inv.arguments[safe: inv.arguments.count - 2], "runner@10.0.0.5")
-    XCTAssertEqual(inv.arguments.last, "cd /d C:\\actions-runner && run.cmd --jitconfig \"J\"")
-  }
-
-  func testSSHInvocationWithPasswordRoutesThroughSSHPass() {
-    // With a password AND sshpass present, route through sshpass for
-    // non-interactive auth into the throwaway guest.
-    let p = WindowsVMProvider(
-      id: "abc", baseImage: "base", sshUser: "runner", sshPassword: "P@ss",
-      sshpassPath: "/opt/homebrew/bin/sshpass")
-    let inv = p.sshInvocation(ip: "10.0.0.5", jitConfig: "J")
-    XCTAssertEqual(inv.executable, "/opt/homebrew/bin/sshpass")
-    XCTAssertEqual(Array(inv.arguments.prefix(3)), ["-p", "P@ss", "/usr/bin/ssh"])
-    XCTAssertTrue(inv.arguments.contains("runner@10.0.0.5"))
-  }
-
-  func testSSHInvocationFallsBackToPlainSSHWhenSSHPassMissing() {
-    // Password set but sshpass not installed -> don't fabricate a path; fall
-    // back to plain ssh (which will use a key/agent if one is configured).
-    let p = WindowsVMProvider(
-      id: "abc", baseImage: "base", sshPassword: "P@ss", sshpassPath: nil)
-    let inv = p.sshInvocation(ip: "10.0.0.5", jitConfig: "J")
-    XCTAssertEqual(inv.executable, "/usr/bin/ssh")
-  }
-
-  // MARK: Factory
 
   func testFactoryStampsMactionsPrefixedWindowsProvider() {
     let factory = WindowsVMProviderFactory(baseImage: "win11-runner-base")
@@ -152,12 +136,8 @@ final class WindowsVMProviderTests: XCTestCase {
   }
 
   func testDetectInstalledCLIReturnsNilWhenNoneInstalled() {
-    // No Windows hypervisor is installed on the dev/CI host, so detection must
-    // return nil rather than fabricate a backend. (If prlctl/utmctl ever IS
-    // installed here, this asserts it returns a usable CLI instead.)
     let cli = WindowsVMProviderFactory.detectInstalledCLI()
     if let cli {
-      XCTAssertFalse(cli.executable.isEmpty)
       XCTAssertTrue(
         FileManager.default.isExecutableFile(atPath: cli.executable),
         "detected CLI must point at a real executable")
@@ -167,10 +147,6 @@ final class WindowsVMProviderTests: XCTestCase {
   }
 
   func testDetectFreeFirstCLIPrefersUTMOrIsNilWhenNoneInstalled() {
-    // The free-first detector (the interactive app's default backend) must point
-    // at a real executable when present, and prefer the free UTM backend when
-    // both UTM and Parallels are installed. On the dev/CI host (no hypervisor),
-    // it returns nil.
     let cli = WindowsVMProviderFactory.detectFreeFirstCLI()
     if let cli {
       XCTAssertTrue(
@@ -189,13 +165,10 @@ final class WindowsVMProviderTests: XCTestCase {
 
   func testStopIsIdempotentAndClearsRunning() {
     // `stop()` tears the clone down via a (here non-existent) CLI path, which is
-    // harmless. The `tornDown` guard means a second `stop()` is a safe no-op and
-    // `isRunning` stays false. (The double-onExit guard itself needs a live VM
-    // to exercise the start() path, so it's verified by inspection + this guard;
-    // see WindowsVMProvider.teardown.)
+    // harmless. The `tornDown` guard means a second `stop()` is a safe no-op.
     let p = WindowsVMProvider(
       id: "abc", baseImage: "base",
-      cli: ParallelsCLI(executable: "/nonexistent/prlctl"), sshPassword: nil,
+      cli: ParallelsCLI(executable: "/nonexistent/prlctl"),
       stopSettleTimeout: 0.05, stopPollInterval: 0.01)
     XCTAssertFalse(p.isRunning)
     p.stop()
@@ -217,11 +190,5 @@ final class WindowsVMProviderTests: XCTestCase {
     XCTAssertEqual(
       HostCleanup.windowsCloneNames(in: listing),
       ["mactions-host-aaa", "mactions-host-bbb"])
-  }
-}
-
-private extension Array {
-  subscript(safe index: Int) -> Element? {
-    indices.contains(index) ? self[index] : nil
   }
 }
