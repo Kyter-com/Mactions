@@ -63,6 +63,21 @@ final class AppState: ObservableObject {
 
   // MARK: Auth
 
+  /// True if the GitHub CLI is installed — enables the one-click reuse path.
+  var gitHubCLIAvailable: Bool { GitHubCLIAuth.isAvailable() }
+
+  /// Easiest path: borrow the token the user's `gh` CLI already holds.
+  func signInWithGitHubCLI() {
+    do {
+      let token = try GitHubCLIAuth.currentToken()
+      try TokenStore.save(token)
+      isSignedIn = true
+      statusMessage = "Signed in via GitHub CLI."
+    } catch {
+      statusMessage = "\(error)"
+    }
+  }
+
   func signInWithDeviceFlow() {
     guard !clientId.isEmpty else {
       statusMessage = "Add an OAuth client id in Settings, or paste a token below."

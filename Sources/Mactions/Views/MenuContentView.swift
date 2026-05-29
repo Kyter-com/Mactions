@@ -73,6 +73,21 @@ struct MenuContentView: View {
     VStack(alignment: .leading, spacing: 10) {
       Text("Connect GitHub").font(.subheadline.weight(.semibold))
 
+      if app.gitHubCLIAvailable {
+        Button {
+          app.signInWithGitHubCLI()
+        } label: {
+          Label("Use my GitHub CLI login", systemImage: "terminal")
+            .frame(maxWidth: .infinity)
+        }
+        .controlSize(.large)
+        Text("Easiest — reuses your existing `gh` login. No token needed.")
+          .font(.caption2).foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+        Divider()
+        Text("Other ways to connect").font(.caption).foregroundStyle(.secondary)
+      }
+
       if let code = app.pendingDeviceCode {
         VStack(alignment: .leading, spacing: 6) {
           Text("Enter this code at github.com/login/device (opened in your browser):")
