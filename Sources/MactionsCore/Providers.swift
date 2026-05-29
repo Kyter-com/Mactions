@@ -1,0 +1,195 @@
+import Foundation
+
+/// A runner *provider* is the substrate a single ephemeral runner executes on:
+/// a local process, a Tart VM, etc. It takes a JIT config, runs the agent for
+/// exactly one job, and reports when the agent exits so the orchestrator can
+/// recycle it.
+public protocol RunnerProvider: AnyObject {
+  /// Stable id for logging/UI (usually the runner name).
+  var id: String { get }
+  /// Launch the agent with `jitConfig`. `onExit` fires (any thread) when the
+  /// agent process/VM finishes — a clean ephemeral exit or a crash.
+  func start(jitConfig: String, onExit: @escaping (Int32) -> Void) throws
+  /// Tear down immediately (user went offline / quit).
+  func stop()
+  var isRunning: Bool { get }
+}
+
+public protocol RunnerProviderFactory {
+  /// Human label for the substrate (shown in the UI).
+  var kind: String { get }
+  func makeProvider(name: String) -> RunnerProvider
+}
+
+// MARK: - Local process (the no-VM POC path)
+
+/// Runs the actions-runner agent directly on this Mac. No VM isolation — fine
+/// for trusted private repos and for proving the loop end to end. For untrusted
+/// code, use a VM-backed provider instead.
+///
+/// Host hygiene: each run executes in its **own clone** of the cached agent at
+/// `runsRoot/<id>`, deleted the instant the job exits. The job's `_work`
+/// checkout, `_tool`/`_actions` caches, `_diag` logs and `.credentials` all
+/// live inside that clone, so nothing accumulates on the host across runs.
+public final class LocalProcessProvider: RunnerProvider {
+  public let id: String
+  private let templateDirectory: URL
+  private let runDirectory: URL
+  private var process: Process?
+  private var cleaned = false
+  private let lock = NSLock()
+
+  /// `templateDirectory` is the pristine cached agent install; the per-run
+  /// clone lives at `runsRoot/<id>`.
+  public init(id: String, templateDirectory: URL, runsRoot: URL) {
+    self.id = id
+    self.templateDirectory = templateDirectory
+    self.runDirectory = runsRoot.appendingPathComponent(id, isDirectory: true)
+  }
+
+  public var isRunning: Bool {
+    lock.lock(); defer { lock.unlock() }
+    return process?.isRunning ?? false
+  }
+
+  public func start(jitConfig: String, onExit: @escaping (Int32) -> Void) throws {
+    try FileManager.default.createDirectory(
+      at: runDirectory.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? FileManager.default.removeItem(at: runDirectory)
+    try cloneAgent()
+
+    let process = Process()
+    process.executableURL = runDirectory.appendingPathComponent("run.sh")
+    process.arguments = ["--jitconfig", jitConfig]
+    process.currentDirectoryURL = runDirectory
+    process.terminationHandler = { [weak self] proc in
+      self?.cleanup()
+      onExit(proc.terminationStatus)
+    }
+    try process.run()
+    lock.lock(); self.process = process; lock.unlock()
+  }
+
+  public func stop() {
+    lock.lock(); let process = self.process; self.process = nil; lock.unlock()
+    if let process, process.isRunning {
+      process.terminate() // terminationHandler runs cleanup()
+    } else {
+      cleanup()
+    }
+  }
+
+  /// APFS copy-on-write clone keeps the per-run copy near-instant and almost
+  /// free on disk; fall back to a plain recursive copy on non-APFS volumes.
+  private func cloneAgent() throws {
+    let clone = try Shell.run("/bin/cp", ["-cR", templateDirectory.path, runDirectory.path])
+    if !clone.ok {
+      try Shell.runChecked("/bin/cp", ["-R", templateDirectory.path, runDirectory.path])
+    }
+  }
+
+  /// Idempotent: delete this run's working copy so nothing is left on the host.
+  private func cleanup() {
+    lock.lock()
+    if cleaned { lock.unlock(); return }
+    cleaned = true
+    lock.unlock()
+    try? FileManager.default.removeItem(at: runDirectory)
+  }
+}
+
+public struct LocalProcessProviderFactory: RunnerProviderFactory {
+  public let kind = "Local process (isolated clone, wiped each run)"
+  private let templateDirectory: URL
+  private let runsRoot: URL
+  public init(templateDirectory: URL, runsRoot: URL) {
+    self.templateDirectory = templateDirectory
+    self.runsRoot = runsRoot
+  }
+  public func makeProvider(name: String) -> RunnerProvider {
+    LocalProcessProvider(id: name, templateDirectory: templateDirectory, runsRoot: runsRoot)
+  }
+}
+
+// MARK: - Tart VM (isolated; experimental)
+
+/// Runs each ephemeral runner inside a throwaway Tart VM cloned from a prepared
+/// base image (Apple Silicon, Virtualization.framework). The base image must
+/// have the actions-runner installed and an SSH login; we clone it, boot it,
+/// SSH in to launch the agent with the JIT config, and delete the clone on
+/// stop. Marked experimental: image prep + the SSH bootstrap are environment
+/// specific. See AGENTS.md → "Providers".
+public final class TartProvider: RunnerProvider {
+  public let id: String
+  private let baseImage: String
+  private let tartPath: String
+  private let sshUser: String
+  private var cloneName: String { "mactions-\(id)" }
+  private var running = false
+  private let lock = NSLock()
+
+  public init(id: String, baseImage: String, tartPath: String, sshUser: String = "admin") {
+    self.id = id
+    self.baseImage = baseImage
+    self.tartPath = tartPath
+    self.sshUser = sshUser
+  }
+
+  public var isRunning: Bool {
+    lock.lock(); defer { lock.unlock() }
+    return running
+  }
+
+  public func start(jitConfig: String, onExit: @escaping (Int32) -> Void) throws {
+    try Shell.runChecked(tartPath, ["clone", baseImage, cloneName])
+    lock.lock(); running = true; lock.unlock()
+
+    // Boot + run + teardown happen on a background thread so `start` returns
+    // promptly; `onExit` fires when the job (and the VM) is done.
+    Thread.detachNewThread { [self] in
+      var status: Int32 = 0
+      do {
+        // `tart run` blocks until the VM powers off. We launch the agent over
+        // SSH in parallel; an ephemeral runner powers the VM off after one job
+        // if the base image is wired to shut down on agent exit.
+        let runner = Process()
+        runner.executableURL = URL(fileURLWithPath: tartPath)
+        runner.arguments = ["run", cloneName, "--no-graphics"]
+        try runner.run()
+
+        let ip = try waitForIP()
+        // Assumes the base image has actions-runner at ~/actions-runner.
+        let remote = "cd ~/actions-runner && ./run.sh --jitconfig \(jitConfig)"
+        try Shell.runChecked("/usr/bin/ssh", [
+          "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+          "\(sshUser)@\(ip)", remote,
+        ])
+        runner.waitUntilExit()
+        status = runner.terminationStatus
+      } catch {
+        status = 1
+      }
+      _ = try? Shell.run(tartPath, ["delete", cloneName])
+      lock.lock(); running = false; lock.unlock()
+      onExit(status)
+    }
+  }
+
+  public func stop() {
+    lock.lock(); running = false; lock.unlock()
+    _ = try? Shell.run(tartPath, ["stop", cloneName])
+    _ = try? Shell.run(tartPath, ["delete", cloneName])
+  }
+
+  private func waitForIP(timeout: TimeInterval = 60) throws -> String {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if let r = try? Shell.run(tartPath, ["ip", cloneName]), r.ok {
+        let ip = r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !ip.isEmpty { return ip }
+      }
+      Thread.sleep(forTimeInterval: 2)
+    }
+    throw Shell.ShellError.nonZeroExit(command: "tart ip \(cloneName)", status: -1, stderr: "timed out waiting for VM IP")
+  }
+}
