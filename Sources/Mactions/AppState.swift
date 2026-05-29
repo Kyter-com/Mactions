@@ -36,6 +36,13 @@ final class AppState: ObservableObject {
   /// True while the (long, multi-GB) image-prep flow is running. Disables the
   /// button so it can't be double-fired.
   @Published var windowsSetupBusy = false
+  /// Latest prerequisite scan (Homebrew, hypervisor, converter tools). Drives the
+  /// preflight checklist; refreshed when the Windows section appears + after an
+  /// install. `nil` until the first scan.
+  @Published var windowsPreflight: WindowsPreflight.Report?
+  /// True while the free-deps installer (`brew install …`) is running. Disables
+  /// the "Install free prerequisites" button so it can't be double-fired.
+  @Published var windowsPreflightBusy = false
 
   // Repo discovery (for the searchable picker).
   @Published var availableRepos: [RepoRef] = []
@@ -221,9 +228,11 @@ final class AppState: ObservableObject {
           templateDirectory: template, runsRoot: HostCleanup.runsRoot())
         // Windows fleet (opt-in): only when the user enabled it AND a base image
         // exists AND a hypervisor CLI is installed. Never spun up automatically.
+        // Default backend is FREE-FIRST (UTM if present, else an existing
+        // Parallels) to match the free-first prerequisite policy.
         let windowsFactory: WindowsVMProviderFactory? =
           (windowsEnabled && windowsImageReady)
-          ? WindowsVMProviderFactory.detectInstalledCLI().map {
+          ? WindowsVMProviderFactory.detectFreeFirstCLI().map {
             WindowsVMProviderFactory(baseImage: windowsBaseImage, cli: $0)
           }
           : nil
@@ -300,6 +309,58 @@ final class AppState: ObservableObject {
   /// `utmctl`) is installed. Windows runners aren't offerable without one.
   var windowsBackendAvailable: Bool { WindowsVMProviderFactory.detectInstalledCLI() != nil }
 
+  /// Run the prerequisite scan and publish it for the checklist. Cheap
+  /// (filesystem probes only), so it's safe to call on `onAppear`.
+  func refreshWindowsPreflight() {
+    windowsPreflight = WindowsPreflight.detect()
+  }
+
+  /// Install ONLY the missing FREE prerequisites (the free UTM hypervisor cask +
+  /// the missing converter formulae) via Homebrew. NEVER installs Parallels
+  /// (paid) and NEVER installs Homebrew itself — if `brew` is absent we point at
+  /// brew.sh. Button-triggered only; the long-blocking `brew install` runs off
+  /// the main actor so the popover stays responsive.
+  func installWindowsFreePrerequisites() {
+    guard state == .offline else { statusMessage = "Go offline first."; return }
+    guard !windowsPreflightBusy else { return }
+    let report = windowsPreflight ?? WindowsPreflight.detect()
+    windowsPreflight = report
+    switch WindowsPreflight.installPlan(for: report) {
+    case let .homebrewMissing(message):
+      statusMessage = message
+      return
+    case .nothingToInstall:
+      statusMessage = "All free Windows prerequisites are already installed."
+      return
+    case .install:
+      break
+    }
+    windowsPreflightBusy = true
+    statusMessage = "Installing free Windows prerequisites (UTM + converter tools via Homebrew)…"
+    Task {
+      let result = await Self.runFreeInstall(report)
+      windowsPreflightBusy = false
+      windowsPreflight = WindowsPreflight.detect()  // reflect what landed
+      switch result {
+      case .installed:
+        statusMessage = "Installed the free Windows prerequisites."
+      case .nothingToInstall:
+        statusMessage = "All free Windows prerequisites are already installed."
+      case let .homebrewMissing(message):
+        statusMessage = message
+      case let .failed(command, stderr):
+        statusMessage = "Install failed (`\(command)`): \(stderr.isEmpty ? "see Homebrew output" : stderr)"
+      }
+    }
+  }
+
+  /// Run the free-deps installer off the main actor (it shells out to `brew`).
+  private nonisolated static func runFreeInstall(_ report: WindowsPreflight.Report) async
+    -> WindowsPreflight.InstallResult
+  {
+    await Task.detached { WindowsPreflight.runInstall(for: report) }.value
+  }
+
   /// Labels a Windows fleet registers with. Mirrors the macOS arm of a CI
   /// matrix: `runs-on: [self-hosted, Windows, mactions]`.
   private let windowsLabels = ["self-hosted", "Windows", "mactions"]
@@ -320,25 +381,52 @@ final class AppState: ObservableObject {
       statusMessage = "Couldn't find scripts/prepare-windows-image."
       return
     }
-    guard windowsBackendAvailable else {
-      statusMessage =
-        "No Windows hypervisor found. Install Parallels (recommended) or UTM, then try again."
-      return
-    }
-    // Fail fast on missing ISO-converter deps so we don't start a multi-GB
-    // download that can't finish.
-    let missing = WindowsImage.missingConverterDependencies()
-    if !missing.isEmpty {
-      statusMessage = "Install the ISO converter tools first: brew install \(missing.joined(separator: " "))"
-      return
-    }
-    windowsSetupBusy = true
-    statusMessage = "Setting up the Windows runner (downloading + building the base image — this takes a while)…"
+    // Preflight FIRST: if the free prerequisites (hypervisor + converter tools)
+    // are missing, auto-install the FREE ones (UTM + converter formulae) via
+    // Homebrew before the ISO download / base-image build. NEVER installs
+    // Parallels (paid); if brew is absent we stop with the brew.sh hint.
+    let report = WindowsPreflight.detect()
+    windowsPreflight = report
     let image = windowsBaseImage
+    windowsSetupBusy = true
+    statusMessage = "Checking Windows prerequisites…"
     Task {
-      // prepare-windows-image auto-resolves + downloads the latest Win11 ARM64
-      // ISO (UUP dump) when no --iso is passed, then drives the base-VM build.
-      // The blocking shell-out runs off the main actor so the UI stays live.
+      // 1) Install missing FREE deps (off the main actor — it may shell out).
+      if case .install = WindowsPreflight.installPlan(for: report) {
+        statusMessage = "Installing free Windows prerequisites (UTM + converter tools via Homebrew)…"
+        let install = await Self.runFreeInstall(report)
+        windowsPreflight = WindowsPreflight.detect()
+        switch install {
+        case .installed, .nothingToInstall:
+          break  // proceed to the build
+        case let .homebrewMissing(message):
+          statusMessage = message
+          windowsSetupBusy = false
+          return
+        case let .failed(command, stderr):
+          statusMessage =
+            "Couldn't install prerequisites (`\(command)`): \(stderr.isEmpty ? "see Homebrew output" : stderr)"
+          windowsSetupBusy = false
+          return
+        }
+      } else if case let .homebrewMissing(message) = WindowsPreflight.installPlan(for: report) {
+        statusMessage = message
+        windowsSetupBusy = false
+        return
+      }
+
+      // 2) Confirm a hypervisor backend is now present before the long build.
+      guard WindowsVMProviderFactory.detectInstalledCLI() != nil else {
+        statusMessage =
+          "No Windows hypervisor available. Install UTM (free) via \"Install free prerequisites\", or open Parallels if you have it, then try again."
+        windowsSetupBusy = false
+        return
+      }
+
+      // 3) Build the base image. prepare-windows-image auto-resolves + downloads
+      // the latest Win11 ARM64 ISO (UUP dump) when no --iso is passed, then
+      // drives the base-VM build. The blocking shell-out runs off the main actor.
+      statusMessage = "Setting up the Windows runner (downloading + building the base image — this takes a while)…"
       let result = await Self.runPrepScript(script, name: image)
       windowsSetupBusy = false
       if let result, result.ok {

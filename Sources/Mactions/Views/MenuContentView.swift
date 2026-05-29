@@ -187,6 +187,8 @@ struct MenuContentView: View {
       Text("Windows runner (experimental)")
         .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
 
+      WindowsPreflightChecklist(app: app)
+
       if app.windowsImageReady {
         Toggle(isOn: Binding(
           get: { app.windowsEnabled },
@@ -220,7 +222,10 @@ struct MenuContentView: View {
         .fixedSize(horizontal: false, vertical: true)
       }
     }
-    .onAppear { app.checkForWindowsImageUpdate() }
+    .onAppear {
+      app.refreshWindowsPreflight()
+      app.checkForWindowsImageUpdate()
+    }
   }
 
   private var repoPicker: some View {
@@ -294,6 +299,74 @@ struct MenuContentView: View {
         }
       }
     }
+  }
+}
+
+/// The free-first prerequisite checklist + auto-install button. Split into its
+/// own subview so the SwiftUI type-checker stays fast and `windowsSection`
+/// doesn't balloon. Shows ✓/✗ for Homebrew, a Windows hypervisor, and the
+/// UUP-dump converter tools, plus a one-click installer for the MISSING FREE
+/// deps (UTM + converter formulae) — it never installs Parallels (paid) and
+/// never installs Homebrew (points at brew.sh instead).
+private struct WindowsPreflightChecklist: View {
+  @ObservedObject var app: AppState
+
+  var body: some View {
+    let report = app.windowsPreflight
+    VStack(alignment: .leading, spacing: 3) {
+      checkRow("Homebrew", ok: report?.homebrewInstalled ?? false)
+      checkRow(
+        hypervisorLabel(report),
+        ok: report?.hasHypervisor ?? false)
+      checkRow(
+        converterLabel(report),
+        ok: (report?.missingConverterFormulae.isEmpty ?? false))
+
+      if let report, !(WindowsPreflight.installPlan(for: report) == .nothingToInstall) {
+        Button {
+          app.installWindowsFreePrerequisites()
+        } label: {
+          HStack(spacing: 6) {
+            if app.windowsPreflightBusy { ProgressView().controlSize(.small) }
+            Label("Install free prerequisites", systemImage: "arrow.down.circle")
+          }
+        }
+        .buttonStyle(.bordered).controlSize(.small)
+        .disabled(app.state != .offline || app.windowsPreflightBusy)
+        Text(
+          (report.homebrewInstalled)
+            ? "Installs only the missing FREE tools (UTM + converter tools) via Homebrew. Never installs paid Parallels."
+            : "Install Homebrew first: https://brew.sh — then this installs the free tools."
+        )
+        .font(.caption2).foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+      }
+    }
+  }
+
+  private func checkRow(_ label: String, ok: Bool) -> some View {
+    HStack(spacing: 5) {
+      Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle")
+        .font(.system(size: 9))
+        .foregroundStyle(ok ? Color.green : Color.secondary)
+      Text(label).font(.caption2).foregroundStyle(.secondary)
+      Spacer()
+    }
+  }
+
+  /// Name the installed hypervisor (free-first recommended) so the user sees
+  /// which backend is in play; otherwise prompt for the free default.
+  private func hypervisorLabel(_ report: WindowsPreflight.Report?) -> String {
+    if let backend = report?.recommendedBackend {
+      return "Hypervisor: \(backend.displayName)"
+    }
+    return "Hypervisor (UTM recommended — free)"
+  }
+
+  private func converterLabel(_ report: WindowsPreflight.Report?) -> String {
+    let missing = report?.missingConverterFormulae ?? []
+    if missing.isEmpty { return "ISO converter tools" }
+    return "ISO converter tools (missing: \(missing.joined(separator: ", ")))"
   }
 }
 
