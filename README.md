@@ -28,6 +28,6 @@ No external dependencies. The orchestration logic lives in the `MactionsCore` li
 
 ## Security
 
-The default **local-process** runner has no isolation — only point it at **trusted / private** repos. VM-isolated runners (Tart) are the path for untrusted code and are still experimental. Tokens are stored in the macOS Keychain.
+The default **local-process** runner has no isolation — only point it at **trusted / private** repos. VM-isolated runners (Tart) are the path for untrusted code and are still experimental. The GitHub token is stored in a `0600` file under Application Support (not the keychain — an unsigned dev build re-prompts on every keychain access; a signed build could use the keychain).
 
 See **[AGENTS.md](AGENTS.md)** for architecture, the per-OS reality (the macOS 2-VM cap, Linux containers, why Windows is hard), and the roadmap.

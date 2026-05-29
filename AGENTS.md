@@ -17,7 +17,8 @@ Kyter's `sweep-collector` CI leans on self-hosted runners, and the GitHub-hosted
 Proof-of-concept. Honest accounting:
 
 - ✅ **Core control loop** (auth → JIT config → provider → ephemeral runner → recycle → teardown) is implemented and unit-tested.
-- ✅ **GitHub device-flow sign-in** + paste-a-PAT fallback, token in Keychain.
+- ✅ **Auth, three ways:** one-click **GitHub CLI** reuse (`gh auth token`), device-flow sign-in, or paste-a-PAT. Token stored in a `0600` file (not the keychain — see Auth for why).
+- ✅ **Searchable multi-repo picker** (lists repos you can admin) + one ephemeral fleet per selected repo, run concurrently.
 - ✅ **Local-process provider**: runs the actions-runner agent directly on the Mac (no VM isolation, but each run is an isolated clone that's wiped on exit — see Host hygiene). This is the runnable MVP path.
 - ✅ **SwiftUI menubar app**: status, config, online/offline, live runner list; deregisters on quit.
 - 🧪 **Tart provider** (VM isolation): implemented against the `tart` CLI but **experimental** — depends on a prepared base image + SSH bootstrap (see Providers).
@@ -29,12 +30,14 @@ Two SwiftPM targets so orchestration logic stays UI-free and testable:
 
 ```
 MactionsCore (library, pure Foundation)        Mactions (executable, SwiftUI/AppKit)
-  GitHubAuth      device flow + PAT, Keychain     MactionsApp   @main, MenuBarExtra, AppDelegate
-  GitHubClient    generate-jitconfig/list/delete  AppState      ObservableObject glue (singleton)
-  RunnerInstaller downloads the runner agent       MenuContentView  the whole popover UI
+  GitHubAuth      device flow + PAT + token file   MactionsApp   @main, MenuBarExtra, AppDelegate
+  GitHubCLIAuth   reuse `gh auth token`            AppState      glue: one orchestrator per
+  GitHubClient    generate-jitconfig/list/delete                 selected repo
+  RepoLister      list admin repos (the picker)    MenuContentView  searchable multi-repo picker
+  RunnerInstaller downloads the runner agent
   Providers       Local + Tart + factories
   Orchestrator    start/stop/maintain-N
-  Shell, Keychain helpers
+  Cleanup, Shell  host hygiene + process helper
 ```
 
 **The loop** (`RunnerOrchestrator`):
@@ -64,16 +67,17 @@ MactionsCore (library, pure Foundation)        Mactions (executable, SwiftUI/App
 
 Friendly by design — no env vars, no hand-copied long tokens.
 
-- **Device flow (preferred):** app shows a short user code, opens `github.com/login/device`, polls for approval. Needs a registered **OAuth App client id** (not a secret; device flow has none). Register one at GitHub → Settings → Developer settings → OAuth Apps, tick **Enable Device Flow**, paste the client id into the app's Settings field.
+- **GitHub CLI (easiest):** reuse the token `gh` already holds (`gh auth token`). One click, no setup, nothing to paste — ideal for any dev who has `gh`. `GitHubCLIAuth`.
+- **Device flow:** show a short user code, open `github.com/login/device`, poll for approval. Needs a registered **OAuth App client id** (not a secret; device flow has none) — bake one in (or paste it in Settings). This is how homerun gives zero-per-user-setup sign-in once the client id ships.
 - **PAT fallback:** paste a token. Works immediately, no OAuth App needed.
 - **Scope:** `repo` (classic) or fine-grained **Administration: read & write** on the target repo — required to register/remove repo self-hosted runners.
-- **Storage:** Keychain (`com.kyter.mactions`), never UserDefaults/plist.
+- **Storage:** a `0600` file at `~/Library/Application Support/Mactions/auth.token`, cached in memory — **not** the login keychain. An unsigned/dev build has no stable code identity, so the keychain re-prompts on every read, "Always Allow" won't stick, and the modal even steals focus from the popover (cancelling in-flight requests). homerun makes the same file-based choice. A signed/notarized build could move back to the keychain — see Roadmap.
 
 ## Build / run / test
 
 ```bash
 swift build          # compiles MactionsCore + the app
-swift test           # 7 unit tests (request building, device-flow guard, orchestrator)
+swift test           # 12 unit tests (requests, device-flow guard, repo lister, orchestrator, cleanup)
 swift run Mactions   # launches the menubar app for dev (look in the menubar)
 ```
 
@@ -88,7 +92,7 @@ Ephemeral means the host is left as it was found. This is enforced, not hoped fo
 - **On go-online:** `HostCleanup.sweepOrphans()` deletes any `runs/` leftovers and stray `mactions-*` Tart clones from a previous crash/force-quit.
 - **On go-offline / quit:** `purgeRuns()` sweeps again (defensive).
 - **Tart:** clones are deleted on agent exit and on `stop()`.
-- **On demand:** the "Clean up" button (offline) calls `purgeAll()` — removes the cached agent and all run files. The Keychain token is the only other artifact; "Sign out" clears it.
+- **On demand:** the "Remove cached agent" button (offline) calls `purgeAll()` — removes the cached agent + all run files (not the token). "Sign out" deletes the token file.
 
 The single persistent, intentional cache is the ~200 MB agent template (so restarts are fast); it's documented, reapable from the UI, and never the place jobs actually run.
 

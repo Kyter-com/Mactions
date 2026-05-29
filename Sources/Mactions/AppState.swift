@@ -151,6 +151,7 @@ final class AppState: ObservableObject {
 
   func loadRepos() async {
     guard let token = TokenStore.load() else { return }
+    guard !reposLoading else { return } // dedupe concurrent loads
     reposLoading = true
     defer { reposLoading = false }
     do {
@@ -162,8 +163,12 @@ final class AppState: ObservableObject {
       if repos.isEmpty {
         statusMessage = "No repos you can administer were found for this account."
       }
+    } catch is CancellationError {
+      // The popover closed mid-load; not worth surfacing.
+    } catch let error as URLError where error.code == .cancelled {
+      // Request cancelled (popover dismissed / superseded). Ignore.
     } catch {
-      statusMessage = "Couldn't load repos: \(error)"
+      statusMessage = "Couldn't load repos: \(error.localizedDescription)"
     }
   }
 

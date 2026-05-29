@@ -13,12 +13,7 @@ let package = Package(
   name: "Mactions",
   platforms: [.macOS(.v13)], // MenuBarExtra is macOS 13+
   targets: [
-    .target(
-      name: "MactionsCore",
-      // Keychain (token storage) lives here; link the framework explicitly so
-      // SecItem* resolve at link time regardless of SDK auto-linking.
-      linkerSettings: [.linkedFramework("Security")]
-    ),
+    .target(name: "MactionsCore"),
     .executableTarget(
       name: "Mactions",
       dependencies: ["MactionsCore"]

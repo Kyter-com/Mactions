@@ -36,10 +36,11 @@ public enum HostCleanup {
     try? FileManager.default.removeItem(at: runsRoot())
   }
 
-  /// Nuke everything Mactions put on disk: the cached agent + all run dirs.
-  /// (The Keychain token is separate; clear it with `TokenStore.clear()`.)
+  /// Remove the cached agent + all run dirs (the big/transient stuff). Leaves
+  /// the auth token in place — signing out clears that via `TokenStore.clear()`.
   public static func purgeAll() {
-    try? FileManager.default.removeItem(at: mactionsRoot())
+    try? FileManager.default.removeItem(at: agentTemplateDirectory())
+    purgeRuns()
   }
 
   /// Best-effort: delete leftover ephemeral Tart VMs from a crashed session.

@@ -120,12 +120,48 @@ public enum GitHubAuth {
   }
 }
 
-/// Where the GitHub token lives. Keychain-backed; same surface whether the
-/// token came from the device flow or a pasted PAT.
+/// Where the GitHub token lives.
+///
+/// File-based (a `0600` file under Application Support), NOT the login
+/// keychain — on purpose. An unsigned/dev build has no stable code identity,
+/// so the keychain re-prompts on every read and "Always Allow" won't stick,
+/// and those modal prompts even steal focus from the menubar popover (which
+/// cancels in-flight requests). A `0600` file avoids all of that — the same
+/// choice homerun makes. Cached in memory so we touch disk at most once.
+///
+/// A signed/notarized build could move this back to the keychain; see
+/// AGENTS.md → Roadmap.
 public enum TokenStore {
-  private static let account = "github-token"
+  private static let lock = NSLock()
+  // nil = not loaded yet; .some(nil) = loaded, no token present.
+  private static var cached: String??
 
-  public static func save(_ token: String) throws { try Keychain.set(token, for: account) }
-  public static func load() -> String? { Keychain.get(account) }
-  public static func clear() throws { try Keychain.remove(account) }
+  private static func tokenURL() -> URL {
+    HostCleanup.mactionsRoot().appendingPathComponent("auth.token")
+  }
+
+  public static func save(_ token: String) throws {
+    let dir = HostCleanup.mactionsRoot()
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let url = tokenURL()
+    try token.write(to: url, atomically: true, encoding: .utf8)
+    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    lock.lock(); cached = .some(token); lock.unlock()
+  }
+
+  public static func load() -> String? {
+    lock.lock()
+    if let cached { lock.unlock(); return cached }
+    lock.unlock()
+    let raw = try? String(contentsOf: tokenURL(), encoding: .utf8)
+    let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let value = (trimmed?.isEmpty == false) ? trimmed : nil
+    lock.lock(); cached = .some(value); lock.unlock()
+    return value
+  }
+
+  public static func clear() throws {
+    lock.lock(); cached = .some(nil); lock.unlock()
+    try? FileManager.default.removeItem(at: tokenURL())
+  }
 }
