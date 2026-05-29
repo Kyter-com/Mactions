@@ -39,6 +39,10 @@ final class AppState: ObservableObject {
 
   /// One orchestrator per repo, keyed by `owner/name`.
   private var orchestrators: [String: RunnerOrchestrator] = [:]
+  /// Bumped on every goOnline/goOffline so a slow goOnline Task (e.g. blocked
+  /// on the agent download) can detect that the user went offline meanwhile and
+  /// abort instead of reviving a dead fleet.
+  private var fleetEpoch = 0
   private let defaults = UserDefaults.standard
 
   init() {
@@ -183,28 +187,43 @@ final class AppState: ObservableObject {
     guard !selectedRepos.isEmpty else { statusMessage = "Pick at least one repository."; return }
     saveConfig()
     HostCleanup.sweepOrphans()
+    fleetEpoch += 1
+    let myEpoch = fleetEpoch
     state = .starting
     statusMessage = "Preparing runner agent…"
     let repos = selectedRepos
     Task {
+      var created: [RunnerOrchestrator] = []
       do {
         let template = try await RunnerInstaller.ensureInstalled(token: token)
+        guard fleetEpoch == myEpoch else { return } // went offline during download
         let factory = LocalProcessProviderFactory(
           templateDirectory: template, runsRoot: HostCleanup.runsRoot())
         for repo in repos {
+          guard fleetEpoch == myEpoch else { break }
           let client = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
           let fleet = FleetConfig(
             owner: repo.owner, repo: repo.name, labels: labels, desiredCount: runnersPerRepo)
           let orch = RunnerOrchestrator(controlPlane: client, factory: factory, config: fleet)
           orch.onChange = { [weak self] in self?.sync() }
           orchestrators[repo.fullName] = orch
+          created.append(orch)
           await orch.start()
+        }
+        guard fleetEpoch == myEpoch else {
+          for orch in created { await orch.stop() } // user went offline; undo
+          return
         }
         state = .online
         sync()
-        statusMessage = "Online for \(repos.count) repo\(repos.count == 1 ? "" : "s")."
+        let live = orchestrators.values.reduce(0) { $0 + $1.runners.count }
+        statusMessage =
+          live == 0
+          ? "Online, but no runners came up — check repo permissions / labels."
+          : "Online: \(live) runner\(live == 1 ? "" : "s") across \(repos.count) repo\(repos.count == 1 ? "" : "s")."
       } catch {
-        statusMessage = "Failed to start: \(error)"
+        guard fleetEpoch == myEpoch else { return }
+        statusMessage = "Failed to start: \(error.localizedDescription)"
         state = .offline
       }
     }
@@ -216,6 +235,7 @@ final class AppState: ObservableObject {
 
   func goOfflineAndWait() async {
     guard !orchestrators.isEmpty || state != .offline else { return }
+    fleetEpoch += 1 // invalidate any in-flight goOnline
     state = .stopping
     sync()
     for orch in orchestrators.values { await orch.stop() }
@@ -235,9 +255,11 @@ final class AppState: ObservableObject {
   }
 
   private func sync() {
+    // Only mirror the live runner list here. We deliberately do NOT re-stamp
+    // orch.lastError onto statusMessage on every change — that clobbered the
+    // status line and made a single transient error look permanent.
     var rows: [FleetRunnerRow] = []
     for (fullName, orch) in orchestrators {
-      if let err = orch.lastError { statusMessage = err }
       for runner in orch.runners {
         rows.append(FleetRunnerRow(repoFullName: fullName, runner: runner))
       }

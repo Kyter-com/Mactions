@@ -37,25 +37,43 @@ public enum RunnerInstaller {
   ) async throws -> URL {
     let dir = installDirectory()
     let runSh = dir.appendingPathComponent("run.sh")
-    if FileManager.default.isExecutableFile(atPath: runSh.path) { return dir }
+    let versionFile = dir.appendingPathComponent(".version")
+    let installed =
+      FileManager.default.isExecutableFile(atPath: runSh.path)
+      ? (try? String(contentsOf: versionFile, encoding: .utf8))?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      : nil
 
-    let version = try await latestRunnerVersion(token: token, session: session) // e.g. "2.319.1"
+    // Resolve the latest version (cheap, one API call). Refreshing the cached
+    // TEMPLATE when GitHub ships a new runner is what stops every ephemeral run
+    // from re-paying the agent self-update (the clones inherit a current agent).
+    // If we can't reach GitHub but already have an install, use it; otherwise
+    // there's nothing to run with.
+    let latest = try? await latestRunnerVersion(token: token, session: session) // e.g. "2.319.1"
+    guard let version = latest else {
+      if installed != nil { return dir }
+      throw InstallError.noAsset("unknown (couldn't reach GitHub to resolve the runner version)")
+    }
+    if installed == version { return dir } // up to date — reuse the template
+
     let asset = "actions-runner-osx-\(arch)-\(version).tar.gz"
     let url = URL(string: "https://github.com/actions/runner/releases/download/v\(version)/\(asset)")!
 
     let (tmp, response) = try await session.download(from: url)
-    if let http = response as? HTTPURLResponse, http.statusCode == 404 {
-      throw InstallError.noAsset(version)
+    if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+      throw InstallError.noAsset("\(version) (HTTP \(http.statusCode))")
     }
 
+    // Fresh dir so a version bump never mixes old + new agent files.
+    try? FileManager.default.removeItem(at: dir)
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     let tarball = dir.appendingPathComponent(asset)
-    try? FileManager.default.removeItem(at: tarball)
     try FileManager.default.moveItem(at: tmp, to: tarball)
 
     let result = try Shell.run("/usr/bin/tar", ["xzf", tarball.path, "-C", dir.path])
     guard result.ok else { throw InstallError.extractionFailed(result.stderr) }
     try? FileManager.default.removeItem(at: tarball)
+    try? version.write(to: versionFile, atomically: true, encoding: .utf8)
     return dir
   }
 

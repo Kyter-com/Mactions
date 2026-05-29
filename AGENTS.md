@@ -106,14 +106,25 @@ The single persistent, intentional cache is the ~200 MB agent template (so resta
 - Swift 5.9 tools, macOS 13+ target. Keep the build warning-clean.
 - Runner names are prefixed `mactions-<host>-<rand>` so teardown can identify our own runners and never touch anyone else's.
 
+## Multiple machines
+
+Runners are named `mactions-<host>-<rand>`, and **teardown only deletes runners under *this* machine's prefix** (`machineRunnerPrefix`). So two Macs (personal + work) signed into the same account never clobber each other's runners — even when one is offline.
+
+Crucially, **your repos don't change.** Workflows target **labels** (`runs-on: [self-hosted, macOS, mactions]`), which are identical on every machine; the host only appears in the internal runner *name* (for dedup + scoped teardown), never in anything a workflow references. Keep the label set the same across your Macs and the same `runs-on` works everywhere — GitHub routes each job to whichever machine has a free runner with those labels (and queues if none are online).
+
 ## Roadmap
 
 - **Windows** support (Win11-ARM VM provider, image prep, or "start a cloud/remote box" provider).
 - **Scale-from-zero:** instead of N idle runners, listen for `workflow_job` queued events (webhook or API poll) and provision on demand. This is what ARC does.
 - **Distributable `.app`:** Xcode/`xcodebuild` bundle step, `LSUIElement`, Developer ID + notarization, and a Login Item so it can auto-start.
 - **Tart image automation:** a `mactions prepare-image` flow that bakes the runner + SSH into a base image.
-- **Org runners + multiple repos** (today it's one repo at a time, repo-level).
-- **Tart provider in the UI** once image prep is automated.
+- **Org-level runners** (repo-level today; multi-repo across selected repos is supported).
+- **Tart provider in the UI** + hardening — its background `tart run` thread races the IP wait and the `stop()` path; revisit when Tart graduates from experimental.
+- **Remaining review items (lower priority):** shorter per-request timeouts + a `gh`-subprocess watchdog (#15); parallel provisioning across repos (#12); runner-tarball checksum verification (#19); draining the agent's stdout/stderr (#16); auto-reclaim of a long-idle cached agent (#17). The token stays a `0600` file by design until the app is signed (#10).
+
+### Hardening already done (from the adversarial review)
+
+Lifecycle is reconcile-based with an `epoch` guard: a failed/late provision can no longer shrink the fleet, phantom an "online" slot, or revive a fleet after the user went offline; a periodic top-up self-heals transient failures (#3,#4,#5,#6,#8,#11). Teardown is per-machine (multi-Mac clobber). `sweepOrphans` now kills orphaned agent processes before purging (#2). The agent template refreshes when GitHub ships a new runner, so runs don't re-pay the self-update (#1). Status no longer re-stamps stale errors (#7); go-online reports the real runner count (#14); the runner download handles any non-2xx (#18).
 
 ## Caveats
 

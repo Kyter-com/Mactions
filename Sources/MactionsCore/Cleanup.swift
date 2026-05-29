@@ -59,9 +59,20 @@ public enum HostCleanup {
     }
   }
 
+  /// Best-effort: kill leftover runner-agent processes (run.sh / Runner.Listener
+  /// and their job children) from a crashed/force-quit session. On a hard exit
+  /// the agents reparent to launchd and keep running (and holding their GitHub
+  /// registration) — `pkill -f` matches them by their working path under
+  /// `runs/`. MUST run before `purgeRuns()` so we don't delete a live job's
+  /// directory out from under it.
+  public static func killOrphanRunnerProcesses() {
+    _ = try? Shell.run("/usr/bin/pkill", ["-f", runsRoot().path])
+  }
+
   /// Sweep orphans left by a previous (possibly crashed) session. Call before
   /// going online.
   public static func sweepOrphans() {
+    killOrphanRunnerProcesses()
     purgeRuns()
     purgeStrayTartClones()
   }

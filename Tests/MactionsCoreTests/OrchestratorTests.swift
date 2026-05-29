@@ -50,7 +50,10 @@ final class OrchestratorTests: XCTestCase {
     let cp = FakeControlPlane()
     let factory = FakeFactory()
     let config = FleetConfig(owner: "o", repo: "r", labels: ["self-hosted"], desiredCount: count)
-    return (RunnerOrchestrator(controlPlane: cp, factory: factory, config: config), cp, factory)
+    // Fixed machine prefix so teardown scoping is deterministic (not host-dependent).
+    let orch = RunnerOrchestrator(
+      controlPlane: cp, factory: factory, config: config, machinePrefix: "mactions-testmac")
+    return (orch, cp, factory)
   }
 
   /// Let queued MainActor tasks (the exit -> recycle hops) run.
@@ -86,9 +89,11 @@ final class OrchestratorTests: XCTestCase {
   func testStopTearsDownAndDeregisters() async {
     let (orch, cp, factory) = makeOrchestrator(count: 2)
     cp.remote = [
-      RemoteRunner(id: 10, name: "mactions-mac-aaa", status: "online", busy: false),
+      RemoteRunner(id: 10, name: "mactions-testmac-aaa", status: "online", busy: false),
       RemoteRunner(id: 11, name: "someone-elses-runner", status: "online", busy: false),
-      RemoteRunner(id: 12, name: "mactions-mac-bbb", status: "offline", busy: false),
+      RemoteRunner(id: 12, name: "mactions-testmac-bbb", status: "offline", busy: false),
+      // Another Mac's Mactions runner — must be left alone (no cross-machine clobber).
+      RemoteRunner(id: 13, name: "mactions-othermac-ccc", status: "online", busy: false),
     ]
     await orch.start()
     await orch.stop()
@@ -96,7 +101,8 @@ final class OrchestratorTests: XCTestCase {
     XCTAssertEqual(orch.state, .offline)
     XCTAssertTrue(orch.runners.isEmpty)
     XCTAssertTrue(factory.made.allSatisfy { $0.stopped })
-    // Only our prefixed runners get deregistered; the stranger is left alone.
+    // Only THIS machine's runners are deregistered; the stranger and the other
+    // Mac's runner are untouched.
     XCTAssertEqual(Set(cp.deleted), [10, 12])
   }
 }
