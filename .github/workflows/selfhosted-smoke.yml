@@ -1,0 +1,22 @@
+name: Self-hosted smoke (Mactions runner)
+
+# Manual-only: a tiny job that runs on a runner provided by Mactions itself
+# (runs-on matches the app's default labels). Proves the ephemeral loop end to
+# end — and gives Mactions a working macOS build/test path while the hosted
+# macos-latest runners are unavailable to the org. Dispatch with:
+#   gh workflow run "Self-hosted smoke (Mactions runner)"
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, macOS, mactions]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift version
+        run: swift --version
+      - name: Build
+        run: swift build
+      - name: Test
+        run: swift test
