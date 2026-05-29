@@ -325,6 +325,9 @@ public struct WindowsVMProviderFactory: RunnerProviderFactory {
   /// Mirrors `Shell.which`-style detection used elsewhere in the core; checks
   /// the Homebrew/SDK install locations a Finder-launched GUI app won't have on
   /// its inherited PATH.
+  ///
+  /// NOTE: this is the *robustness*-first order (Parallels first). For the
+  /// interactive app's default we prefer FREE/OSS — see `detectFreeFirstCLI`.
   public static func detectInstalledCLI() -> WindowsVMCLI? {
     let prlctlCandidates = ["/usr/local/bin/prlctl", "/opt/homebrew/bin/prlctl"]
     if let path = prlctlCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
@@ -333,6 +336,23 @@ public struct WindowsVMProviderFactory: RunnerProviderFactory {
     let utmctl = "/Applications/UTM.app/Contents/MacOS/utmctl"
     if FileManager.default.isExecutableFile(atPath: utmctl) {
       return UTMCLI(executable: utmctl)
+    }
+    return nil
+  }
+
+  /// Pick the installed backend FREE-FIRST: UTM (free, the default) if present,
+  /// else Parallels (paid — only honored if the user already has it), else
+  /// `nil`. This is the default the interactive app uses; it lines up with
+  /// `WindowsPreflight.Report.recommendedBackend` (QEMU isn't wired to a
+  /// `WindowsVMCLI` here, so a QEMU-only host returns `nil`).
+  public static func detectFreeFirstCLI() -> WindowsVMCLI? {
+    let utmctl = "/Applications/UTM.app/Contents/MacOS/utmctl"
+    if FileManager.default.isExecutableFile(atPath: utmctl) {
+      return UTMCLI(executable: utmctl)
+    }
+    let prlctlCandidates = ["/usr/local/bin/prlctl", "/opt/homebrew/bin/prlctl"]
+    if let path = prlctlCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+      return ParallelsCLI(executable: path)
     }
     return nil
   }

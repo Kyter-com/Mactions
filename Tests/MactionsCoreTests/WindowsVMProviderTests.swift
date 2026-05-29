@@ -150,6 +150,25 @@ final class WindowsVMProviderTests: XCTestCase {
     }
   }
 
+  func testDetectFreeFirstCLIPrefersUTMOrIsNilWhenNoneInstalled() {
+    // The free-first detector (the interactive app's default backend) must point
+    // at a real executable when present, and prefer the free UTM backend when
+    // both UTM and Parallels are installed. On the dev/CI host (no hypervisor),
+    // it returns nil.
+    let cli = WindowsVMProviderFactory.detectFreeFirstCLI()
+    if let cli {
+      XCTAssertTrue(
+        FileManager.default.isExecutableFile(atPath: cli.executable),
+        "free-first CLI must point at a real executable")
+      let utmctl = "/Applications/UTM.app/Contents/MacOS/utmctl"
+      if FileManager.default.isExecutableFile(atPath: utmctl) {
+        XCTAssertTrue(cli is UTMCLI, "UTM present -> must prefer the free UTM backend")
+      }
+    } else {
+      XCTAssertNil(cli)
+    }
+  }
+
   // MARK: Teardown guard
 
   func testStopIsIdempotentAndClearsRunning() {

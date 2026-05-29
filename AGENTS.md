@@ -22,7 +22,7 @@ Proof-of-concept. Honest accounting:
 - ✅ **Local-process provider**: runs the actions-runner agent directly on the Mac (no VM isolation, but each run is an isolated clone that's wiped on exit — see Host hygiene). This is the runnable MVP path.
 - ✅ **SwiftUI menubar app**: status, config, online/offline, live runner list; deregisters on quit.
 - 🧪 **Tart provider** (VM isolation): implemented against the `tart` CLI but **experimental** — depends on a prepared base image + SSH bootstrap (see Providers).
-- 🧪 **Windows provider** (`WindowsVMProvider`): implemented + unit-tested, but **experimental and not yet live-verified end to end**. **Opt-in only** — OFF by default and gated behind a **"Set up Windows runner"** button; nothing heavy (ISO download, VM build) ever happens automatically. Clones a throwaway Win11-ARM VM per job (Parallels `prlctl` recommended; UTM `utmctl` fallback), SSHes in to launch the win-arm64 runner agent, and destroys the clone on exit. The one-time base image is built by `scripts/prepare-windows-image`, which **auto-downloads the latest Win11 ARM64 ISO** (UUP dump) when you don't supply one, and an **auto-update** check (`WindowsImage`) tells you when a newer Windows build is out. See [Windows support](#windows-support).
+- 🧪 **Windows provider** (`WindowsVMProvider`): implemented + unit-tested, but **experimental and not yet live-verified end to end**. **Opt-in only** — OFF by default and gated behind a **"Set up Windows runner"** button; nothing heavy (ISO download, VM build) ever happens automatically. Clones a throwaway Win11-ARM VM per job (**UTM `utmctl` — free/OSS, the default**; Parallels `prlctl` used only if already installed), SSHes in to launch the win-arm64 runner agent, and destroys the clone on exit. Prerequisites are **free-first and installed by the app**: `WindowsPreflight` detects what's present (Homebrew, hypervisor, ISO-converter tools) and a button installs the *missing free* deps via Homebrew (never Parallels, never Homebrew itself). The one-time base image is built by `scripts/prepare-windows-image`, which **auto-downloads the latest Win11 ARM64 ISO** (UUP dump) when you don't supply one, and an **auto-update** check (`WindowsImage`) tells you when a newer Windows build is out. See [Windows support](#windows-support).
 
 ## Architecture
 
@@ -35,8 +35,10 @@ MactionsCore (library, pure Foundation)        Mactions (executable, SwiftUI/App
   GitHubClient    generate-jitconfig/list/delete                 selected repo
   RepoLister      list admin repos (the picker)    MenuContentView  searchable multi-repo picker
   RunnerInstaller downloads the runner agent
-  Providers       Local + Tart + factories
+  Providers       Local + Tart + Windows + factories
   Orchestrator    start/stop/maintain-N
+  WindowsPreflight free-first prereq detect + brew installer (pure plan)
+  WindowsImage    UUP-dump latest-ISO resolve + build-id auto-update
   Cleanup, Shell  host hygiene + process helper
 ```
 
@@ -56,7 +58,7 @@ MactionsCore (library, pure Foundation)        Mactions (executable, SwiftUI/App
 
 - **`LocalProcessProvider`** — runs the agent as a child process on the Mac. No isolation. Fine for **trusted private repos**. This is the default and the only one wired into the UI today.
 - **`TartProvider`** (experimental) — clones a [Tart](https://tart.run) base image, boots it, SSHes in to launch the agent, deletes the clone on exit. Requires: Apple Silicon, `tart` installed, and a **base image** that already has the actions-runner at `~/actions-runner` plus an SSH login. Image prep is not automated yet. Tart is **macOS/Linux only** — it cannot boot Windows guests, which is why Windows needs its own provider.
-- **`WindowsVMProvider`** (experimental) — the Windows analog of `TartProvider`: clones a pristine Win11-ARM base VM, boots it headless, SSHes in to launch the win-arm64 runner agent (`run.cmd --jitconfig …`), and **force-stops + deletes the clone on exit**. Backed by a `WindowsVMCLI` abstraction so it can drive Parallels (`prlctl`, recommended) or UTM (`utmctl`, free fallback). See [Windows support](#windows-support).
+- **`WindowsVMProvider`** (experimental) — the Windows analog of `TartProvider`: clones a pristine Win11-ARM base VM, boots it headless, SSHes in to launch the win-arm64 runner agent (`run.cmd --jitconfig …`), and **force-stops + deletes the clone on exit**. Backed by a `WindowsVMCLI` abstraction so it can drive UTM (`utmctl`, **free/OSS — the app's default**) or Parallels (`prlctl`, only if already present). The interactive app picks the backend **free-first** via `WindowsVMProviderFactory.detectFreeFirstCLI()` (UTM, else an existing Parallels); `detectInstalledCLI()` is the older robustness-first order kept for reference. See [Windows support](#windows-support).
 
 ### Per-OS reality (important)
 
@@ -68,7 +70,14 @@ MactionsCore (library, pure Foundation)        Mactions (executable, SwiftUI/App
 
 🧪 **Experimental, and not yet live-verified end to end.** The control-plane code (provider, factory, stray-clone reaping, the image build-id auto-update logic) compiles and is unit-tested; the actual ISO auto-download/convert, the VM boot, + a green Windows job have **not** been run here because that needs a hand-built base image (an ISO download + a multi-minute Windows install) and a hypervisor (neither is present in this dev env). Treat "a Windows job ran on a Mactions runner" as unproven until you complete the image prep and watch one go green.
 
-**Opt-in, button-gated (important).** Windows support is OFF by default. The **"Set up Windows runner"** button in the popover's Windows section is the *only* trigger for any ISO download or base-image build — nothing heavy ever runs automatically. The button: checks a Windows hypervisor CLI is installed (`WindowsVMProviderFactory.detectInstalledCLI()`), checks the ISO-converter deps are present (`WindowsImage.missingConverterDependencies()`), then shells out to `scripts/prepare-windows-image`. Once the base image is built it flips a persisted `windowsImageReady` flag (UserDefaults) and reveals a **Windows toggle** that adds a fleet labeled `[self-hosted, Windows, mactions]` alongside the macOS one on go-online.
+**Opt-in, button-gated (important).** Windows support is OFF by default. The **"Set up Windows runner"** button in the popover's Windows section is the *only* trigger for any ISO download or base-image build — nothing heavy ever runs automatically. The button: runs `WindowsPreflight.detect()`, **auto-installs the missing FREE prerequisites** (UTM + the converter tools, via Homebrew — see below), confirms a hypervisor CLI is now installed, then shells out to `scripts/prepare-windows-image`. Once the base image is built it flips a persisted `windowsImageReady` flag (UserDefaults) and reveals a **Windows toggle** that adds a fleet labeled `[self-hosted, Windows, mactions]` alongside the macOS one on go-online.
+
+**Free-first prerequisites (installed by the app, not by hand).** `WindowsPreflight` (pure, Foundation-only, unit-tested) is the prerequisite layer so the user never hand-runs `brew`:
+
+- **Detection** (`detect()` / `makeReport`): probes **Homebrew** (`brew`, on PATH or the `/opt/homebrew`, `/usr/local` prefixes a Finder-launched app won't have on PATH), the **hypervisor backends** (UTM's bundled `utmctl`, Parallels' `prlctl`, QEMU's `qemu-system-aarch64`), and the **converter tools** (`aria2c`, `cabextract`, `wimlib-imagex`→`wimlib`, `chntpw`). The `Report` exposes what's installed, what's missing, and a `recommendedBackend` chosen **free-first**: UTM (free) if present, else an *existing* Parallels (paid — never recommended for install), else QEMU.
+- **The install plan** (`installPlan(for:)`) is a **pure, unit-testable function**: it builds `brew install --cask utm` (only when no hypervisor is present yet) + one `brew install <missing converter formulae>` for the **missing FREE deps only**. It **never** emits `--cask parallels` (paid), and if `brew` is absent it returns `.homebrewMissing` with the https://brew.sh hint — it does **not** try to install Homebrew. The actual run (`runInstall`) is a separate call that shells out, so tests don't.
+- **UI:** a ✓/✗ checklist (Homebrew, hypervisor, converter tools) plus an **"Install free prerequisites"** button (disabled while busy / when not offline). The button installs only the missing free deps; "Set up Windows runner" runs the same install automatically before the build.
+- **UTM caveat** (carried over): `utmctl` uses Apple's ScriptingBridge and needs an active GUI/login session — fine for this interactive foreground app, fragile for an unattended launchd host. That's why Parallels is the more robust choice *if you already own it*, but we never push the user to buy it.
 
 **Auto-download-latest + auto-update.** `--iso` is now *optional*: with no ISO, `prepare-windows-image` resolves + downloads the **latest Win11 ARM64 retail build** via UUP dump (the only automatable source), converts it to an ISO, and records the build id at `~/.mactions/windows-base.build`. `WindowsImage` (pure, unit-tested) resolves the latest available build and compares it to that recorded id (`compareBuilds`/`updateAvailable`, numeric dotted-segment ordering so `26100.9 < 26100.10`), so the app can nudge a rebuild when Microsoft ships a newer Windows. The base image is the one cached/auto-refreshed artifact; per-job clones stay throwaway.
 
@@ -90,13 +99,15 @@ The provider drives a `WindowsVMCLI` backend (a pure-function abstraction so the
 
 A throwaway VM discards the **entire guest disk** per job — npm cache, `%TEMP%`, registry, the `_work` checkout, profile, everything. There is no Windows equivalent of the local provider's APFS-clone HOME-redirect trick, and none is needed: the only thing that persists is the **pristine base image template**; only ephemeral clones are ever booted. `HostCleanup.purgeStrayWindowsClones()` (called from `sweepOrphans()` on go-online) reaps any `mactions-…` clone a crash left behind, so the host accumulates nothing across crashes either. The clone name carries the `mactions-` prefix, so reaping never touches a non-Mactions VM.
 
-### Backends: Parallels vs UTM
+### Backends: UTM vs Parallels (free-first)
 
-- **Parallels (`prlctl`) — recommended.** The only Microsoft-authorized hypervisor for Win11 ARM on Apple Silicon with full HW acceleration, and the only one with a **true background-service headless mode** plus a complete CLI lifecycle that works **without a GUI login session**. Requires Pro/Business Edition (paid) and Full Disk Access for the Parallels app.
-- **UTM (`utmctl`) — free fallback.** Works, but `utmctl` uses Apple's ScriptingBridge and **requires an active GUI (Aqua) login session** — it silently fails over SSH or from a pure launchd/headless context. Fine when Mactions runs in the foreground; fragile for an unattended host. Use it only if the Parallels license is a non-starter.
-- **QEMU+hvf** is the fully-free, no-GUI-dependency DIY path (you build more plumbing yourself); not implemented here, noted as the next fallback if Parallels cost is rejected.
+The app is **free/OSS-first**, so UTM is the default and the only hypervisor we'll install for you. Parallels is honored if you already have it, never recommended for purchase.
 
-`WindowsVMProviderFactory.detectInstalledCLI()` picks Parallels if present, else UTM, else `nil`.
+- **UTM (`utmctl`) — free/OSS, the default.** Free + open-source (QEMU backend), so it's what `WindowsPreflight` installs (`brew install --cask utm`) and what `detectFreeFirstCLI()` prefers. Caveat: `utmctl` uses Apple's ScriptingBridge and **requires an active GUI (Aqua) login session** — it silently fails over SSH or from a pure launchd/headless context. Fine for this interactive foreground app; fragile for an unattended host.
+- **Parallels (`prlctl`) — paid, only if already installed.** The only Microsoft-authorized hypervisor for Win11 ARM on Apple Silicon with full HW acceleration, and the only one with a **true background-service headless mode** plus a complete CLI lifecycle that works **without a GUI login session** — so it's the more robust choice *if you already own a Pro/Business license* (paid, plus Full Disk Access). We **never** install it (it's paid); the free-first picker uses it only when it's the sole backend present.
+- **QEMU+hvf** is the fully-free, no-GUI-dependency DIY path (you build more plumbing yourself); `WindowsPreflight` detects `qemu-system-aarch64` and the recommender lists it as a free fallback, but it is **not yet wired to a `WindowsVMCLI`**, so a QEMU-only host can't run a Windows fleet today.
+
+Two pickers exist: `WindowsVMProviderFactory.detectFreeFirstCLI()` (UTM, else an existing Parallels — the app's default) and the older `detectInstalledCLI()` (Parallels, else UTM — robustness-first, kept for reference).
 
 ### One-time base image prep (the button / the script)
 
@@ -151,7 +162,7 @@ Friendly by design — no env vars, no hand-copied long tokens.
 
 ```bash
 swift build          # compiles MactionsCore + the app
-swift test           # 40 unit tests (requests, device-flow guard, repo lister, orchestrator, cleanup, Windows VM command shapes, Windows image build-id/UUP-dump logic)
+swift test           # 60 unit tests (requests, device-flow guard, repo lister, orchestrator, cleanup, Windows VM command shapes, Windows image build-id/UUP-dump logic, Windows preflight detection + free-first brew-command builder)
 swift run Mactions   # launches the menubar app for dev (look in the menubar)
 ```
 
@@ -189,7 +200,7 @@ Crucially, **your repos don't change.** Workflows target **labels** (`runs-on: [
 
 ## Roadmap
 
-- **Windows** support: scaffolded + wired into the UI (`WindowsVMProvider`, `WindowsImage`, `scripts/prepare-windows-image`, the opt-in "Set up Windows runner" button + Windows toggle — see [Windows support](#windows-support)). Auto-download-latest (UUP dump) and the build-id auto-update check are implemented + unit-tested. **Remaining (NOT live-verified here):** the ISO auto-download/convert actually producing a bootable ISO, a real Win11-ARM base image, the VM boot, and a green Windows job. Also: a backend picker (Parallels vs UTM) in the UI, and a QEMU+hvf backend for a fully-free, no-GUI-session path.
+- **Windows** support: scaffolded + wired into the UI (`WindowsVMProvider`, `WindowsImage`, `WindowsPreflight`, `scripts/prepare-windows-image`, the opt-in "Set up Windows runner" button + the free-first preflight checklist/"Install free prerequisites" button + Windows toggle — see [Windows support](#windows-support)). Free-first prerequisite detection + the brew-command builder, auto-download-latest (UUP dump), and the build-id auto-update check are implemented + unit-tested. **Remaining (NOT live-verified here):** the actual `brew install` of the free deps, the ISO auto-download/convert producing a bootable ISO, a real Win11-ARM base image, the VM boot, and a green Windows job. Also: a QEMU+hvf backend wired to a `WindowsVMCLI` for a fully-free, no-GUI-session path (preflight already detects QEMU), and an explicit backend picker in the UI.
 - **Scale-from-zero:** instead of N idle runners, listen for `workflow_job` queued events (webhook or API poll) and provision on demand. This is what ARC does.
 - **Distributable `.app`:** Xcode/`xcodebuild` bundle step, `LSUIElement`, Developer ID + notarization, and a Login Item so it can auto-start.
 - **Tart image automation:** a `mactions prepare-image` flow that bakes the runner + SSH into a base image.
