@@ -77,11 +77,13 @@ Friendly by design — no env vars, no hand-copied long tokens.
 
 ```bash
 swift build          # compiles MactionsCore + the app
-swift test           # 12 unit tests (requests, device-flow guard, repo lister, orchestrator, cleanup)
+swift test           # 11 unit tests (requests, device-flow guard, repo lister, orchestrator, cleanup)
 swift run Mactions   # launches the menubar app for dev (look in the menubar)
 ```
 
 `swift run` is fine for development; a distributable `.app` bundle (with `LSUIElement`, Developer ID signing, notarization) is a packaging step that doesn't exist yet — see Roadmap.
+
+**CI:** there's deliberately no push-triggered CI. GitHub-hosted `macos-latest` runners aren't available to the Kyter-com org (jobs get no runner and fail in ~4s), and a self-hosted runner only exists while someone has Mactions open — neither is reliable for push CI. So validation is local `swift test` plus the manual **`.github/workflows/selfhosted-smoke.yml`** (`workflow_dispatch`), which builds + tests on a Mactions-provided runner. A dedicated always-on Mac runner would let this become real push CI.
 
 ## Host hygiene (no leftover crap)
 
