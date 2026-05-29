@@ -2,11 +2,13 @@ import MactionsCore
 import SwiftUI
 
 /// The entire UI: a single popover hung off the menubar item. Signed-out shows
-/// the GitHub connect flow; signed-in shows fleet config + the online toggle +
-/// live runners. Kept in one view to avoid multi-window plumbing in the MVP.
+/// the GitHub connect flow; signed-in shows a searchable multi-repo picker, the
+/// online toggle, and live runners. Split into small subviews so the SwiftUI
+/// type-checker stays fast.
 struct MenuContentView: View {
   @EnvironmentObject private var app: AppState
   @State private var pat = ""
+  @State private var repoFilter = ""
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
@@ -28,22 +30,10 @@ struct MenuContentView: View {
       }
 
       Divider()
-      HStack(spacing: 12) {
-        if app.isSignedIn {
-          Button("Sign out", action: app.signOut)
-            .buttonStyle(.link)
-          if app.state == .offline {
-            Button("Clean up", action: app.cleanUpHostFiles)
-              .buttonStyle(.link)
-              .help("Remove the cached runner agent and all per-run files from this Mac")
-          }
-        }
-        Spacer()
-        Button("Quit Mactions") { NSApp.terminate(nil) }
-          .buttonStyle(.link)
-      }
+      footer
     }
     .padding(14)
+    .task(id: app.isSignedIn) { await app.loadReposIfNeeded() }
   }
 
   // MARK: Header
@@ -67,6 +57,25 @@ struct MenuContentView: View {
     }
   }
 
+  // MARK: Footer
+
+  private var footer: some View {
+    HStack(spacing: 8) {
+      if app.isSignedIn {
+        Button("Sign out", action: app.signOut)
+        if app.state == .offline {
+          Button("Remove cached agent", action: app.cleanUpHostFiles)
+            .help(
+              "Per-run files are wiped automatically after every job. This also removes the cached ~200 MB runner agent.")
+        }
+      }
+      Spacer()
+      Button("Quit") { NSApp.terminate(nil) }
+    }
+    .buttonStyle(.bordered)
+    .controlSize(.small)
+  }
+
   // MARK: Connect (signed out)
 
   private var connectSection: some View {
@@ -77,9 +86,9 @@ struct MenuContentView: View {
         Button {
           app.signInWithGitHubCLI()
         } label: {
-          Label("Use my GitHub CLI login", systemImage: "terminal")
-            .frame(maxWidth: .infinity)
+          Label("Use my GitHub CLI login", systemImage: "terminal").frame(maxWidth: .infinity)
         }
+        .buttonStyle(.borderedProminent)
         .controlSize(.large)
         Text("Easiest — reuses your existing `gh` login. No token needed.")
           .font(.caption2).foregroundStyle(.secondary)
@@ -104,9 +113,9 @@ struct MenuContentView: View {
         } label: {
           Label("Sign in with GitHub", systemImage: "person.badge.key")
         }
+        .buttonStyle(.bordered)
         .disabled(app.authBusy)
-
-        Text("Device-flow sign-in needs an OAuth App client id (see below). No client id yet? Paste a token instead.")
+        Text("Device-flow sign-in needs an OAuth App client id. No client id yet? Paste a token instead.")
           .font(.caption2).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }
@@ -123,6 +132,7 @@ struct MenuContentView: View {
         app.signInWithToken(pat)
         pat = ""
       }
+      .buttonStyle(.bordered)
       .disabled(pat.trimmingCharacters(in: .whitespaces).isEmpty)
       Text("Needs repo-admin (`repo` scope, or fine-grained Administration: read & write).")
         .font(.caption2).foregroundStyle(.secondary)
@@ -132,15 +142,18 @@ struct MenuContentView: View {
 
   // MARK: Fleet (signed in)
 
+  private var filteredRepos: [RepoRef] {
+    let query = repoFilter.trimmingCharacters(in: .whitespaces).lowercased()
+    guard !query.isEmpty else { return app.availableRepos }
+    return app.availableRepos.filter { $0.fullName.lowercased().contains(query) }
+  }
+
   private var fleetSection: some View {
     VStack(alignment: .leading, spacing: 10) {
-      LabeledField("Owner", text: $app.owner, prompt: "Kyter-com")
-        .disabled(app.state != .offline)
-      LabeledField("Repo", text: $app.repo, prompt: "sweep-collector")
-        .disabled(app.state != .offline)
+      repoPicker
       LabeledField("Labels", text: $app.labelsText, prompt: "self-hosted,macOS")
         .disabled(app.state != .offline)
-      Stepper("Runners: \(app.desiredCount)", value: $app.desiredCount, in: 1...5)
+      Stepper("Runners per repo: \(app.runnersPerRepo)", value: $app.runnersPerRepo, in: 1...5)
         .disabled(app.state != .offline)
 
       Button {
@@ -152,20 +165,82 @@ struct MenuContentView: View {
         )
         .frame(maxWidth: .infinity)
       }
+      .buttonStyle(.borderedProminent)
       .controlSize(.large)
-      .disabled(app.state == .starting || app.state == .stopping)
+      .disabled(app.selectedRepos.isEmpty || app.state == .starting || app.state == .stopping)
 
-      if !app.runners.isEmpty {
-        Text("Runners").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-        ForEach(app.runners) { runner in
-          HStack(spacing: 6) {
-            Image(systemName: "circle.fill")
-              .font(.system(size: 6))
-              .foregroundStyle(runner.phase == .online ? Color.green : Color.orange)
-            Text(runner.id).font(.caption.monospaced()).lineLimit(1).truncationMode(.middle)
-            Spacer()
-            Text(runner.phase.rawValue).font(.caption2).foregroundStyle(.secondary)
+      if !app.runners.isEmpty { runnerList }
+    }
+  }
+
+  private var repoPicker: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      HStack {
+        Text("Repositories (\(app.selectedRepos.count) selected)")
+          .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+        Spacer()
+        if app.reposLoading {
+          ProgressView().controlSize(.small)
+        } else {
+          Button {
+            Task { await app.loadRepos() }
+          } label: {
+            Image(systemName: "arrow.clockwise")
           }
+          .buttonStyle(.borderless)
+          .help("Refresh repositories")
+        }
+      }
+      TextField("Filter repositories…", text: $repoFilter)
+        .textFieldStyle(.roundedBorder)
+      ScrollView {
+        LazyVStack(alignment: .leading, spacing: 2) {
+          ForEach(filteredRepos) { repo in repoRow(repo) }
+        }
+        .padding(4)
+      }
+      .frame(height: 150)
+      .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
+      .overlay(alignment: .center) {
+        if app.availableRepos.isEmpty && !app.reposLoading {
+          Text("No admin repos loaded — try Refresh.")
+            .font(.caption).foregroundStyle(.secondary)
+        }
+      }
+    }
+  }
+
+  private func repoRow(_ repo: RepoRef) -> some View {
+    Button {
+      app.toggleRepo(repo)
+    } label: {
+      HStack(spacing: 6) {
+        Image(systemName: app.isSelected(repo) ? "checkmark.circle.fill" : "circle")
+          .foregroundStyle(app.isSelected(repo) ? Color.accentColor : Color.secondary)
+        Text(repo.fullName).font(.caption).lineLimit(1).truncationMode(.middle)
+        if repo.isPrivate {
+          Image(systemName: "lock.fill").font(.system(size: 8)).foregroundStyle(.secondary)
+        }
+        Spacer()
+      }
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .disabled(app.state != .offline)
+  }
+
+  private var runnerList: some View {
+    VStack(alignment: .leading, spacing: 4) {
+      Text("Runners").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+      ForEach(app.runners) { row in
+        HStack(spacing: 6) {
+          Image(systemName: "circle.fill")
+            .font(.system(size: 6))
+            .foregroundStyle(row.runner.phase == .online ? Color.green : Color.orange)
+          Text(row.repoFullName).font(.caption2).foregroundStyle(.secondary)
+          Text(row.runner.id).font(.caption2.monospaced()).lineLimit(1).truncationMode(.middle)
+          Spacer()
+          Text(row.runner.phase.rawValue).font(.caption2).foregroundStyle(.secondary)
         }
       }
     }
