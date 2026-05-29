@@ -22,7 +22,7 @@ Proof-of-concept. Honest accounting:
 - ✅ **Local-process provider**: runs the actions-runner agent directly on the Mac (no VM isolation, but each run is an isolated clone that's wiped on exit — see Host hygiene). This is the runnable MVP path.
 - ✅ **SwiftUI menubar app**: status, config, online/offline, live runner list; deregisters on quit.
 - 🧪 **Tart provider** (VM isolation): implemented against the `tart` CLI but **experimental** — depends on a prepared base image + SSH bootstrap (see Providers).
-- ⛔ **Windows**: not built. See Roadmap for why it's the hard one.
+- 🧪 **Windows provider** (`WindowsVMProvider`): implemented + unit-tested, but **experimental and not yet live-verified end to end**. Clones a throwaway Win11-ARM VM per job (Parallels `prlctl` recommended; UTM `utmctl` fallback), SSHes in to launch the win-arm64 runner agent, and destroys the clone on exit. Needs a one-time base image you build with `scripts/prepare-windows-image` (you supply the ISO). See [Windows support](#windows-support).
 
 ## Architecture
 
@@ -55,13 +55,81 @@ MactionsCore (library, pure Foundation)        Mactions (executable, SwiftUI/App
 `RunnerProvider` is the substrate one runner executes on.
 
 - **`LocalProcessProvider`** — runs the agent as a child process on the Mac. No isolation. Fine for **trusted private repos**. This is the default and the only one wired into the UI today.
-- **`TartProvider`** (experimental) — clones a [Tart](https://tart.run) base image, boots it, SSHes in to launch the agent, deletes the clone on exit. Requires: Apple Silicon, `tart` installed, and a **base image** that already has the actions-runner at `~/actions-runner` plus an SSH login. Image prep is not automated yet.
+- **`TartProvider`** (experimental) — clones a [Tart](https://tart.run) base image, boots it, SSHes in to launch the agent, deletes the clone on exit. Requires: Apple Silicon, `tart` installed, and a **base image** that already has the actions-runner at `~/actions-runner` plus an SSH login. Image prep is not automated yet. Tart is **macOS/Linux only** — it cannot boot Windows guests, which is why Windows needs its own provider.
+- **`WindowsVMProvider`** (experimental) — the Windows analog of `TartProvider`: clones a pristine Win11-ARM base VM, boots it headless, SSHes in to launch the win-arm64 runner agent (`run.cmd --jitconfig …`), and **force-stops + deletes the clone on exit**. Backed by a `WindowsVMCLI` abstraction so it can drive Parallels (`prlctl`, recommended) or UTM (`utmctl`, free fallback). See [Windows support](#windows-support).
 
 ### Per-OS reality (important)
 
 - **macOS guests:** Tart via Virtualization.framework. Apple's EULA caps you at **2 concurrent macOS VMs per host**.
 - **Linux guests:** easiest. Prefer a container (Colima/Lima/Docker) over a full VM for cleaner ephemerality. On Apple Silicon these are **arm64**; x64 Linux needs slow QEMU emulation, so label runners by arch and adjust workflows.
-- **Windows guests:** the hard one. On Apple Silicon only **Windows 11 ARM** runs (UTM/QEMU/Parallels); x64 is emulation-only and slow. Tart doesn't do Windows. Honestly, a cheap always-on Windows box or a cloud VM the app starts/stops via API beats emulating locally.
+- **Windows guests:** the hard one, now scaffolded via `WindowsVMProvider` (see [Windows support](#windows-support)). On Apple Silicon only **Windows 11 ARM** runs (Parallels/UTM/QEMU); x64 is emulation-only and slow. Tart doesn't do Windows. The provider clones a throwaway Win11-ARM VM per job and destroys it after — the only way to hit the ephemerality bar on Windows (no APFS-clone HOME-redirect trick exists there).
+
+## Windows support
+
+🧪 **Experimental, and not yet live-verified end to end.** The control-plane code (provider, factory, stray-clone reaping) compiles and is unit-tested; the actual VM boot + a green Windows job have **not** been run here because that needs a hand-built base image (which needs an ISO download + a multi-minute Windows install). Treat "a Windows job ran on a Mactions runner" as unproven until you complete the image prep and watch one go green.
+
+### Why Windows is its own provider
+
+Tart cannot boot Windows at all — Windows 11 ARM needs Secure Boot + TPM 2.0, which Apple's Virtualization.framework (Tart's backend) doesn't expose. So `WindowsVMProvider` is a separate provider with a different hypervisor CLI. Only the **orchestration pattern** transfers from `TartProvider`; the VM tool does not.
+
+### How it works (the ephemeral per-job loop)
+
+The provider drives a `WindowsVMCLI` backend (a pure-function abstraction so the command shapes are unit-testable without a VM). Per job:
+
+1. **Clone** a pristine Win11-ARM base VM to a throwaway `mactions-<id>` clone (CoW: `prlctl clone --linked` / `utmctl clone`).
+2. **Start** it headless. Key divergence from Tart: these CLIs' `start` returns *immediately* (it does NOT block until the VM powers off, the way `tart run` does).
+3. **Poll** the CLI for the guest's IP (longer timeout than Tart — a fresh Win11 clone takes a few minutes to get a DHCP lease).
+4. **SSH in** and launch the agent: `run.cmd --jitconfig <BASE64_JIT>`. The base64 JIT string the orchestrator already generates is **OS-agnostic** — the same value that launches `run.sh` on mac/Linux launches `run.cmd` on Windows, so the provider contract needed zero changes. The SSH command **blocks** until `run.cmd`'s single job finishes; that's how we observe completion (since `start` didn't block).
+5. **Destroy** on exit: force-stop (`stop --kill`) + `delete` the clone on every path (success, SSH failure, boot failure), then fire `onExit`. `stop()` does the same teardown for the user-went-offline path.
+
+### Ephemerality
+
+A throwaway VM discards the **entire guest disk** per job — npm cache, `%TEMP%`, registry, the `_work` checkout, profile, everything. There is no Windows equivalent of the local provider's APFS-clone HOME-redirect trick, and none is needed: the only thing that persists is the **pristine base image template**; only ephemeral clones are ever booted. `HostCleanup.purgeStrayWindowsClones()` (called from `sweepOrphans()` on go-online) reaps any `mactions-…` clone a crash left behind, so the host accumulates nothing across crashes either. The clone name carries the `mactions-` prefix, so reaping never touches a non-Mactions VM.
+
+### Backends: Parallels vs UTM
+
+- **Parallels (`prlctl`) — recommended.** The only Microsoft-authorized hypervisor for Win11 ARM on Apple Silicon with full HW acceleration, and the only one with a **true background-service headless mode** plus a complete CLI lifecycle that works **without a GUI login session**. Requires Pro/Business Edition (paid) and Full Disk Access for the Parallels app.
+- **UTM (`utmctl`) — free fallback.** Works, but `utmctl` uses Apple's ScriptingBridge and **requires an active GUI (Aqua) login session** — it silently fails over SSH or from a pure launchd/headless context. Fine when Mactions runs in the foreground; fragile for an unattended host. Use it only if the Parallels license is a non-starter.
+- **QEMU+hvf** is the fully-free, no-GUI-dependency DIY path (you build more plumbing yourself); not implemented here, noted as the next fallback if Parallels cost is rejected.
+
+`WindowsVMProviderFactory.detectInstalledCLI()` picks Parallels if present, else UTM, else `nil`.
+
+### One-time base image prep (the manual step)
+
+The single unavoidable manual step is acquiring the official **Windows 11 ARM64 ISO** (Microsoft only offers it as a time-limited interactive download, so it can't be hard-coded). Then:
+
+```bash
+# 1. Download the ISO (manual):
+open https://www.microsoft.com/en-us/software-download/windows11arm64
+
+# 2. Build the base VM (automated as far as the tooling allows):
+scripts/prepare-windows-image --iso ~/Downloads/Win11_ARM64.iso --name win11-runner-base
+```
+
+`prepare-windows-image` builds a small unattend ISO from `scripts/autounattend.xml` + `scripts/bootstrap.ps1`, then:
+
+- **Parallels:** creates + boots the VM and drives the install from the CLI; you let `autounattend.xml` + `bootstrap.ps1` finish, detach the install media, and shut it down.
+- **UTM:** `utmctl` has **no `create` verb**, so the first template must be built once in the UTM GUI; the script prints the exact steps and the path to the unattend ISO.
+
+`autounattend.xml` lays down a UEFI/GPT Win11 Pro ARM install, creates a throwaway local-admin `runner` with auto-login, skips OOBE, and runs `bootstrap.ps1` on first logon. `bootstrap.ps1` enables OpenSSH Server, makes PowerShell the default SSH shell, and installs the `actions-runner-win-arm64` agent to `C:\actions-runner` (short root path to dodge Windows MAX_PATH on deep `node_modules` trees). Power the VM off when bootstrap finishes — that powered-off VM is the pristine base; point `WindowsVMProviderFactory(baseImage:)` at its name.
+
+### Workflow change (sweep-collector)
+
+The Windows arm of sweep-collector's `ci.yml` matrix needs its `runner` changed from `windows-latest` to the Mactions Windows label set, mirroring the macOS arm:
+
+```yaml
+- os: windows
+  runner: [self-hosted, Windows, mactions]   # was: windows-latest
+```
+
+The JIT config must carry labels `[self-hosted, Windows, mactions]` for these jobs (configure a Windows fleet with those labels). The existing `cache:` line keys on `runner.environment == 'github-hosted'`, so a self-hosted Windows runner gets no npm cache — same as the macOS arm, and exactly what you want. (This repo doesn't edit sweep-collector; the change is documented here.)
+
+### Perf / compatibility caveats
+
+- sweep-collector's `npm test` is `vitest run` over pure-JS/jsdom unit tests (sql.js is WASM; Playwright/Electron e2e is excluded; `npm ci --ignore-scripts` skips native postinstalls), so it runs on **native arm64 Node 24** with effectively no emulation. Node 24 ships official win-arm64 binaries and `actions/setup-node@v6` reading `.nvmrc` picks them (RUNNER_ARCH=ARM64 on a genuine arm64 runner).
+- Emulation is still a *fallback risk* for other workloads: any dependency that pulls an x64-only Windows binary runs under Win11's Prism emulation (slower, occasionally incompatible). Verify a real `npm ci` on win-arm64 before promising parity for anything beyond vitest.
+- The win-arm64 runner is still officially "beta"/limited-support; the multi-edition ISO is unactivated (cosmetic nags) — acceptable for a throwaway CI guest, not for production.
+- A fresh Win11 clone boots much slower than a Tart Linux guest, so jobs pay a multi-minute clone+boot+SSH tax per run. JIT tokens expire ~60 min after generation; the orchestrator already mints them right before `start()`, so don't pre-warm clones with a stale jitconfig.
 
 ## Auth
 
@@ -92,9 +160,9 @@ Ephemeral means the host is left as it was found. This is enforced, not hoped fo
 - **Everything Mactions writes lives under one directory:** `~/.mactions/` (the cached agent template + a `runs/` dir + the token). A dot-dir in `$HOME`, **not** `~/Library/Application Support` — the Actions runner breaks on the space in "Application Support" (`exit 126`), so the work path must be space-free. One `rm -rf` reaps it all.
 - **Per run (fully ephemeral — like a throwaway machine):** each job runs in its own **APFS clone** of the cached agent at `runs/<runner-name>`, and the job's `HOME`, npm cache (`npm_config_cache`), tool cache (`RUNNER_TOOL_CACHE`), `XDG_CACHE_HOME`, and `TMPDIR` are all redirected *inside* that clone. So the checkout, `node_modules`, downloaded actions/tools, dotfiles, and temp files all live in the clone, which is deleted the instant the agent exits. **Nothing touches the user's real `~/.npm` / `~/Library/Caches` / `$TMPDIR`, and nothing survives the job.** Tradeoff: no cross-run cache reuse — deps re-download each run, which is the price of "separate PC every time". (APFS copy-on-write keeps the clone near-instant and almost free on disk.)
 - **Only persistent artifact:** the cached agent template at `~/.mactions/actions-runner` — that's the runner *software* (downloaded once, refreshed on version bumps), not job output. "Remove cached agent" wipes even that.
-- **On go-online:** `HostCleanup.sweepOrphans()` deletes any `runs/` leftovers and stray `mactions-*` Tart clones from a previous crash/force-quit.
+- **On go-online:** `HostCleanup.sweepOrphans()` deletes any `runs/` leftovers and stray `mactions-*` Tart clones **and Windows VM clones** (`purgeStrayWindowsClones()`, via `prlctl`/`utmctl`) from a previous crash/force-quit.
 - **On go-offline / quit:** `purgeRuns()` sweeps again (defensive).
-- **Tart:** clones are deleted on agent exit and on `stop()`.
+- **Tart / Windows VMs:** clones are deleted on agent exit and on `stop()`.
 - **On demand:** the "Remove cached agent" button (offline) calls `purgeAll()` — removes the cached agent + all run files (not the token). "Sign out" deletes the token file.
 
 The single persistent, intentional cache is the ~200 MB agent template (so restarts are fast); it's documented, reapable from the UI, and never the place jobs actually run.
@@ -115,7 +183,7 @@ Crucially, **your repos don't change.** Workflows target **labels** (`runs-on: [
 
 ## Roadmap
 
-- **Windows** support (Win11-ARM VM provider, image prep, or "start a cloud/remote box" provider).
+- **Windows** support: scaffolded (`WindowsVMProvider` + `scripts/prepare-windows-image`, see [Windows support](#windows-support)). Remaining: live-verify a real Win11-ARM base image + a green Windows job, wire the provider into the UI (backend pick + base-image name), and consider a QEMU+hvf backend so there's a fully-free, no-GUI-session path.
 - **Scale-from-zero:** instead of N idle runners, listen for `workflow_job` queued events (webhook or API poll) and provision on demand. This is what ARC does.
 - **Distributable `.app`:** Xcode/`xcodebuild` bundle step, `LSUIElement`, Developer ID + notarization, and a Login Item so it can auto-start.
 - **Tart image automation:** a `mactions prepare-image` flow that bakes the runner + SSH into a base image.

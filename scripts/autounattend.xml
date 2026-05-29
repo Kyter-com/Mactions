@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  autounattend.xml — unattended Windows 11 ARM64 install for a Mactions
+  ephemeral GitHub Actions runner base image.
+
+  Windows Setup reads this automatically when it is present on removable media
+  (a small ISO/floppy mounted alongside the install media). It:
+    - wipes disk 0 and lays down a UEFI/GPT layout (EFI + MSR + Windows),
+    - installs the "Windows 11 Pro" Arm64 edition from the multi-edition ISO,
+    - creates a local admin `runner` with auto-login and skips all OOBE,
+    - runs bootstrap.ps1 on first logon (OpenSSH + the win-arm64 runner agent).
+
+  IMPORTANT — THROWAWAY ONLY:
+    - The password below is a well-known throwaway value. This VM is destroyed
+      after every job; never reuse this image or password for anything real.
+    - The product key VK7JG-... is Microsoft's public generic Win11 Pro key
+      (selects the edition during Setup; it does NOT activate). The VM runs
+      unactivated with cosmetic nags — acceptable for a disposable CI guest.
+
+  Generated/edited from the research brief's skeleton. processorArchitecture
+  MUST be arm64 for a Win11-ARM install — an x64/amd64 answer file will fail
+  partitioning on Apple Silicon.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE"
+               processorArchitecture="arm64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Setup"
+               processorArchitecture="arm64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <DiskConfiguration>
+        <Disk wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <!-- UEFI/GPT layout for ARM: EFI System + MSR + Windows. -->
+            <CreatePartition wcm:action="add">
+              <Order>1</Order><Type>EFI</Type><Size>200</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>2</Order><Type>MSR</Type><Size>16</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>3</Order><Type>Primary</Type><Extend>true</Extend>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order><PartitionID>1</PartitionID><Format>FAT32</Format><Label>System</Label>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order><PartitionID>2</PartitionID>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>3</Order><PartitionID>3</PartitionID><Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+      <ImageInstall>
+        <OSImage>
+          <InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>
+          <InstallFrom>
+            <!-- Pick the Arm64 edition out of the multi-edition install.wim/esd. -->
+            <MetaData wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+              <Key>/IMAGE/NAME</Key><Value>Windows 11 Pro</Value>
+            </MetaData>
+          </InstallFrom>
+        </OSImage>
+      </ImageInstall>
+      <UserData>
+        <ProductKey>
+          <!-- Generic Win11 Pro edition-select key (does NOT activate). -->
+          <Key>VK7JG-NPHTM-C97JM-9MPGT-3V66T</Key>
+        </ProductKey>
+        <AcceptEula>true</AcceptEula>
+      </UserData>
+    </component>
+  </settings>
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="arm64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>runner</Name>
+            <Group>Administrators</Group>
+            <DisplayName>runner</DisplayName>
+            <Password><Value>P@ssw0rd-throwaway</Value><PlainText>true</PlainText></Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+      <AutoLogon>
+        <Enabled>true</Enabled>
+        <Username>runner</Username>
+        <LogonCount>999</LogonCount>
+        <Password><Value>P@ssw0rd-throwaway</Value><PlainText>true</PlainText></Password>
+      </AutoLogon>
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -File C:\setup\bootstrap.ps1</CommandLine>
+          <Description>Provision OpenSSH + the win-arm64 actions-runner agent</Description>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+  </settings>
+</unattend>

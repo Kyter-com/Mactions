@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+#
+# prepare-windows-image — build the pristine Win11-ARM base VM that Mactions'
+# WindowsVMProvider clones (throwaway) per job.
+#
+# This is the ONE part of Windows support with an unavoidable manual step: you
+# supply the official Windows 11 ARM64 ISO (Microsoft only offers it as a
+# time-limited, ~6-7 GB interactive download — it cannot be hard-coded here).
+# Everything else (the autounattend answer file, the bootstrap ISO, and the
+# guided install) this script sets up for you.
+#
+# After this finishes you'll have a powered-off VM named (by default)
+# "win11-runner-base". Point Mactions' WindowsVMProviderFactory at that name.
+#
+# Honest scope: a hand-rolled hypervisor cannot be driven 100% from the CLI for
+# the FIRST template (Parallels needs `prlctl create`/install media attach; UTM
+# has NO `create` verb at all — see the gotcha below). So this script automates
+# what it can and prints exact next steps for the manual bits, per the detected
+# tool. The per-job clone/boot/destroy loop afterward IS fully automated by the
+# provider.
+#
+# Usage:
+#   scripts/prepare-windows-image --iso /path/to/Win11_ARM64.iso [options]
+#
+# Options:
+#   --iso PATH        Path to the official Win11 ARM64 ISO (required).
+#   --name NAME       Base VM name to create (default: win11-runner-base).
+#   --tool TOOL       parallels | utm   (default: auto-detect).
+#   --disk GB         Guest disk size in GB (default: 64).
+#   --ram MB          Guest RAM in MB (default: 8192).
+#   --cpus N          Guest vCPU count (default: 4).
+#   -h, --help        Show this help.
+
+set -euo pipefail
+
+NAME="win11-runner-base"
+TOOL=""
+ISO=""
+DISK_GB=64
+RAM_MB=8192
+CPUS=4
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --iso)  ISO="$2"; shift 2 ;;
+    --name) NAME="$2"; shift 2 ;;
+    --tool) TOOL="$2"; shift 2 ;;
+    --disk) DISK_GB="$2"; shift 2 ;;
+    --ram)  RAM_MB="$2"; shift 2 ;;
+    --cpus) CPUS="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# --- Detect the hypervisor CLI ----------------------------------------------
+detect_tool() {
+  if command -v prlctl >/dev/null 2>&1; then echo parallels; return; fi
+  if [[ -x /Applications/UTM.app/Contents/MacOS/utmctl ]]; then echo utm; return; fi
+  echo none
+}
+[[ -z "$TOOL" ]] && TOOL="$(detect_tool)"
+
+if [[ "$TOOL" == "none" ]]; then
+  cat <<'EOF' >&2
+No Windows-capable hypervisor CLI found.
+
+Install ONE of (Parallels is recommended for an unattended host — see AGENTS.md):
+  brew install --cask parallels                    # Parallels Desktop (Pro/Business for headless + prlctl)
+  brew install --cask parallels-virtualization-sdk # prlctl tooling
+  -- or the free fallback --
+  brew install --cask utm                          # UTM (utmctl bundled; needs a GUI login session)
+
+Then re-run this script.
+EOF
+  exit 1
+fi
+
+[[ -n "$ISO" ]] || die "missing --iso. Download the official Win11 ARM64 ISO first:
+  open https://www.microsoft.com/en-us/software-download/windows11arm64
+  (choose 'Windows 11 (multi-edition ISO for Arm64)')."
+[[ -f "$ISO" ]] || die "ISO not found at: $ISO"
+
+# --- Build the autounattend ISO ---------------------------------------------
+# Windows Setup auto-reads autounattend.xml from removable media. We also place
+# bootstrap.ps1 under \setup so FirstLogonCommands can run it.
+build_unattend_iso() {
+  local staging out
+  staging="$(mktemp -d)"
+  out="${TMPDIR:-/tmp}/mactions-unattend.iso"
+  mkdir -p "$staging/setup"
+  cp "$HERE/autounattend.xml" "$staging/autounattend.xml"
+  cp "$HERE/bootstrap.ps1"    "$staging/setup/bootstrap.ps1"
+  # hdiutil ships with macOS; produce a Joliet/UDF ISO Setup can read.
+  hdiutil makehybrid -iso -joliet -default-volume-name UNATTEND \
+    -o "$out" "$staging" >/dev/null
+  rm -rf "$staging"
+  echo "$out"
+}
+
+echo "==> Building unattended-install ISO (autounattend.xml + bootstrap.ps1)"
+UNATTEND_ISO="$(build_unattend_iso)"
+echo "    $UNATTEND_ISO"
+
+echo
+echo "Tool:        $TOOL"
+echo "Base VM:     $NAME"
+echo "Win11 ISO:   $ISO"
+echo "Unattend:    $UNATTEND_ISO"
+echo "Disk/RAM/CPU: ${DISK_GB}GB / ${RAM_MB}MB / ${CPUS}"
+echo
+
+case "$TOOL" in
+  parallels)
+    # Parallels CAN create + drive a VM headlessly from the CLI.
+    echo "==> Creating Parallels Win11-ARM VM '$NAME'"
+    prlctl create "$NAME" --distribution win-11 --no-hdd
+    prlctl set "$NAME" --memsize "$RAM_MB" --cpus "$CPUS"
+    prlctl set "$NAME" --device-add hdd --size $((DISK_GB * 1024))
+    # Attach the Windows ISO and the unattend ISO as two CD drives.
+    prlctl set "$NAME" --device-add cdrom --image "$ISO" --connect
+    prlctl set "$NAME" --device-add cdrom --image "$UNATTEND_ISO" --connect
+    # Win11 ARM needs TPM + EFI secure boot; Parallels enables these for win-11.
+    prlctl set "$NAME" --efi-boot on || true
+    echo
+    echo "==> Booting for the unattended install (this takes a while)."
+    echo "    Watch progress in the Parallels window; autounattend.xml drives it"
+    echo "    and bootstrap.ps1 installs OpenSSH + the win-arm64 runner agent."
+    prlctl start "$NAME"
+    cat <<EOF
+
+NEXT (one time):
+  1. Let the install + first-logon bootstrap finish (the guest prints
+     "Bootstrap complete" and asks you to shut down).
+  2. Detach the install media so future clones don't try to reinstall:
+       prlctl set "$NAME" --device-del cdrom0
+       prlctl set "$NAME" --device-del cdrom1
+  3. Shut the VM down (pristine base):
+       prlctl stop "$NAME"
+  4. Verify SSH reachability once from a throwaway clone:
+       prlctl clone "$NAME" --linked --name mactions-smoke
+       prlctl start mactions-smoke
+       prlctl list -f --info mactions-smoke      # grab the IP
+       ssh runner@<ip> 'echo \$env:RUNNER_ARCH'  # expect ARM64
+       prlctl stop mactions-smoke --kill && prlctl delete mactions-smoke
+  5. Point Mactions at base image name "$NAME" (WindowsVMProviderFactory).
+EOF
+    ;;
+
+  utm)
+    # utmctl has NO 'create' verb (ScriptingBridge exposes only clone/start/
+    # stop/delete/ip-address). The first template MUST be built in the UTM GUI.
+    cat <<EOF
+==> UTM has no CLI 'create' verb — build the template ONCE in the UTM app:
+
+  1. Open UTM -> Create a New Virtual Machine -> Virtualize -> Windows.
+  2. Disable "Import VHDX Image"; instead attach the Windows ISO:
+       Boot ISO Image:  $ISO
+  3. Set: ${RAM_MB} MB RAM, ${CPUS} CPUs, ${DISK_GB} GB disk.
+     Enable TPM 2.0 + UEFI (required, or Win11 Setup fails its hardware check).
+  4. After creating, add a SECOND CD/USB drive pointing at the unattend ISO:
+       $UNATTEND_ISO
+  5. Name the VM exactly:  $NAME
+  6. Start it; autounattend.xml drives the install and bootstrap.ps1 provisions
+     OpenSSH + the win-arm64 runner agent. When it prints "Bootstrap complete":
+       - remove BOTH ISO drives (so clones don't reinstall),
+       - (optional) remove the display device for a truly headless clone,
+       - shut the VM down. That powered-off VM is your pristine base.
+  7. Verify from a clone (NOTE: utmctl needs an active GUI login session):
+       /Applications/UTM.app/Contents/MacOS/utmctl clone "$NAME" --name mactions-smoke
+       /Applications/UTM.app/Contents/MacOS/utmctl start mactions-smoke --hide
+       /Applications/UTM.app/Contents/MacOS/utmctl ip-address mactions-smoke
+       ssh runner@<ip> 'echo \$env:RUNNER_ARCH'   # expect ARM64
+       /Applications/UTM.app/Contents/MacOS/utmctl stop mactions-smoke
+       /Applications/UTM.app/Contents/MacOS/utmctl delete mactions-smoke
+  8. Point Mactions at base image name "$NAME" (WindowsVMProviderFactory with UTMCLI()).
+
+The unattend ISO is ready at: $UNATTEND_ISO
+EOF
+    ;;
+esac
+
+echo
+echo "Done. Once the base VM '$NAME' is built + powered off, Mactions can clone it per job."
