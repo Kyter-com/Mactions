@@ -60,11 +60,25 @@ public enum WindowsPreflight {
     /// The UUP-dump → ISO converter tools (aria2c, cabextract, wimlib-imagex,
     /// mkisofs, chntpw) — the convert script hard-requires all of them.
     public let converters: [Tool]
+    /// swtpm (the QEMU-paired software TPM 2.0 emulator). Required for the QEMU
+    /// path because Win11 hard-requires TPM 2.0; UTM/Parallels bring their own.
+    public let swtpm: Tool
+    /// edk2 AArch64 UEFI firmware (the read-only CODE file and the per-VM-copied
+    /// VARS template). Bundled with the `qemu` Homebrew formula under
+    /// `/opt/homebrew/share/qemu/`; absent means the QEMU path can't boot Win.
+    public let efiCode: Tool
+    public let efiVars: Tool
 
-    public init(homebrew: Tool, hypervisors: [Hypervisor: Tool], converters: [Tool]) {
+    public init(
+      homebrew: Tool, hypervisors: [Hypervisor: Tool], converters: [Tool],
+      swtpm: Tool, efiCode: Tool, efiVars: Tool
+    ) {
       self.homebrew = homebrew
       self.hypervisors = hypervisors
       self.converters = converters
+      self.swtpm = swtpm
+      self.efiCode = efiCode
+      self.efiVars = efiVars
     }
 
     /// Is Homebrew installed? (Free-dep auto-install needs it.)
@@ -84,20 +98,29 @@ public enum WindowsPreflight {
       converters.filter { !$0.installed }.map { WindowsImage.brewFormula(for: $0.name) }
     }
 
-    /// The FREE backend to recommend installing when none is present: UTM. We
-    /// never recommend Parallels (paid). If a free one is already installed we
-    /// don't need to install anything.
-    public static let recommendedFreeBackendToInstall: Hypervisor = .utm
+    /// `true` iff every piece of the QEMU stack is present (the qemu binary,
+    /// swtpm, AND both EFI firmware files). This is what the free-first picker
+    /// keys on — qemu alone is necessary but not sufficient.
+    public var qemuStackReady: Bool {
+      hypervisors[.qemu]?.installed == true
+        && swtpm.installed && efiCode.installed && efiVars.installed
+    }
+
+    /// The FREE backend to recommend installing when none is present: QEMU
+    /// (fully headless, no Aqua session required). UTM remains as an alternate
+    /// the user can pick, but we never push them to install it.
+    public static let recommendedFreeBackendToInstall: Hypervisor = .qemu
 
     /// The backend the provider should default to, free-first:
-    ///   1. UTM if installed (free, the default),
-    ///   2. else Parallels if installed (paid — only if the user already has it),
-    ///   3. else QEMU if installed,
-    ///   4. else `nil` (none present → the installer offers to add UTM).
+    ///   1. QEMU if its full stack is ready (fully headless, no Aqua session),
+    ///   2. else UTM if installed (free, but needs a GUI login session),
+    ///   3. else Parallels if installed (paid — only if already present),
+    ///   4. else `nil` (none ready → the installer offers to add the QEMU stack).
     public var recommendedBackend: Hypervisor? {
+      if qemuStackReady { return .qemu }
       if hypervisors[.utm]?.installed == true { return .utm }
       if hypervisors[.parallels]?.installed == true { return .parallels }
-      if hypervisors[.qemu]?.installed == true { return .qemu }
+      if hypervisors[.qemu]?.installed == true { return .qemu }  // partial stack
       return nil
     }
 
@@ -114,6 +137,12 @@ public enum WindowsPreflight {
   /// inherited PATH, so we probe them directly (mirrors `Shell.which`).
   static let brewCandidatePaths = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
   static let utmctlPath = "/Applications/UTM.app/Contents/MacOS/utmctl"
+  /// edk2 AArch64 UEFI firmware files ship inside Homebrew's `qemu` formula at
+  /// `/opt/homebrew/share/qemu/`. The CODE file is read-only (the firmware
+  /// image), the VARS file is the per-VM-copied template (boot order, Secure
+  /// Boot keys persist in the copy).
+  static let efiCodePath = "/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
+  static let efiVarsPath = "/opt/homebrew/share/qemu/edk2-arm-vars.fd"
 
   /// Scan the host for all Windows-runner prerequisites. The probe closures are
   /// injectable so the pure assembly (`makeReport`) can be unit-tested without
@@ -158,7 +187,20 @@ public enum WindowsPreflight {
       Tool(name: $0.binary, path: whichLookup($0.binary))
     }
 
-    return Report(homebrew: homebrew, hypervisors: hypervisors, converters: converters)
+    // QEMU-stack extras (only meaningful when the QEMU backend will be used).
+    // swtpm is the software TPM 2.0 daemon. The two EFI .fd files are bundled
+    // by Homebrew's qemu formula at fixed absolute paths. We reuse the same
+    // `isExecutable` probe for the .fd paths (semantically: "path is present
+    // on disk") so tests can mock both via the same `pathHits` set.
+    let swtpm = Tool(name: "swtpm", path: whichLookup("swtpm"))
+    let efiCode = Tool(
+      name: "edk2-aarch64-code.fd", path: isExecutable(efiCodePath) ? efiCodePath : nil)
+    let efiVars = Tool(
+      name: "edk2-arm-vars.fd", path: isExecutable(efiVarsPath) ? efiVarsPath : nil)
+
+    return Report(
+      homebrew: homebrew, hypervisors: hypervisors, converters: converters,
+      swtpm: swtpm, efiCode: efiCode, efiVars: efiVars)
   }
 
   // MARK: - Free-deps install plan (pure → unit-testable)
@@ -195,9 +237,13 @@ public enum WindowsPreflight {
   ///
   /// Policy baked in here:
   ///   - If `brew` is missing → `.homebrewMissing` (never auto-install Homebrew).
-  ///   - Install UTM (`brew install --cask utm`) ONLY if no hypervisor is present
-  ///     yet. UTM is free/OSS; we NEVER install Parallels (paid). If the user
-  ///     already has *any* hypervisor (incl. Parallels), we add no hypervisor.
+  ///   - Hypervisor: only when NO hypervisor is fully present, install the
+  ///     QEMU stack (`qemu` + `swtpm` — fully headless, no Aqua session). If a
+  ///     hypervisor (incl. Parallels) is already there, install nothing extra.
+  ///     We NEVER install Parallels (paid). We no longer push UTM — the QEMU
+  ///     stack is the free default; UTM stays a runtime option but isn't pushed.
+  ///   - If the QEMU binary exists but swtpm doesn't (or vice versa), install
+  ///     the missing piece so the stack becomes whole.
   ///   - Install the missing converter formulae in one `brew install …`.
   ///   - If nothing is missing → `.nothingToInstall`.
   public static func installPlan(for report: Report) -> InstallPlan {
@@ -207,11 +253,23 @@ public enum WindowsPreflight {
 
     var commands: [BrewCommand] = []
 
-    // Hypervisor: add the free default (UTM) only when none is installed. Never
-    // Parallels — it's paid, and if it's already present `hasHypervisor` is true.
+    // QEMU stack: when no hypervisor is present we install qemu + swtpm. When
+    // qemu IS present but the stack is incomplete (e.g. swtpm got uninstalled
+    // independently), top it up so the chosen backend can actually boot.
+    var hypervisorFormulae: [String] = []
+    let qemuInstalled = report.hypervisors[.qemu]?.installed == true
     if !report.hasHypervisor {
-      commands.append(
-        BrewCommand(executable: brew, arguments: ["install", "--cask", "utm"]))
+      hypervisorFormulae += ["qemu", "swtpm"]
+    } else if qemuInstalled && !report.qemuStackReady {
+      if !report.swtpm.installed { hypervisorFormulae.append("swtpm") }
+      // EFI firmware is bundled with the qemu formula; if it's absent it means
+      // qemu wasn't installed via Homebrew (some non-brew install). Reinstall.
+      if !report.efiCode.installed || !report.efiVars.installed {
+        hypervisorFormulae.append("qemu")
+      }
+    }
+    if !hypervisorFormulae.isEmpty {
+      commands.append(BrewCommand(executable: brew, arguments: ["install"] + hypervisorFormulae))
     }
 
     // Converter tools: one `brew install` for all the missing formulae.

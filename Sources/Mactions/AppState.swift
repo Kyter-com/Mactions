@@ -381,13 +381,28 @@ final class AppState: ObservableObject {
       statusMessage = "Couldn't find scripts/prepare-windows-image."
       return
     }
+    let image = windowsBaseImage
+    // FAST PATH: if the base VM exists AND is powered off, the prep script has
+    // nothing useful to do — flip windowsImageReady on directly. Without this,
+    // re-pressing the button after the user finishes the manual UTM GUI install
+    // (UTM has no `create` verb, so the first template MUST be built in the GUI)
+    // re-triggers the multi-GB UUP download + ~30-40 min convert just to confirm
+    // a powered-off VM exists. The same `baseImagePoweredOff` probe is reused
+    // post-prep below, so the freshness criterion is identical.
+    if let cli = WindowsVMProviderFactory.detectFreeFirstCLI(),
+      WindowsVMProviderFactory.baseImagePoweredOff(name: image, cli: cli)
+    {
+      windowsImageReady = true
+      saveConfig()
+      statusMessage = "Windows base image '\(image)' is ready."
+      return
+    }
     // Preflight FIRST: if the free prerequisites (hypervisor + converter tools)
     // are missing, auto-install the FREE ones (UTM + converter formulae) via
     // Homebrew before the ISO download / base-image build. NEVER installs
     // Parallels (paid); if brew is absent we stop with the brew.sh hint.
     let report = WindowsPreflight.detect()
     windowsPreflight = report
-    let image = windowsBaseImage
     windowsSetupBusy = true
     statusMessage = "Checking Windows prerequisites…"
     Task {

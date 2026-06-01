@@ -86,10 +86,36 @@ final class WindowsPreflightTests: XCTestCase {
 
   func testRecommendedBackendNilWhenNonePresent() {
     XCTAssertNil(report().recommendedBackend)
-    // The free backend we'd offer to INSTALL is always UTM (never Parallels).
-    XCTAssertEqual(WindowsPreflight.Report.recommendedFreeBackendToInstall, .utm)
+    // The free backend we'd offer to INSTALL is now QEMU (fully headless — no
+    // Aqua login session, runs from launchd). UTM is honored if present but no
+    // longer pushed; Parallels (paid) is never recommended.
+    XCTAssertEqual(WindowsPreflight.Report.recommendedFreeBackendToInstall, .qemu)
     XCTAssertTrue(WindowsPreflight.Report.recommendedFreeBackendToInstall.isFree)
     XCTAssertFalse(WindowsPreflight.Hypervisor.parallels.isFree)
+  }
+
+  func testRecommendedBackendPrefersQEMUStackOverUTMWhenStackReady() {
+    // Both UTM and the full QEMU stack present: prefer QEMU (headless, no
+    // Aqua session — UTM's hard limit for unattended hosts).
+    let r = report(
+      which: ["qemu-system-aarch64", "swtpm"],
+      paths: [
+        WindowsPreflight.utmctlPath, WindowsPreflight.efiCodePath, WindowsPreflight.efiVarsPath,
+      ])
+    XCTAssertTrue(r.qemuStackReady)
+    XCTAssertEqual(r.recommendedBackend, .qemu)
+  }
+
+  func testQEMUWithoutSwtpmOrEFIFirmwareIsNotStackReady() {
+    // qemu binary alone isn't enough — Win11 needs TPM 2.0 (swtpm) + EFI fw.
+    let r1 = report(which: ["qemu-system-aarch64"])  // no swtpm, no firmware
+    XCTAssertFalse(r1.qemuStackReady)
+    let r2 = report(which: ["qemu-system-aarch64", "swtpm"])  // no firmware
+    XCTAssertFalse(r2.qemuStackReady)
+    let r3 = report(
+      which: ["qemu-system-aarch64", "swtpm"],
+      paths: [WindowsPreflight.efiCodePath, WindowsPreflight.efiVarsPath])
+    XCTAssertTrue(r3.qemuStackReady)
   }
 
   // MARK: Install plan (the pure brew-command builder)
@@ -103,18 +129,39 @@ final class WindowsPreflightTests: XCTestCase {
     XCTAssertTrue(message.contains("https://brew.sh"))
   }
 
-  func testInstallPlanInstallsUTMCaskAndMissingConvertersWhenBrewPresent() {
-    // brew present, nothing else -> add the free UTM cask + all converter tools.
+  func testInstallPlanInstallsQEMUStackAndMissingConvertersWhenBrewPresent() {
+    // brew present, nothing else -> install the QEMU stack (qemu + swtpm) and
+    // all converter tools. We no longer push UTM (still honored at runtime,
+    // but not the free default we'll install on the user's behalf).
     let plan = WindowsPreflight.installPlan(for: report(which: ["brew"]))
     guard case let .install(commands) = plan else {
       return XCTFail("expected .install, got \(plan)")
     }
     XCTAssertEqual(commands.count, 2)
     XCTAssertEqual(commands[0].executable, "/opt/homebrew/bin/brew")
-    XCTAssertEqual(commands[0].arguments, ["install", "--cask", "utm"])
+    XCTAssertEqual(commands[0].arguments, ["install", "qemu", "swtpm"])
     XCTAssertEqual(
       commands[1].arguments,
       ["install", "aria2", "cabextract", "wimlib", "cdrtools", "minacle/chntpw/chntpw"])
+    XCTAssertFalse(
+      commands.contains { $0.arguments.contains("--cask") },
+      "must NOT install UTM cask (no longer the free default)")
+  }
+
+  func testInstallPlanTopsUpMissingSwtpmWhenQemuAlreadyInstalled() {
+    // qemu binary is present but swtpm wasn't installed alongside (e.g. user
+    // had brew qemu from before). Top up just the missing piece + still install
+    // converters — we never re-install qemu in that case.
+    let r = report(
+      which: ["brew", "qemu-system-aarch64", "aria2c", "cabextract", "wimlib-imagex", "mkisofs",
+        "chntpw"],
+      paths: [WindowsPreflight.efiCodePath, WindowsPreflight.efiVarsPath])
+    let plan = WindowsPreflight.installPlan(for: r)
+    guard case let .install(commands) = plan else {
+      return XCTFail("expected .install, got \(plan)")
+    }
+    XCTAssertEqual(commands.count, 1)
+    XCTAssertEqual(commands[0].arguments, ["install", "swtpm"])
   }
 
   func testInstallPlanNeverInstallsParallelsAndSkipsHypervisorWhenOnePresent() {
@@ -173,7 +220,7 @@ final class WindowsPreflightTests: XCTestCase {
     }
     XCTAssertEqual(result, .installed)
     XCTAssertEqual(ran, [
-      ["install", "--cask", "utm"],
+      ["install", "qemu", "swtpm"],
       ["install", "aria2", "cabextract", "wimlib", "cdrtools", "minacle/chntpw/chntpw"],
     ])
   }
@@ -188,7 +235,7 @@ final class WindowsPreflightTests: XCTestCase {
     guard case let .failed(command, stderr) = result else {
       return XCTFail("expected .failed, got \(result)")
     }
-    XCTAssertTrue(command.contains("install --cask utm"))
+    XCTAssertTrue(command.contains("install qemu swtpm"))
     XCTAssertEqual(stderr, "brew: download failed")  // trimmed
   }
 
