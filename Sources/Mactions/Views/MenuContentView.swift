@@ -216,7 +216,7 @@ struct MenuContentView: View {
         Text(
           app.windowsBackendAvailable
             ? "Downloads the latest Win11 ARM64 ISO and builds a throwaway base VM (multi-GB, one time). Not yet live-verified."
-            : "Needs Parallels (recommended) or UTM installed. Downloads the latest Win11 ARM64 ISO + builds a base VM when set up."
+            : "Installs the free QEMU stack (qemu + swtpm, fully headless) if needed, then downloads the latest Win11 ARM64 ISO + builds a base VM."
         )
         .font(.caption2).foregroundStyle(.secondary)
         .fixedSize(horizontal: false, vertical: true)
@@ -306,8 +306,8 @@ struct MenuContentView: View {
 /// own subview so the SwiftUI type-checker stays fast and `windowsSection`
 /// doesn't balloon. Shows ✓/✗ for Homebrew, a Windows hypervisor, and the
 /// UUP-dump converter tools, plus a one-click installer for the MISSING FREE
-/// deps (UTM + converter formulae) — it never installs Parallels (paid) and
-/// never installs Homebrew (points at brew.sh instead).
+/// deps (the QEMU stack — qemu + swtpm — plus converter formulae) — it never
+/// installs Parallels (paid) and never installs Homebrew (points at brew.sh).
 private struct WindowsPreflightChecklist: View {
   @ObservedObject var app: AppState
 
@@ -335,7 +335,7 @@ private struct WindowsPreflightChecklist: View {
         .disabled(app.state != .offline || app.windowsPreflightBusy)
         Text(
           (report.homebrewInstalled)
-            ? "Installs only the missing FREE tools (UTM + converter tools) via Homebrew. Never installs paid Parallels."
+            ? "Installs only the missing FREE tools (QEMU + swtpm + converter tools) via Homebrew. Never installs paid Parallels."
             : "Install Homebrew first: https://brew.sh — then this installs the free tools."
         )
         .font(.caption2).foregroundStyle(.secondary)
@@ -360,7 +360,7 @@ private struct WindowsPreflightChecklist: View {
     if let backend = report?.recommendedBackend {
       return "Hypervisor: \(backend.displayName)"
     }
-    return "Hypervisor (UTM recommended — free)"
+    return "Hypervisor (QEMU recommended — free, headless)"
   }
 
   private func converterLabel(_ report: WindowsPreflight.Report?) -> String {

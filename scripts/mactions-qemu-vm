@@ -33,6 +33,16 @@
 
 set -euo pipefail
 
+# A Finder- or login-item-launched .app inherits a launchd PATH that lacks
+# /opt/homebrew/bin, so the `require qemu-system-aarch64`/`swtpm`/`python3`/`nc`
+# checks below (and the bare-name qemu-img / qemu-system-aarch64 / swtpm calls
+# in the verbs, plus the qmp_status nc|python3 pipeline) would not resolve and
+# every verb would die. Prepend the Homebrew + /usr/local bins, preserving any
+# inherited PATH. `${PATH:-…}` keeps this safe under `set -u` if PATH is unset.
+# This is the single chokepoint that makes ALL lifecycle + sweep calls work
+# regardless of how the parent app was launched (mirrors AppState.runPrepScript).
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+
 MACTIONS_ROOT="${HOME}/.mactions"
 BASE_DIR="${MACTIONS_ROOT}/windows-base"
 CLONES_DIR="${MACTIONS_ROOT}/windows-clones"
@@ -142,9 +152,15 @@ cmd_base_status() {
   if [[ -f "$BASE_DIR/base.qcow2" \
      && -f "$BASE_DIR/efi_vars.fd" \
      && -d "$BASE_DIR/tpm-state" ]]; then
-    # No clone using the base disk (qemu-img processes lock the base when
-    # clones with `-b` reference it; we just check for live qemu against the
-    # base path as a coarse "in use" signal).
+    # "in-use" here means a LIVE base BUILD/install is still holding base.qcow2
+    # open: qemu-windows-base launches qemu with -drive file="$BASE_DIR/base.qcow2",
+    # so that path is on its argv and pgrep -f matches it. Per-job CLONES do NOT
+    # match — a clone's qemu argv carries only its overlay (.../disk.qcow2), and
+    # the base path lives inside the overlay's qcow2 header (written once by
+    # `qemu-img create -b`), never on the command line. That's intentional and
+    # safe: clones are copy-on-write, so concurrent readers of a static base are
+    # fine; the only state we must refuse to clone/rebuild from is a base whose
+    # own install is still running, which this catches.
     if pgrep -f "$BASE_DIR/base.qcow2" >/dev/null 2>&1; then
       echo "in-use"
     else
@@ -230,27 +246,40 @@ cmd_start() {
   )
   if [[ -f "$dir/config.iso" ]]; then
     config_cd_args+=(
-      -device scsi-cd,bus=scsi0.0,drive=cfg
+      # bootindex=99 deprioritizes the config CD in EDK2's boot-candidate
+      # enumeration. The hdiutil makehybrid -iso config ISO is non-bootable (no
+      # El Torito catalog) so EDK2 skips it anyway, but the explicit high index
+      # removes any nondeterminism before EDK2 reaches the Windows Boot Manager
+      # NVRAM entry carried in the copied efi_vars.fd.
+      -device scsi-cd,bus=scsi0.0,drive=cfg,bootindex=99
       -drive id=cfg,if=none,media=cdrom,file="$dir/config.iso",readonly=on
     )
   fi
 
+  # CRITICAL: the clone must boot the SAME virtual machine Windows was INSTALLED
+  # onto by qemu-windows-base, or the installed OS can bugcheck on an ACPI/IORT
+  # topology change (INACCESSIBLE_BOOT_DEVICE / ACPI_BIOS_ERROR). So -cpu, the
+  # -M machine model (incl. iommu=smmuv3, which adds the ACPI IORT table Windows
+  # enumerated at install), the EFI code/vars pairing, and the NIC OPROM
+  # suppression all MIRROR qemu-windows-base byte-for-byte. Only the install-only
+  # bits differ here: no boot CD / unattend USB, -serial null (no keypress
+  # watchdog needed once the OS is installed), and the per-clone config CD.
   qemu-system-aarch64 \
     -name "$clone" \
-    -accel hvf -cpu max -smp "$CPUS",sockets=1,cores="$CPUS",threads=1 -m "$RAM_MB" \
-    -M virt,gic-version=3,acpi=on \
+    -accel hvf -cpu host -smp "$CPUS",sockets=1,cores="$CPUS",threads=1 -m "$RAM_MB" \
+    -M virt,gic-version=max,acpi=on,iommu=smmuv3 \
     -drive if=pflash,format=raw,readonly=on,file="$EFI_CODE" \
     -drive if=pflash,format=raw,file="$dir/efi_vars.fd" \
     -chardev socket,id=chrtpm,path="$dir/tpm-sock" \
     -tpmdev emulator,id=tpm0,chardev=chrtpm \
     -device tpm-tis-device,tpmdev=tpm0 \
-    -device virtio-blk-pci,drive=hd0 \
+    -device virtio-blk-pci,drive=hd0,bootindex=1 \
     -drive id=hd0,if=none,file="$dir/disk.qcow2",format=qcow2,discard=unmap \
     "${config_cd_args[@]}" \
     -device qemu-xhci,id=usb \
     -device usb-tablet \
     -device usb-kbd \
-    -device virtio-net-pci,netdev=net0 \
+    -device virtio-net-pci,netdev=net0,romfile= \
     -netdev user,id=net0 \
     -device virtio-gpu-pci \
     -display none -serial null -monitor none \

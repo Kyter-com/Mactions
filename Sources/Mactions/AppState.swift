@@ -305,8 +305,9 @@ final class AppState: ObservableObject {
 
   // MARK: Windows runner (opt-in)
 
-  /// True only if a Windows-capable hypervisor CLI (Parallels `prlctl`, or UTM
-  /// `utmctl`) is installed. Windows runners aren't offerable without one.
+  /// True only if a Windows-capable backend is installed: the QEMU stack
+  /// (`mactions-qemu-vm` helper + `qemu-system-aarch64`), Parallels (`prlctl`),
+  /// or UTM (`utmctl`). Windows runners aren't offerable without one.
   var windowsBackendAvailable: Bool { WindowsVMProviderFactory.detectInstalledCLI() != nil }
 
   /// Run the prerequisite scan and publish it for the checklist. Cheap
@@ -315,11 +316,12 @@ final class AppState: ObservableObject {
     windowsPreflight = WindowsPreflight.detect()
   }
 
-  /// Install ONLY the missing FREE prerequisites (the free UTM hypervisor cask +
-  /// the missing converter formulae) via Homebrew. NEVER installs Parallels
-  /// (paid) and NEVER installs Homebrew itself — if `brew` is absent we point at
-  /// brew.sh. Button-triggered only; the long-blocking `brew install` runs off
-  /// the main actor so the popover stays responsive.
+  /// Install ONLY the missing FREE prerequisites (the QEMU stack — `qemu` +
+  /// `swtpm`, fully headless — plus the missing converter formulae) via Homebrew.
+  /// NEVER installs Parallels (paid) and NEVER installs Homebrew itself — if
+  /// `brew` is absent we point at brew.sh. Button-triggered only; the
+  /// long-blocking `brew install` runs off the main actor so the popover stays
+  /// responsive.
   func installWindowsFreePrerequisites() {
     guard state == .offline else { statusMessage = "Go offline first."; return }
     guard !windowsPreflightBusy else { return }
@@ -336,7 +338,7 @@ final class AppState: ObservableObject {
       break
     }
     windowsPreflightBusy = true
-    statusMessage = "Installing free Windows prerequisites (UTM + converter tools via Homebrew)…"
+    statusMessage = "Installing free Windows prerequisites (QEMU + swtpm + converter tools via Homebrew)…"
     Task {
       let result = await Self.runFreeInstall(report)
       windowsPreflightBusy = false
@@ -408,7 +410,7 @@ final class AppState: ObservableObject {
     Task {
       // 1) Install missing FREE deps (off the main actor — it may shell out).
       if case .install = WindowsPreflight.installPlan(for: report) {
-        statusMessage = "Installing free Windows prerequisites (UTM + converter tools via Homebrew)…"
+        statusMessage = "Installing free Windows prerequisites (QEMU + swtpm + converter tools via Homebrew)…"
         let install = await Self.runFreeInstall(report)
         windowsPreflight = WindowsPreflight.detect()
         switch install {
@@ -433,7 +435,7 @@ final class AppState: ObservableObject {
       // 2) Confirm a hypervisor backend is now present before the long build.
       guard WindowsVMProviderFactory.detectInstalledCLI() != nil else {
         statusMessage =
-          "No Windows hypervisor available. Install UTM (free) via \"Install free prerequisites\", or open Parallels if you have it, then try again."
+          "No Windows hypervisor available. Install the free QEMU stack via \"Install free prerequisites\", or open Parallels/UTM if you have it, then try again."
         windowsSetupBusy = false
         return
       }

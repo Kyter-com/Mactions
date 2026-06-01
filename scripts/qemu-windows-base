@@ -29,6 +29,12 @@
 
 set -euo pipefail
 
+# A Finder/login-item-launched .app inherits a launchd PATH without
+# /opt/homebrew/bin, so the require checks below (qemu-system-aarch64 / qemu-img
+# / swtpm) would not resolve. prepare-windows-image already augments PATH before
+# delegating here, but self-fix too so this script is correct when run directly.
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+
 # --- paths + defaults --------------------------------------------------------
 MACTIONS_ROOT="${HOME}/.mactions"
 WBASE="${MACTIONS_ROOT}/windows-base"

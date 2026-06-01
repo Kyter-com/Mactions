@@ -163,9 +163,12 @@ $JobScript = 'C:\setup\run-job.ps1'
 New-Item -ItemType Directory -Force -Path 'C:\setup' | Out-Null
 
 # run-job.ps1 finds the per-clone JIT on the injected config disc, runs ONE job,
-# then powers the VM off (the host's only completion signal). NOTE: it must NOT
-# power off when no JIT is found — a media-attach race should self-heal, not look
-# like a completed job to the host's power-state poll.
+# then powers the VM off (the host's only completion signal). It ALSO powers off
+# if no JIT is found after the full wait: the config disc is always pre-attached
+# before the VM starts (no attach race on any backend), and leaving the VM up
+# never self-heals (no re-scan, -AtLogOn task won't re-fire this session), so a
+# fast power-off lets the host reclaim the slot and reconcile a fresh clone
+# instead of stalling the full jobTimeout on a wedged guest.
 @'
 $ErrorActionPreference = "Continue"
 $RunnerRoot = "C:\actions-runner"
@@ -204,10 +207,18 @@ if ($jit) {
   # Self power-off — the host detects completion purely via VM power state.
   shutdown /s /t 0
 } else {
-  # No JIT yet: do NOT power off (a media race would look like a finished job to
-  # the host). Leave the VM up; the host's jobTimeout + force-kill is the backstop.
-  Write-Output "no jitconfig found on any removable/CD volume after wait; leaving VM up"
+  # No JIT after the full 120s wait. The config disc is attached BEFORE the VM
+  # starts on every backend (QEMU: at qemu launch via -cdrom; Parallels:
+  # attach-then-boot; UTM: in-bundle overwrite while powered off), so a null
+  # result here means a genuinely broken clone, NOT a transient attach race —
+  # and leaving the VM up does NOT self-heal (this script never re-scans, and the
+  # task is -AtLogOn only, so it won't re-fire within the same logged-on session).
+  # Power off so the host's power-state poll reclaims the slot fast and the
+  # orchestrator reconciles a fresh clone (with a fresh JIT) instead of burning
+  # the full ~50-min jobTimeout on an idle guest while the JIT token expires.
+  Write-Output "no jitconfig found on any removable/CD volume after wait; powering off so the host reclaims the slot"
   Stop-Transcript | Out-Null
+  shutdown /s /t 0
 }
 '@ | Set-Content -Path $JobScript -Encoding UTF8
 

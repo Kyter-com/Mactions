@@ -7,10 +7,12 @@ import Foundation
 /// the command shapes without shelling out — the real run is a separate call
 /// (`runInstall`).
 ///
-/// FREE-FIRST policy (important): the recommended hypervisor is **UTM** (free,
-/// open-source). Parallels is paid, so we NEVER recommend installing it and only
-/// prefer it when it's *already present*. QEMU is noted as a deeper free fallback
-/// (not wired into a provider here). Homebrew is the install vehicle but is never
+/// FREE-FIRST policy (important): the recommended hypervisor is the **QEMU +
+/// swtpm + edk2** stack (free, open-source, and fully headless — no Aqua login
+/// session required), which is what we install when none is present. UTM remains
+/// a supported runtime backend (free but Aqua-bound) when already installed.
+/// Parallels is paid, so we NEVER recommend installing it and only prefer it when
+/// it's *already present*. Homebrew is the install vehicle but is never
 /// auto-installed — if it's absent we tell the user to install it from brew.sh.
 public enum WindowsPreflight {
 
@@ -19,15 +21,16 @@ public enum WindowsPreflight {
   /// A hypervisor capable of booting a Windows 11 ARM guest. Ordered by the
   /// free-first preference the recommender uses.
   public enum Hypervisor: String, Equatable, Sendable {
-    /// UTM — free + open-source. The recommended default. Caveat: `utmctl` uses
-    /// Apple's ScriptingBridge and needs an active GUI/login session (fine for
-    /// this interactive app; fragile for an unattended launchd host — see docs).
+    /// UTM — free + open-source, a supported runtime backend when present.
+    /// Caveat: `utmctl` uses Apple's ScriptingBridge and needs an active GUI/login
+    /// session (fine for this interactive app; fragile for an unattended launchd
+    /// host — see docs), which is why QEMU is the recommended default instead.
     case utm
     /// Parallels — paid. Preferred ONLY if already installed; never recommended
     /// for install.
     case parallels
-    /// QEMU — fully free, no GUI-session dependency, but more DIY plumbing. A
-    /// deeper free fallback; not wired into a provider here.
+    /// QEMU — fully free, fully headless (no Aqua login session). The recommended
+    /// default, wired into a provider via `QEMUCLI` + the `mactions-qemu-vm` helper.
     case qemu
 
     /// `true` for the free/OSS backends (UTM, QEMU) — the ones we may recommend
@@ -333,8 +336,9 @@ public enum WindowsPreflight {
 }
 
 extension WindowsPreflight.Hypervisor {
-  /// Free-first iteration order: UTM (free default), Parallels (paid, only if
-  /// present), QEMU (deeper free fallback).
+  /// Iteration order for the installed-list. Note the free-first *recommendation*
+  /// (what we install / `recommendedBackend`) is QEMU; this ordering only governs
+  /// how `installedHypervisors` is listed.
   static let allOrdered: [WindowsPreflight.Hypervisor] = [.utm, .parallels, .qemu]
 
   /// Human label for the checklist / status line.

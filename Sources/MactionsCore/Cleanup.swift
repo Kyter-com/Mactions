@@ -62,11 +62,15 @@ public enum HostCleanup {
   /// Best-effort: delete leftover ephemeral Windows VM clones from a crashed
   /// session. The Windows provider names its throwaway clones `mactions-…`, the
   /// same prefix we scope teardown to, so we never touch a non-Mactions VM.
-  /// No-op if neither `prlctl` (Parallels) nor `utmctl` (UTM) is present.
+  /// Covers all three backends: Parallels (`prlctl`), UTM (`utmctl`), and QEMU
+  /// (the `mactions-qemu-vm` helper's `list`/`delete` verbs + an on-disk fallback
+  /// sweep of `~/.mactions/windows-clones/mactions-*`). No-op for a backend whose
+  /// tooling isn't present.
   ///
   /// Honors the ephemerality bar across crashes: if the app died mid-job the
-  /// hypervisor can leave a powered-down clone (with its `_work` checkout)
-  /// behind; this reaps it on the next go-online.
+  /// hypervisor (or a detached qemu/swtpm pair) can leave a powered-down clone
+  /// (with its `_work` checkout, qcow2 overlay + TPM state) behind; this reaps it
+  /// — and any orphaned qemu/swtpm process — on the next go-online.
   public static func purgeStrayWindowsClones() {
     // Parallels: `prlctl list --all -o name` prints one VM name per line.
     if let prlctl = Shell.which("prlctl"),
@@ -83,6 +87,33 @@ public enum HostCleanup {
       for name in windowsCloneNames(in: list.stdout) {
         _ = try? Shell.run(utmctl, ["stop", name])
         _ = try? Shell.run(utmctl, ["delete", name])
+      }
+    }
+    // QEMU: clones aren't in any hypervisor registry — they're on-disk dirs under
+    // ~/.mactions/windows-clones/<id>/, so prlctl/utmctl can't see them. Drive the
+    // helper's own `list`/`delete` verbs (delete = stop, which SIGTERM→SIGKILLs a
+    // leaked qemu and reaps swtpm, then rm -rf's the clone dir incl the qcow2
+    // overlay / efi_vars / tpm-state / config.iso). The helper self-prepends the
+    // Homebrew bins to PATH, so this works even from a Finder/launchd-launched app.
+    if let qemu = WindowsVMProviderFactory.qemuHelperPath,
+      let list = try? Shell.run(qemu, ["list"]), list.ok {
+      for name in windowsCloneNames(in: list.stdout) {
+        _ = try? Shell.run(qemu, ["delete", name])
+      }
+    }
+    // Belt-and-suspenders: even if the helper is gone (tools uninstalled) or its
+    // `require` block died, reap any leftover throwaway clone dirs by hand. The
+    // `mactions-` prefix scopes this to our own clones; the pkill-by-path first
+    // kills a leaked qemu/swtpm still holding files under the dir (both were
+    // started detached via -daemonize/--daemon, so they outlive the app), mirroring
+    // killOrphanRunnerProcesses.
+    let clonesDir = NSString(string: "~/.mactions/windows-clones").expandingTildeInPath
+    let fm = FileManager.default
+    if let entries = try? fm.contentsOfDirectory(atPath: clonesDir) {
+      for entry in entries where entry.hasPrefix("mactions-") {
+        let dir = clonesDir + "/" + entry
+        _ = try? Shell.run("/usr/bin/pkill", ["-f", dir])
+        try? fm.removeItem(atPath: dir)
       }
     }
   }
