@@ -4,8 +4,8 @@
 # slots into the existing WindowsVMCLI abstraction without exposing vmrun's
 # quirks (no getstate; running-state is read from `vmrun list`; the per-clone
 # config-ISO is wired onto a SATA cdrom by editing the clone .vmx) to Swift.
-# Mirrors scripts/mactions-qemu-vm's verb contract byte-for-byte so the Swift
-# side stays "one CLI + verb args" and stays unit-testable.
+# The stable one-CLI-+-verb-args contract keeps the Swift `VMwareCLI` side a set
+# of pure command builders, unit-testable without launching a VM.
 #
 # Convention:
 #   - The pristine base lives FLAT at:  ~/.mactions/fusion/<base>.vmx
@@ -43,7 +43,7 @@ set -euo pipefail
 # Homebrew/usr-local bins, preserving any inherited PATH. `${PATH:-…}` keeps this
 # safe under `set -u` if PATH is unset. Single chokepoint that makes ALL
 # lifecycle + sweep calls work regardless of how the parent app was launched
-# (mirrors mactions-qemu-vm's PATH-prepend + AppState.runPrepScript).
+# (matching AppState.runPrepScript's PATH handling).
 VMWARE_LIB="/Applications/VMware Fusion.app/Contents/Library"
 export PATH="${VMWARE_LIB}:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 

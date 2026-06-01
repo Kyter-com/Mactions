@@ -5,41 +5,34 @@ import Foundation
 /// The clone/boot/status/stop/delete + per-clone-config-injection verbs a
 /// Windows-VM provider drives, expressed as **pure command builders** so the
 /// per-tool shapes are unit-testable without a live VM (mirrors the
-/// `jitConfigRequest`-style split the rest of the core uses). A concrete tool
-/// (`prlctl` for Parallels, `utmctl` for UTM) fills these in.
+/// `jitConfigRequest`-style split the rest of the core uses). `VMwareCLI` (the
+/// `mactions-fusion-vm` helper wrapping `vmrun`) is the sole conformer.
 ///
 /// HEADLESS / OUTBOUND-REGISTRATION model (see AGENTS.md): there is no inbound
 /// SSH and no guest-IP discovery. Per job we deliver a per-clone **config ISO**
 /// carrying the JIT registration into the guest; the in-guest runtime reads it,
 /// runs `run.cmd --jitconfig` (registering OUTBOUND to GitHub) for ONE job, then
 /// powers the VM off. The host learns completion purely by polling VM **power
-/// state**. The two backends differ only in how the config ISO is delivered:
-/// Parallels has a real attach verb; UTM has none, so we overwrite a fixed
-/// in-bundle disk image in the clone bundle while it's powered off.
+/// state**.
 public protocol WindowsVMCLI: Sendable {
-  /// Absolute path to the CLI binary (e.g. `/usr/local/bin/prlctl`).
+  /// Absolute path to the CLI binary (the `mactions-fusion-vm` helper).
   var executable: String { get }
   /// Human label for the substrate (shown in the UI / logs).
   var displayName: String { get }
   /// Make a cheap throwaway clone of `base` named `clone` (CoW / linked clone).
   func cloneArgs(base: String, clone: String) -> [String]
-  /// Boot the clone headless (no GUI window). Returns immediately — unlike
-  /// `tart run`, these CLIs do NOT block until the VM powers off.
+  /// Boot the clone headless (no GUI window). Returns immediately — the helper
+  /// does NOT block until the VM powers off.
   func startArgs(clone: String) -> [String]
   /// Force power-off (used on teardown / stop()).
   func stopArgs(clone: String) -> [String]
   /// Permanently delete the clone and all its files (the ephemerality bar).
   func deleteArgs(clone: String) -> [String]
-  /// Discover the guest's IP. UNUSED on the outbound-registration flow; kept for
-  /// the Parallels diagnostics / any future direct-connect path.
-  func ipArgs(clone: String) -> [String]
-  /// Pull a single IPv4 address out of the `ip` command's stdout.
-  func parseIP(from output: String) -> String?
   /// Query the clone's power state. The provider parses it via `parseIsStopped`.
   func statusArgs(clone: String) -> [String]
-  /// Query the BASE image's readiness. For VM-named backends (UTM, Parallels)
-  /// this matches `statusArgs` — the base is a named VM that's powered off.
-  /// QEMU overrides it because the base is a set of files on disk, not a VM.
+  /// Query the BASE image's readiness — the helper's `base-status` verb checks
+  /// the base `.vmx` exists, carries the linked-clone snapshot, and isn't
+  /// powered on (prints "stopped" when ready to clone from).
   func baseStatusArgs(base: String) -> [String]
   /// `true` when the status/list output shows the VM powered-off/stopped.
   func parseIsStopped(from output: String) -> Bool
@@ -47,28 +40,19 @@ public protocol WindowsVMCLI: Sendable {
   func forceStopArgs(clone: String) -> [String]
   /// How this backend delivers the per-clone config ISO into the guest.
   func injectionPlan(clone: String, clonePath: String?, configISO: String) -> WindowsInjectionPlan
-  /// Absolute path to the clone's on-disk bundle, for backends that inject by
-  /// overwriting an in-bundle file (UTM). `nil` when injection is via the CLI
-  /// (Parallels), so the provider skips path resolution.
+  /// Absolute path to the clone's on-disk dir, where the helper drops the linked
+  /// clone and the provider writes `config.iso` (the CD the helper wired at
+  /// clone time). The provider uses it to compute the config-ISO target path.
   func cloneBundlePath(clone: String) -> String?
 }
 
-/// How a backend delivers the per-clone config ISO into a powered-off clone.
+/// How the backend delivers the per-clone config ISO into a powered-off clone.
 public enum WindowsInjectionPlan: Equatable, Sendable {
-  /// Overwrite a fixed in-bundle disk image (absolute `target`) with the config
-  /// ISO while the clone is powered off — UTM has no CLI attach verb, but a
-  /// fixed in-bundle drive travels byte-for-byte through `utmctl clone`, so
-  /// replacing that one file delivers the payload. (UNVERIFIED: hinges on UTM
-  /// re-reading the replaced image on start rather than a cached fd — see the
-  /// live-verification checklist in AGENTS.md / issue tracker.)
-  case overwriteInBundleDrive(target: String)
-  /// Copy the config ISO to a per-clone path that the backend's `start` step
-  /// picks up as a real `-cdrom` attachment (QEMU). No pre-existing target file
-  /// is required (vs. `overwriteInBundleDrive`, which guards on it as a UTM
-  /// build-step assertion).
+  /// Copy the config ISO to a per-clone path the backend wired up at clone time.
+  /// For VMware Fusion, `mactions-fusion-vm`'s `clone` verb already pointed the
+  /// clone's `sata0:0` CD at `<clone-dir>/config.iso` with `startConnected=TRUE`,
+  /// so injection is just this byte copy (no attach command, no in-bundle dance).
   case copyConfigFile(target: String)
-  /// Attach the config ISO as a CD via the CLI (Parallels' real attach verb).
-  case attachCommands([[String]])
 }
 
 /// Coarse VM power phase, used to gate completion detection. We must observe
@@ -76,26 +60,7 @@ public enum WindowsInjectionPlan: Equatable, Sendable {
 /// powered itself off" — a freshly cloned (not-yet-started) VM also reads stopped.
 public enum VMPhase: Equatable, Sendable { case starting, running, stopped }
 
-/// True for a real, usable guest IPv4: four in-range octets, not 0.0.0.0, not
-/// APIPA (169.254/16), and not a netmask/broadcast-looking 255.x value.
-func isUsableIPv4(_ s: String) -> Bool {
-  let octs = s.split(separator: ".").compactMap { Int($0) }
-  guard octs.count == 4, octs.allSatisfy({ (0...255).contains($0) }) else { return false }
-  if octs.allSatisfy({ $0 == 0 }) { return false }      // 0.0.0.0 placeholder
-  if octs[0] == 169 && octs[1] == 254 { return false }  // APIPA link-local
-  if octs[0] == 255 { return false }                    // mask/broadcast
-  return true
-}
-
 extension WindowsVMCLI {
-  /// First usable-IPv4 token in the output (`utmctl ip-address` prints a bare
-  /// address per line). Parallels overrides this with a JSON parse.
-  public func parseIP(from output: String) -> String? {
-    output
-      .components(separatedBy: CharacterSet(charactersIn: " \t\n\r,/"))
-      .first(where: isUsableIPv4)
-  }
-
   /// Default power-state read: mentions "stopped" and isn't mid-transition.
   public func parseIsStopped(from output: String) -> Bool {
     let o = output.lowercased()
@@ -105,179 +70,17 @@ extension WindowsVMCLI {
   /// Default force-stop == the normal stop (override where a kill flag exists).
   public func forceStopArgs(clone: String) -> [String] { stopArgs(clone: clone) }
 
-  /// Backends that attach via the CLI don't need a bundle path.
-  public func cloneBundlePath(clone: String) -> String? { nil }
-
-  /// Default base-readiness check is the same as a clone status check — the
-  /// base is a VM with the same name. QEMU overrides this because the base is
-  /// a set of files on disk, not a VM that can be in "running" / "stopped".
+  /// Default base-readiness check is the same as a clone status check.
   public func baseStatusArgs(base: String) -> [String] { statusArgs(clone: base) }
-}
-
-/// Parallels Desktop Pro/Business via `prlctl` — the **proven** backend.
-///
-/// The only Microsoft-authorized hypervisor for Windows 11 ARM on Apple Silicon
-/// with full hardware acceleration, a true background-service headless mode (no
-/// GUI-login dependency), CoW linked clones, and a complete CLI lifecycle
-/// including a **real attach verb** — so the per-clone config ISO is attached
-/// directly, with no in-bundle-overwrite dance.
-public struct ParallelsCLI: WindowsVMCLI {
-  public let executable: String
-  public init(executable: String = "/usr/local/bin/prlctl") {
-    self.executable = executable
-  }
-  public var displayName: String { "Parallels (prlctl)" }
-  public func cloneArgs(base: String, clone: String) -> [String] {
-    ["clone", base, "--linked", "--name", clone]
-  }
-  public func startArgs(clone: String) -> [String] { ["start", clone] }
-  // `--kill` forces an immediate power-off rather than a graceful ACPI shutdown,
-  // matching the throwaway-PC model (we're about to delete the clone anyway).
-  public func stopArgs(clone: String) -> [String] { ["stop", clone, "--kill"] }
-  public func forceStopArgs(clone: String) -> [String] { ["stop", clone, "--kill"] }
-  public func deleteArgs(clone: String) -> [String] { ["delete", clone] }
-  public func statusArgs(clone: String) -> [String] { ["status", clone] }
-  // Query structured JSON and read the labeled lease field — scraping `-f --info`
-  // text yields a netmask/gateway as the "first IPv4 token".
-  public func ipArgs(clone: String) -> [String] { ["list", clone, "--full", "--json"] }
-  public func parseIP(from output: String) -> String? {
-    guard let data = output.data(using: .utf8),
-      let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-      let ip = arr.first?["ip_configured"] as? String,
-      ip != "-", !ip.isEmpty, isUsableIPv4(ip)
-    else { return nil }
-    return ip  // ip_configured is a bare address, no /mask
-  }
-  // Real attach verb: connect the per-clone config ISO to the base's empty
-  // cdrom0 slot while the clone is stopped, then boot.
-  public func injectionPlan(clone: String, clonePath: String?, configISO: String) -> WindowsInjectionPlan {
-    .attachCommands([["set", clone, "--device-set", "cdrom0", "--image", configISO, "--connect"]])
-  }
-}
-
-/// UTM via `utmctl` — the free/open-source default (QEMU backend).
-///
-/// CAVEAT (see AGENTS.md): `utmctl` uses Apple's ScriptingBridge, which needs an
-/// active GUI (Aqua) login session and does NOT work over SSH or from a pure
-/// launchd/headless context. Its verb set is clone/start/stop/delete/status/
-/// ip-address — there is **no attach-drive verb**, and `file`/`exec` need the
-/// QEMU guest agent (no first-class arm64-Windows build, UTM #5134). So the
-/// per-clone config ISO is delivered by OVERWRITING a fixed in-bundle disk image
-/// in the clone bundle while powered off (`injectionPlan`). UNVERIFIED end to end
-/// — see the live-verification checklist before trusting this backend.
-public struct UTMCLI: WindowsVMCLI {
-  public let executable: String
-  /// Directory UTM stores VM bundles in. The clone bundle is `<dir>/<clone>.utm`.
-  public let documentsDir: String
-  /// Filename of the fixed in-bundle data disk we overwrite per clone (the
-  /// `<UUID>` recorded for the second drive added during base-image prep). The
-  /// guest reads the config off this disk by volume label.
-  public let inBundleImageName: String
-  public init(
-    executable: String = "/Applications/UTM.app/Contents/MacOS/utmctl",
-    documentsDir: String = NSString(
-      string: "~/Library/Containers/com.utmapp.UTM/Data/Documents").expandingTildeInPath,
-    inBundleImageName: String = "mactions-config.img"
-  ) {
-    self.executable = executable
-    self.documentsDir = documentsDir
-    self.inBundleImageName = inBundleImageName
-  }
-  public var displayName: String { "UTM (utmctl)" }
-  public func cloneArgs(base: String, clone: String) -> [String] {
-    ["clone", base, "--name", clone]
-  }
-  // `--hide` boots without surfacing a window; the VM itself must also have its
-  // display device removed for a truly headless run (done in image prep).
-  public func startArgs(clone: String) -> [String] { ["start", clone, "--hide"] }
-  public func stopArgs(clone: String) -> [String] { ["stop", clone] }
-  public func deleteArgs(clone: String) -> [String] { ["delete", clone] }
-  public func statusArgs(clone: String) -> [String] { ["status", clone] }
-  public func ipArgs(clone: String) -> [String] { ["ip-address", clone] }
-  // Deterministic bundle path: UTM names bundles by VM name under documentsDir.
-  // (Verify against a real `utmctl clone` — see AGENTS.md live checklist.)
-  public func cloneBundlePath(clone: String) -> String? {
-    documentsDir + "/" + clone + ".utm"
-  }
-  // No attach verb: overwrite the fixed in-bundle drive at <bundle>/Data/<name>.
-  public func injectionPlan(clone: String, clonePath: String?, configISO: String) -> WindowsInjectionPlan {
-    let bundle = clonePath ?? cloneBundlePath(clone: clone) ?? ""
-    return .overwriteInBundleDrive(target: bundle + "/Data/" + inBundleImageName)
-  }
-}
-
-/// QEMU + swtpm + edk2 — the FULLY-HEADLESS, GUI-LESS, FREE/OSS backend (no
-/// Aqua login session required, vs. UTM/Parallels). The actual multi-process
-/// QEMU + swtpm lifecycle is wrapped in `scripts/mactions-qemu-vm` so the Swift
-/// side stays "one CLI + verb args" like prlctl/utmctl — every method here is
-/// pure command-shape, unit-testable without launching anything.
-///
-/// State layout (the helper owns these paths):
-///   ~/.mactions/windows-base/        — the pristine base (built once, atomic)
-///   ~/.mactions/windows-clones/<id>/ — per-clone state (qcow2 overlay, EFI
-///                                      vars copy, TPM state copy, sockets,
-///                                      pidfiles, optional config.iso)
-///
-/// Injection model: provider `inject()` copies the per-job config ISO into
-/// `<clone-dir>/config.iso`; the helper's `start` step attaches it as a real
-/// `-cdrom` (no in-bundle-overwrite hack, no separate attach command).
-public struct QEMUCLI: WindowsVMCLI {
-  public let executable: String
-  /// Where per-clone state lives. The helper builds `<dir>/<clone-name>/`.
-  public let clonesDir: String
-  public init(
-    executable: String,
-    clonesDir: String = NSString(string: "~/.mactions/windows-clones").expandingTildeInPath
-  ) {
-    self.executable = executable
-    self.clonesDir = clonesDir
-  }
-  public var displayName: String { "QEMU (headless)" }
-  public func cloneArgs(base: String, clone: String) -> [String] {
-    ["clone", base, clone]
-  }
-  public func startArgs(clone: String) -> [String] { ["start", clone] }
-  public func stopArgs(clone: String) -> [String] { ["stop", clone] }
-  /// Helper `stop` already escalates SIGTERM → SIGKILL, so a separate force
-  /// path adds nothing — but we still expose it to satisfy the protocol.
-  public func forceStopArgs(clone: String) -> [String] { ["stop", clone] }
-  public func deleteArgs(clone: String) -> [String] { ["delete", clone] }
-  public func statusArgs(clone: String) -> [String] { ["status", clone] }
-  /// The QEMU helper has a dedicated `base-status` verb that checks the BASE
-  /// directory (qcow2 + EFI vars + tpm-state all present, no live qemu against
-  /// the base) and prints "stopped" / "in-use" / "missing". We map it to the
-  /// same parseIsStopped path so "stopped" → ready to clone from.
-  public func baseStatusArgs(base: String) -> [String] { ["base-status", base] }
-  /// QMP doesn't expose a guest IPv4 (no guest agent), and the outbound model
-  /// doesn't need one. Return a benign no-op to keep the protocol total — the
-  /// provider never asks for the IP on the outbound flow.
-  public func ipArgs(clone: String) -> [String] { ["status", clone] }
-  public func parseIP(from output: String) -> String? { nil }
-  /// Helper prints exactly "running" or "stopped" so the default substring match
-  /// is correct; explicit override here as documentation.
-  public func parseIsStopped(from output: String) -> Bool {
-    output.lowercased().contains("stopped")
-  }
-  /// Clone state dir, where the helper drops the per-clone files. The provider's
-  /// inject step uses this to compute the config ISO target path.
-  public func cloneBundlePath(clone: String) -> String? {
-    clonesDir + "/" + clone
-  }
-  /// Drop the JIT config ISO at <clone-dir>/config.iso; the helper's `start`
-  /// step picks it up and attaches it as a usb-storage CD-ROM to the guest.
-  public func injectionPlan(clone: String, clonePath: String?, configISO: String) -> WindowsInjectionPlan {
-    let dir = clonePath ?? cloneBundlePath(clone: clone) ?? ""
-    return .copyConfigFile(target: dir + "/config.iso")
-  }
 }
 
 /// VMware Fusion (free) via `vmrun` — the **PROVEN** backend for Win11-ARM on
 /// Apple Silicon (see AGENTS.md → Windows support). Fusion's EFI boots Win11-ARM
 /// cleanly where stock QEMU's firmware hangs, and `vmrun` gives a true headless
-/// CLI (clone/start/stop/deleteVM + snapshots). As with `QEMUCLI`, the lifecycle
-/// is wrapped in `scripts/mactions-fusion-vm` so the Swift side stays "one CLI +
-/// verb args" — every method here is pure command-shape, unit-testable without
-/// launching anything.
+/// CLI (clone/start/stop/deleteVM + snapshots). The lifecycle is wrapped in
+/// `scripts/mactions-fusion-vm` so the Swift side stays "one CLI + verb args" —
+/// every method here is pure command-shape, unit-testable without launching
+/// anything.
 ///
 /// State layout (the helper owns these paths):
 ///   ~/.mactions/fusion/<base>.vmx     — the pristine base (flat), with a
@@ -317,11 +120,6 @@ public struct VMwareCLI: WindowsVMCLI {
   /// "no-snapshot" / "missing"). Mapped to the same parseIsStopped path so
   /// "stopped" → ready to clone from.
   public func baseStatusArgs(base: String) -> [String] { ["base-status", base] }
-  /// `vmrun` exposes no guest IPv4 (no guest agent needed on the outbound model).
-  /// Return a benign no-op to keep the protocol total — the provider never asks
-  /// for the IP on the outbound flow.
-  public func ipArgs(clone: String) -> [String] { ["status", clone] }
-  public func parseIP(from output: String) -> String? { nil }
   /// Helper normalizes to exactly "running" or "stopped" (vmrun itself has no
   /// getstate; the helper reads `vmrun list`), so the substring match is correct;
   /// explicit override here as documentation. Also correct for the `base-status`
@@ -349,10 +147,12 @@ public struct VMwareCLI: WindowsVMCLI {
 /// ephemerality bar on Windows (the entire guest disk is discarded per job).
 ///
 /// HEADLESS / OUTBOUND-REGISTRATION flow (no SSH, no IP discovery):
-///   1. **Clone** the pristine base to a throwaway `mactions-<id>` clone.
+///   1. **Clone** the pristine base to a throwaway `mactions-<id>` clone — the
+///      `mactions-fusion-vm` `clone` verb linked-clones the base snapshot and
+///      wires the clone's `sata0:0` CD at `<clone-dir>/config.iso`.
 ///   2. **Build** a tiny per-clone **config ISO** carrying the JIT config.
-///   3. **Inject** it into the (powered-off) clone: Parallels attaches it as a
-///      CD; UTM overwrites a fixed in-bundle disk image in the clone bundle.
+///   3. **Inject** it: copy the config ISO to that `<clone-dir>/config.iso` path
+///      (the wired CD), while the clone is still powered off.
 ///   4. **Start** headless. The base image's in-guest runtime (a logon Scheduled
 ///      Task from `bootstrap.ps1`) reads the JIT off the disc, runs
 ///      `run.cmd --jitconfig` for ONE job (registering OUTBOUND to GitHub), then
@@ -361,9 +161,7 @@ public struct VMwareCLI: WindowsVMCLI {
 ///      powered itself off (after first confirming it reached `.running`).
 ///   6. **Destroy** the clone on every path, then fire `onExit`.
 ///
-/// EXPERIMENTAL, not live-verified end to end. The UTM in-bundle injection hinges
-/// on an assumption that needs a live test (see AGENTS.md); Parallels is the
-/// proven backend.
+/// PROVEN end to end on VMware Fusion (see AGENTS.md → Windows support).
 public final class WindowsVMProvider: RunnerProvider {
   public let id: String
   private let baseImage: String
@@ -389,16 +187,16 @@ public final class WindowsVMProvider: RunnerProvider {
   /// Set the first (and only) time the clone is torn down. Guards the background
   /// thread and `stop()` from racing to delete the VM / fire `onExit` twice.
   private var tornDown = false
-  /// Per-clone scratch dir (config ISO + staging); removed on teardown. For
-  /// Parallels the attached CD references the ISO until the VM is gone, so we
-  /// can't delete it earlier.
+  /// Per-clone scratch dir (config ISO + staging); removed on teardown. The
+  /// guest reads the JIT off the copy on the clone's wired CD, so this staging
+  /// dir is only needed until `inject()` copies it into the clone dir.
   private var configWorkdir: String?
   private let lock = NSLock()
 
   public init(
     id: String,
     baseImage: String,
-    cli: WindowsVMCLI = ParallelsCLI(),
+    cli: WindowsVMCLI,
     configVolumeName: String = "MACTIONS",
     bootTimeout: TimeInterval = 300,
     jobTimeout: TimeInterval = 3000,
@@ -522,37 +320,21 @@ public final class WindowsVMProvider: RunnerProvider {
     return iso
   }
 
-  /// Deliver the config ISO into the powered-off clone per the backend's plan.
+  /// Deliver the config ISO into the powered-off clone. The clone's `sata0:0` CD
+  /// was already wired at `<clone-dir>/config.iso` by the helper's `clone` verb,
+  /// so this is just a byte copy to that path.
   private func inject(configISO: String) throws {
     let clonePath = cli.cloneBundlePath(clone: cloneName)
-    switch cli.injectionPlan(clone: cloneName, clonePath: clonePath, configISO: configISO) {
-    case let .overwriteInBundleDrive(target):
-      // Overwrite the fixed in-bundle drive in the (powered-off) clone bundle.
-      let fm = FileManager.default
-      guard fm.fileExists(atPath: target) else {
-        throw Shell.ShellError.nonZeroExit(
-          command: "cp \(configISO) \(target)", status: -1,
-          stderr:
-            "config-drive target not found in the clone bundle: \(target). The base image needs a fixed "
-            + "in-bundle data disk at that path (added once during image prep). See the UTM "
-            + "live-verification steps in AGENTS.md.")
-      }
-      try? fm.removeItem(atPath: target)
-      try fm.copyItem(atPath: configISO, toPath: target)
-    case let .copyConfigFile(target):
-      // Copy the config ISO to the per-clone path. Unlike .overwriteInBundleDrive,
-      // we don't require the target to pre-exist — for QEMU, start-time reads
-      // <clone-dir>/config.iso if present and attaches it as a real -cdrom.
-      let fm = FileManager.default
-      let parent = (target as NSString).deletingLastPathComponent
-      if !parent.isEmpty {
-        try? fm.createDirectory(atPath: parent, withIntermediateDirectories: true)
-      }
-      if fm.fileExists(atPath: target) { try? fm.removeItem(atPath: target) }
-      try fm.copyItem(atPath: configISO, toPath: target)
-    case let .attachCommands(commands):
-      for cmd in commands { try Shell.runChecked(cli.executable, cmd) }
+    guard case let .copyConfigFile(target) = cli.injectionPlan(
+      clone: cloneName, clonePath: clonePath, configISO: configISO)
+    else { return }  // single-case enum — always matches
+    let fm = FileManager.default
+    let parent = (target as NSString).deletingLastPathComponent
+    if !parent.isEmpty {
+      try? fm.createDirectory(atPath: parent, withIntermediateDirectories: true)
     }
+    if fm.fileExists(atPath: target) { try? fm.removeItem(atPath: target) }
+    try fm.copyItem(atPath: configISO, toPath: target)
   }
 
   // MARK: Teardown
@@ -608,7 +390,7 @@ public struct WindowsVMProviderFactory: RunnerProviderFactory {
   private let baseImage: String
   private let cli: WindowsVMCLI
 
-  public init(baseImage: String, cli: WindowsVMCLI = ParallelsCLI()) {
+  public init(baseImage: String, cli: WindowsVMCLI) {
     self.baseImage = baseImage
     self.cli = cli
   }
@@ -617,18 +399,17 @@ public struct WindowsVMProviderFactory: RunnerProviderFactory {
     WindowsVMProvider(id: name, baseImage: baseImage, cli: cli)
   }
 
-  /// Resolve a `scripts/<name>` lifecycle helper at module-load time: first next
-  /// to the binary's working dir (dev builds run via `swift run` from the repo),
-  /// then by walking up from the executable to a repo root (useful when the app
-  /// is launched from a path that isn't the repo cwd). nil if the helper isn't
-  /// shipped alongside the binary (that backend is then not offered).
-  static func resolveHelper(named name: String) -> String? {
+  /// Resolve the `scripts/mactions-fusion-vm` lifecycle helper at module-load
+  /// time: first next to the binary's working dir (dev builds run via
+  /// `swift run` from the repo), then by walking up from the executable to a
+  /// repo root (useful when the app is launched from a path that isn't the repo
+  /// cwd). nil if the helper isn't shipped alongside the binary (Fusion is then
+  /// not offered).
+  public static var fusionHelperPath: String? = {
     let fm = FileManager.default
-    let rel = "scripts/" + name
-    // 1. ./scripts/<name> relative to the binary's working dir.
+    let rel = "scripts/mactions-fusion-vm"
     let cwd = fm.currentDirectoryPath + "/" + rel
     if fm.isExecutableFile(atPath: cwd) { return cwd }
-    // 2. Walk up from the binary (.build/<…>/Mactions → repo root with scripts/).
     var dir = URL(fileURLWithPath: CommandLine.arguments.first ?? "/").deletingLastPathComponent()
     for _ in 0..<6 {
       let candidate = dir.appendingPathComponent(rel).path
@@ -637,81 +418,35 @@ public struct WindowsVMProviderFactory: RunnerProviderFactory {
       dir = dir.deletingLastPathComponent()
     }
     return nil
-  }
-
-  /// Path to the `mactions-qemu-vm` helper that owns QEMU+swtpm lifecycle.
-  public static var qemuHelperPath: String? = resolveHelper(named: "mactions-qemu-vm")
-
-  /// Path to the `mactions-fusion-vm` helper that owns the VMware Fusion `vmrun`
-  /// lifecycle (the proven backend).
-  public static var fusionHelperPath: String? = resolveHelper(named: "mactions-fusion-vm")
+  }()
 
   /// Absolute path to VMware Fusion's `vmrun`. Fusion is NOT brew-installable
   /// (Broadcom-portal download), so detection is presence-only — we never try to
   /// install it. Pairing the helper + this binary is the "Fusion available" gate.
   static let fusionVmrunPath = "/Applications/VMware Fusion.app/Contents/Library/vmrun"
 
-  /// Pick the best installed Windows-VM backend, or `nil` if none is present.
-  /// Prefers VMware Fusion (the PROVEN Win11-ARM backend), then QEMU (headless
-  /// but does NOT boot Win11-ARM on this stack — kept for parity), then Parallels
-  /// (`prlctl`), then UTM (`utmctl`, needs a GUI session).
+  /// The Windows-VM backend, or `nil` if VMware Fusion isn't installed. Fusion is
+  /// the sole backend (the PROVEN Win11-ARM path on Apple Silicon); its
+  /// "installed" condition is BOTH the `mactions-fusion-vm` helper present
+  /// alongside the binary AND `vmrun` on disk. If either half is missing, no
+  /// Windows backend is offered.
   public static func detectInstalledCLI() -> WindowsVMCLI? {
-    if let fusion = fusionHelperPath,
+    guard let fusion = fusionHelperPath,
       FileManager.default.isExecutableFile(atPath: fusionVmrunPath)
-    {
-      return VMwareCLI(executable: fusion)
-    }
-    if let qemu = qemuHelperPath,
-      FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/qemu-system-aarch64")
-    {
-      return QEMUCLI(executable: qemu)
-    }
-    let prlctlCandidates = ["/usr/local/bin/prlctl", "/opt/homebrew/bin/prlctl"]
-    if let path = prlctlCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
-      return ParallelsCLI(executable: path)
-    }
-    let utmctl = "/Applications/UTM.app/Contents/MacOS/utmctl"
-    if FileManager.default.isExecutableFile(atPath: utmctl) {
-      return UTMCLI(executable: utmctl)
-    }
-    return nil
+    else { return nil }
+    return VMwareCLI(executable: fusion)
   }
 
-  /// Pick the installed backend FREE-FIRST: VMware Fusion (free since Nov 2024
-  /// AND the proven Win11-ARM backend — preferred), else QEMU (free + headless
-  /// but does NOT boot Win11-ARM here), else UTM (free but needs a GUI session),
-  /// else Parallels (paid — only if already installed), else `nil`. Fusion's
-  /// "installed" condition is BOTH the `mactions-fusion-vm` helper present
-  /// alongside the binary AND `vmrun` on disk; QEMU's is the helper AND
-  /// `qemu-system-aarch64`. If either half is missing that backend isn't offered.
-  public static func detectFreeFirstCLI() -> WindowsVMCLI? {
-    if let fusion = fusionHelperPath,
-      FileManager.default.isExecutableFile(atPath: fusionVmrunPath)
-    {
-      return VMwareCLI(executable: fusion)
-    }
-    if let qemu = qemuHelperPath,
-      FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/qemu-system-aarch64")
-    {
-      return QEMUCLI(executable: qemu)
-    }
-    let utmctl = "/Applications/UTM.app/Contents/MacOS/utmctl"
-    if FileManager.default.isExecutableFile(atPath: utmctl) {
-      return UTMCLI(executable: utmctl)
-    }
-    let prlctlCandidates = ["/usr/local/bin/prlctl", "/opt/homebrew/bin/prlctl"]
-    if let path = prlctlCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
-      return ParallelsCLI(executable: path)
-    }
-    return nil
-  }
+  /// Alias retained for call sites that historically distinguished a "free-first"
+  /// pick. With Fusion the sole backend, this is the same as `detectInstalledCLI`.
+  public static func detectFreeFirstCLI() -> WindowsVMCLI? { detectInstalledCLI() }
 
   /// `true` iff the base image is built AND idle — the only state from which a
-  /// per-job clone is reliable. UTM/Parallels: VM named `name` exists + powered
-  /// off. QEMU: the base files (qcow2 + EFI vars + tpm-state) exist + no live
-  /// qemu against them. Used to gate `windowsImageReady` rather than trusting
-  /// the prep script's exit code. A probe error (e.g. utmctl outside an Aqua
-  /// session, or the helper failing) returns `false`, never throws.
+  /// per-job clone is reliable. For Fusion: the `mactions-fusion-vm base-status`
+  /// verb confirms the base `.vmx` exists, carries the linked-clone snapshot, and
+  /// isn't powered on (prints "stopped"). Used to gate `windowsImageReady` rather
+  /// than trusting the prep script's exit code. A probe error returns `false`,
+  /// never throws.
   public static func baseImagePoweredOff(name: String, cli: WindowsVMCLI) -> Bool {
     guard let r = try? Shell.run(cli.executable, cli.baseStatusArgs(base: name)), r.ok else {
       return false

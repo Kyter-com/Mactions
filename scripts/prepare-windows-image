@@ -17,12 +17,10 @@
 # After this finishes you'll have a powered-off VM named (by default)
 # "win11-runner-base". Point Mactions' WindowsVMProviderFactory at that name.
 #
-# Honest scope: a hand-rolled hypervisor cannot be driven 100% from the CLI for
-# the FIRST template (Parallels needs `prlctl create`/install media attach; UTM
-# has NO `create` verb at all — see the gotcha below). So this script automates
-# what it can and prints exact next steps for the manual bits, per the detected
-# tool. The per-job clone/boot/destroy loop afterward IS fully automated by the
-# provider.
+# Scope: on VMware Fusion the whole base build is automated end to end (this
+# downloads/remasters the ISO, then fusion-windows-base authors the .vmx, boots
+# headless, lets autounattend + bootstrap run, and snapshots base-provisioned).
+# The per-job clone/boot/destroy loop afterward is fully automated by the provider.
 #
 # Usage:
 #   scripts/prepare-windows-image [--iso /path/to/Win11_ARM64.iso] [options]
@@ -32,8 +30,8 @@
 #                     the latest Win11 ARM64 retail build is auto-downloaded via
 #                     UUP dump and converted to an ISO.
 #   --name NAME       Base VM name to create (default: win11-runner-base).
-#   --tool TOOL       fusion | qemu | parallels | utm   (default: auto-detect;
-#                     fusion is the proven Win11-ARM backend).
+#   --tool TOOL       fusion   (default: auto-detect; VMware Fusion is the only
+#                     backend — the proven Win11-ARM path).
 #   --disk GB         Guest disk size in GB (default: 64).
 #   --ram MB          Guest RAM in MB (default: 8192).
 #   --cpus N          Guest vCPU count (default: 4).
@@ -75,39 +73,23 @@ done
 die() { echo "error: $*" >&2; exit 1; }
 
 # --- Detect the hypervisor CLI ----------------------------------------------
-# Free-first AND proven-first: VMware Fusion (free since Nov 2024) is the PROVEN
-# Win11-ARM backend and is preferred. QEMU + swtpm + EDK2 is next (fully
-# headless, but stock QEMU can't boot Win11-ARM on this stack — see AGENTS.md).
-# UTM is the free fallback that needs a GUI session. Parallels is honored if
-# already installed (paid; never recommended for install).
+# VMware Fusion (free since Nov 2024) is the sole backend — the PROVEN Win11-ARM
+# path on Apple Silicon. It is NOT brew-installable (Broadcom-portal download),
+# so we only detect its presence.
 detect_tool() {
   local VMRUN="/Applications/VMware Fusion.app/Contents/Library/vmrun"
-  local QEMU_FW="/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
   if [[ -x "$VMRUN" ]]; then echo fusion; return; fi
-  if command -v qemu-system-aarch64 >/dev/null 2>&1 \
-     && command -v swtpm >/dev/null 2>&1 \
-     && [[ -f "$QEMU_FW" ]]; then echo qemu; return; fi
-  if command -v prlctl >/dev/null 2>&1; then echo parallels; return; fi
-  if [[ -x /Applications/UTM.app/Contents/MacOS/utmctl ]]; then echo utm; return; fi
   echo none
 }
 [[ -z "$TOOL" ]] && TOOL="$(detect_tool)"
 
 if [[ "$TOOL" == "none" ]]; then
   cat <<'EOF' >&2
-No Windows-capable hypervisor backend found.
+VMware Fusion not found — it's the backend Mactions uses for Win11-ARM.
 
-RECOMMENDED — VMware Fusion (free, and the PROVEN Win11-ARM backend; see AGENTS.md):
-  Download + install VMware Fusion from the Broadcom portal (it is NOT
-  brew-installable). Then re-run this script — it auto-detects Fusion.
-
-Other backends (kept for parity; stock QEMU does NOT boot Win11-ARM here):
-  brew install qemu swtpm                          # QEMU + swtpm (headless)
-  brew install --cask utm                          # UTM (needs a GUI login session)
-  brew install --cask parallels                    # Parallels Desktop (paid)
-  brew install --cask parallels-virtualization-sdk # prlctl tooling
-
-Then re-run this script.
+Install VMware Fusion (free, and the PROVEN Win11-ARM backend; see AGENTS.md):
+  Download + install VMware Fusion from the Broadcom portal. It is NOT
+  brew-installable. Then re-run this script — it auto-detects Fusion.
 EOF
   exit 1
 fi
@@ -278,10 +260,7 @@ fi
 # predictable) and runs the first match — so provisioning finds it regardless of
 # whether the media mounts as D:, E:, …
 #
-# We build BOTH:
-#   - an ISO (UTM/Parallels backends attach it as a second CD)
-#   - a FAT-formatted USB flash drive image (QEMU backend; two CDs on one
-#     virtio-scsi controller deadlocks cdboot.efi — see qemu-windows-base.)
+# An ISO9660 disc the Fusion base build attaches as a SATA cdrom (sata0:1).
 build_unattend_iso() {
   local staging out
   staging="$(mktemp -d)"
@@ -295,38 +274,6 @@ build_unattend_iso() {
   hdiutil makehybrid -ov -iso -joliet -default-volume-name UNATTEND \
     -o "$out" "$staging" >/dev/null
   rm -rf "$staging"
-  echo "$out"
-}
-
-build_unattend_fat() {
-  local out staging dmg mnt
-  out="${MACTIONS_ROOT}/unattend.img"
-  mkdir -p "$MACTIONS_ROOT"
-  rm -f "$out"
-  # hdiutil create APPENDS .dmg to the output base and (with -fs MS-DOS -layout
-  # NONE) writes a RAW FAT12 superfloppy — verified with `file`: a DOS/MBR FAT
-  # boot sector, which QEMU reads directly as `-drive format=raw`. So build into a
-  # temp dir at a known basename and rename "<base>.dmg" -> our ".img". 4 MB fits
-  # the two small files; volume MACTIONS is also what the in-guest run-job.ps1
-  # looks for as the per-clone JIT volume label.
-  #
-  # Do NOT use `mktemp -t …dmg` + `${x%.dmg}` here: macOS BSD `mktemp` keeps the
-  # literal XXXXXX and appends its random suffix AFTER ".dmg", so the `%.dmg`
-  # strip no-ops and `hdiutil` writes a filename the `mv` can't find — which
-  # aborted the whole QEMU base build before the install ever started.
-  staging="$(mktemp -d)"
-  dmg="$staging/unattend"            # hdiutil writes "$staging/unattend.dmg"
-  hdiutil create -size 4m -fs MS-DOS -volname MACTIONS -layout NONE "$dmg" >/dev/null
-  mv "$dmg.dmg" "$out"
-  rm -rf "$staging"
-  mnt="$(mktemp -d)"
-  hdiutil attach -nobrowse -mountpoint "$mnt" "$out" >/dev/null
-  mkdir -p "$mnt/setup"
-  cp "$HERE/autounattend.xml" "$mnt/autounattend.xml"
-  cp "$HERE/bootstrap.ps1"    "$mnt/setup/bootstrap.ps1"
-  sync
-  hdiutil detach "$mnt" >/dev/null 2>&1
-  rmdir "$mnt" 2>/dev/null || true
   echo "$out"
 }
 
@@ -386,9 +333,6 @@ MACTIONS_ROOT="${HOME}/.mactions"
 echo "==> Building unattended-install ISO (autounattend.xml + bootstrap.ps1)"
 UNATTEND_ISO="$(build_unattend_iso)"
 echo "    $UNATTEND_ISO"
-echo "==> Building unattend FAT image (USB flash drive for the QEMU backend)"
-UNATTEND_FAT="$(build_unattend_fat)"
-echo "    $UNATTEND_FAT"
 
 # Record the build id this base image is built from so the app's auto-update
 # check (WindowsImage.recordedBaseImageBuild) can compare it to the latest
@@ -434,95 +378,6 @@ case "$TOOL" in
     echo "==> Fusion base build done. Base lives at ~/.mactions/fusion/$NAME.vmx"
     echo "    (snapshot 'base-provisioned'). Per job, mactions-fusion-vm linked-clones"
     echo "    it into ~/.mactions/fusion/<id>/ and attaches a config.iso CD."
-    ;;
-
-  qemu)
-    # QEMU + swtpm + edk2: fully headless, no manual GUI step. The unattend FAT
-    # image is already at the canonical path (build_unattend_fat writes there).
-    # We just stash the Win11 ISO at the canonical path the helper looks for.
-    BASE_DIR="${MACTIONS_ROOT}/windows-base"
-    mkdir -p "$BASE_DIR"
-    echo "==> Stashing Win11 ISO at the canonical path for the QEMU base-build helper"
-    cp -f "$ISO" "$MACTIONS_ROOT/win11-base.iso"
-    echo "==> Running QEMU headless base-image build (autounattend → bootstrap → auto-shutdown)"
-    DISPLAY_MODE="${DISPLAY_MODE:-none}" "$HERE/qemu-windows-base"
-    echo
-    echo "==> QEMU base build done. Base lives at $BASE_DIR/ (base.qcow2 + efi_vars.fd"
-    echo "    + tpm-state/). Per job the runtime helper (mactions-qemu-vm) clones it"
-    echo "    into ~/.mactions/windows-clones/<id>/ and attaches a config.iso CD."
-    ;;
-
-  parallels)
-    # Parallels CAN create + drive a VM headlessly from the CLI.
-    echo "==> Creating Parallels Win11-ARM VM '$NAME'"
-    prlctl create "$NAME" --distribution win-11 --no-hdd
-    prlctl set "$NAME" --memsize "$RAM_MB" --cpus "$CPUS"
-    prlctl set "$NAME" --device-add hdd --size $((DISK_GB * 1024))
-    # Attach the Windows ISO and the unattend ISO as two CD drives.
-    prlctl set "$NAME" --device-add cdrom --image "$ISO" --connect
-    prlctl set "$NAME" --device-add cdrom --image "$UNATTEND_ISO" --connect
-    # Win11 ARM needs TPM + EFI secure boot; Parallels enables these for win-11.
-    prlctl set "$NAME" --efi-boot on || true
-    echo
-    echo "==> Booting for the unattended install (this takes a while)."
-    echo "    Watch progress in the Parallels window; autounattend.xml drives it"
-    echo "    and bootstrap.ps1 installs the win-arm64 runner agent + the per-clone"
-    echo "    run-once Scheduled Task (outbound registration — no SSH)."
-    prlctl start "$NAME"
-    cat <<EOF
-
-NEXT (one time):
-  1. Let the install + first-logon bootstrap finish (the guest prints
-     "Bootstrap complete" and asks you to shut down).
-  2. Detach the install media, but KEEP cdrom0 as the empty per-clone config
-     slot (the provider attaches the per-job JIT ISO there with --device-set):
-       prlctl set "$NAME" --device-del cdrom1        # unattend ISO
-       prlctl set "$NAME" --device-set cdrom0 --disconnect --image ""  # free the Win ISO, keep the slot
-  3. Shut the VM down (pristine base):
-       prlctl stop "$NAME"
-  4. (Headless smoke — no SSH) The provider clones, attaches a config ISO to
-     cdrom0, boots; the guest runs ONE job then powers itself off. Confirm a
-     clone boots + self-powers-off; Mactions detects completion via power state.
-  5. Point Mactions at base image name "$NAME" (WindowsVMProviderFactory).
-EOF
-    ;;
-
-  utm)
-    # utmctl has NO 'create'/attach verb (ScriptingBridge exposes only clone/
-    # start/stop/delete/status/ip-address). The template MUST be built in the GUI,
-    # and the per-clone JIT is delivered by OVERWRITING a FIXED in-bundle data
-    # disk in the clone bundle (UNVERIFIED — see the live-verification checklist
-    # in AGENTS.md / issue #5 before trusting this backend; Parallels is proven).
-    cat <<EOF
-==> UTM has no CLI 'create'/attach verb — build the template ONCE in the UTM app:
-
-  1. Open UTM -> Create a New Virtual Machine -> Virtualize -> Windows.
-  2. Disable "Import VHDX Image"; instead attach the Windows ISO:
-       Boot ISO Image:  $ISO
-  3. Set: ${RAM_MB} MB RAM, ${CPUS} CPUs, ${DISK_GB} GB disk.
-     Enable TPM 2.0 + UEFI (required, or Win11 Setup fails its hardware check).
-  4. Add a SECOND CD pointing at the unattend ISO (removed after install):
-       $UNATTEND_ISO
-  5. Add a small FIXED data disk (Add Drive -> New, NOT "New External") — this
-     is the per-clone CONFIG slot the provider overwrites with the JIT each job.
-     Confirm config.plist gives it an ImageName under Data/<UUID> (a CD records an
-     external bookmark with no in-bundle file, which the overwrite needs). Note
-     that ImageName for UTMCLI(inBundleImageName:).
-  6. Name the VM exactly:  $NAME
-  7. Start it; autounattend.xml drives the install and bootstrap.ps1 installs the
-     win-arm64 runner agent + the run-once Scheduled Task (outbound, no SSH).
-     When it prints "Bootstrap complete":
-       - remove the TWO install ISOs (keep the fixed config disk),
-       - (optional) remove the display device for a truly headless clone,
-       - shut the VM down. That powered-off VM is your pristine base.
-  8. LIVE-VERIFY (AGENTS.md): clone it, overwrite <clone>.utm/Data/<ImageName>
-     with a config ISO while powered off, start --hide, and confirm the guest
-     mounts the NEW contents + the job runs + the VM self-powers-off. If UTM
-     serves a cached image instead, fall back to Parallels.
-  9. Point Mactions at base image name "$NAME" (WindowsVMProviderFactory with UTMCLI()).
-
-The unattend ISO is ready at: $UNATTEND_ISO
-EOF
     ;;
 esac
 

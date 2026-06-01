@@ -12,8 +12,8 @@
     3. Disable UAC for this disposable guest so the task gets a full admin token.
 
   Per job, the host clones this base, injects a tiny config ISO carrying the JIT
-  registration (Parallels attaches it; UTM overwrites a fixed in-bundle drive),
-  and boots the clone headless. run-job.ps1 then:
+  registration (VMware Fusion: the clone's sata0:0 CD is wired to it at clone
+  time), and boots the clone headless. run-job.ps1 then:
     - finds the JIT on the config disc (by volume label / drive scan),
     - runs `run.cmd --jitconfig <JIT>` for exactly ONE job (registers OUTBOUND to
       GitHub, auto-deregisters when done),
@@ -280,9 +280,8 @@ if ($jit) {
   # Self power-off - the host detects completion purely via VM power state.
   shutdown /s /t 0
 } else {
-  # No JIT after the full 120s wait. The config disc is attached BEFORE the VM
-  # starts on every backend (QEMU: at qemu launch via -cdrom; Parallels:
-  # attach-then-boot; UTM: in-bundle overwrite while powered off), so a null
+  # No JIT after the full 120s wait. The config disc is wired to the clone's
+  # sata0:0 CD BEFORE the VM starts (mactions-fusion-vm's clone verb), so a null
   # result here means a genuinely broken clone, NOT a transient attach race -
   # and leaving the VM up does NOT self-heal (this script never re-scans, and the
   # task is -AtLogOn only, so it won't re-fire within the same logged-on session).
@@ -319,8 +318,8 @@ Write-Host ''
 Write-Host '== Bootstrap complete. =='
 Write-Host 'Per job, the host injects the JIT via a config disc; the runner registers'
 Write-Host 'OUTBOUND, runs one job, and the VM powers itself off.'
-# Auto-power-off so headless build scripts (QEMU) detect completion via guest
-# shutdown without a human in the loop. 30s delay lets the FirstLogonCommands
-# Windows wraps around us mark Setup complete + flush post-FLC work before the
-# VM goes down. Harmless on UTM/Parallels - the user previously did this by hand.
+# Auto-power-off so fusion-windows-base detects completion via guest shutdown
+# (it polls `vmrun list`) without a human in the loop. The 30s delay lets the
+# FirstLogonCommands wrapper mark Setup complete + flush post-FLC work before the
+# VM goes down.
 shutdown /s /t 30 /c "Mactions base image bootstrap complete"

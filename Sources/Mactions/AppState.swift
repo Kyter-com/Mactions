@@ -227,12 +227,11 @@ final class AppState: ObservableObject {
         let factory = LocalProcessProviderFactory(
           templateDirectory: template, runsRoot: HostCleanup.runsRoot())
         // Windows fleet (opt-in): only when the user enabled it AND a base image
-        // exists AND a hypervisor CLI is installed. Never spun up automatically.
-        // Default backend is FREE-FIRST (UTM if present, else an existing
-        // Parallels) to match the free-first prerequisite policy.
+        // exists AND VMware Fusion is installed. Never spun up automatically.
+        // Fusion is the sole backend (the proven Win11-ARM path).
         let windowsFactory: WindowsVMProviderFactory? =
           (windowsEnabled && windowsImageReady)
-          ? WindowsVMProviderFactory.detectFreeFirstCLI().map {
+          ? WindowsVMProviderFactory.detectInstalledCLI().map {
             WindowsVMProviderFactory(baseImage: windowsBaseImage, cli: $0)
           }
           : nil
@@ -305,10 +304,9 @@ final class AppState: ObservableObject {
 
   // MARK: Windows runner (opt-in)
 
-  /// True only if a Windows-capable backend is installed: VMware Fusion (the
-  /// PROVEN Win11-ARM backend — `mactions-fusion-vm` helper + `vmrun`), the QEMU
-  /// stack (`mactions-qemu-vm` + `qemu-system-aarch64`), Parallels (`prlctl`), or
-  /// UTM (`utmctl`). Windows runners aren't offerable without one.
+  /// True only if VMware Fusion is installed (the sole Windows backend — the
+  /// PROVEN Win11-ARM path; `mactions-fusion-vm` helper + `vmrun`). Windows
+  /// runners aren't offerable without it.
   var windowsBackendAvailable: Bool { WindowsVMProviderFactory.detectInstalledCLI() != nil }
 
   /// Run the prerequisite scan and publish it for the checklist. Cheap
@@ -317,12 +315,12 @@ final class AppState: ObservableObject {
     windowsPreflight = WindowsPreflight.detect()
   }
 
-  /// Install ONLY the missing FREE prerequisites (the QEMU stack — `qemu` +
-  /// `swtpm`, fully headless — plus the missing converter formulae) via Homebrew.
-  /// NEVER installs Parallels (paid) and NEVER installs Homebrew itself — if
-  /// `brew` is absent we point at brew.sh. Button-triggered only; the
-  /// long-blocking `brew install` runs off the main actor so the popover stays
-  /// responsive.
+  /// Install ONLY the missing FREE prerequisites (the UUP-dump converter tools +
+  /// xorriso for the no-prompt boot ISO) via Homebrew. NEVER installs a
+  /// hypervisor — VMware Fusion is a manual Broadcom-portal download — and NEVER
+  /// installs Homebrew itself (if `brew` is absent we point at brew.sh).
+  /// Button-triggered only; the long-blocking `brew install` runs off the main
+  /// actor so the popover stays responsive.
   func installWindowsFreePrerequisites() {
     guard state == .offline else { statusMessage = "Go offline first."; return }
     guard !windowsPreflightBusy else { return }
@@ -339,7 +337,7 @@ final class AppState: ObservableObject {
       break
     }
     windowsPreflightBusy = true
-    statusMessage = "Installing free Windows prerequisites (QEMU + swtpm + converter tools via Homebrew)…"
+    statusMessage = "Installing free Windows prerequisites (ISO converter tools + xorriso via Homebrew)…"
     Task {
       let result = await Self.runFreeInstall(report)
       windowsPreflightBusy = false
@@ -387,12 +385,11 @@ final class AppState: ObservableObject {
     let image = windowsBaseImage
     // FAST PATH: if the base VM exists AND is powered off, the prep script has
     // nothing useful to do — flip windowsImageReady on directly. Without this,
-    // re-pressing the button after the user finishes the manual UTM GUI install
-    // (UTM has no `create` verb, so the first template MUST be built in the GUI)
-    // re-triggers the multi-GB UUP download + ~30-40 min convert just to confirm
-    // a powered-off VM exists. The same `baseImagePoweredOff` probe is reused
-    // post-prep below, so the freshness criterion is identical.
-    if let cli = WindowsVMProviderFactory.detectFreeFirstCLI(),
+    // re-pressing the button re-triggers the multi-GB UUP download + ~30-40 min
+    // convert just to confirm a powered-off VM exists. The same
+    // `baseImagePoweredOff` probe is reused post-prep below, so the freshness
+    // criterion is identical.
+    if let cli = WindowsVMProviderFactory.detectInstalledCLI(),
       WindowsVMProviderFactory.baseImagePoweredOff(name: image, cli: cli)
     {
       windowsImageReady = true
@@ -400,10 +397,11 @@ final class AppState: ObservableObject {
       statusMessage = "Windows base image '\(image)' is ready."
       return
     }
-    // Preflight FIRST: if the free prerequisites (hypervisor + converter tools)
-    // are missing, auto-install the FREE ones (UTM + converter formulae) via
-    // Homebrew before the ISO download / base-image build. NEVER installs
-    // Parallels (paid); if brew is absent we stop with the brew.sh hint.
+    // Preflight FIRST: auto-install the FREE brew-able prerequisites (the
+    // UUP-dump converter tools + xorriso) before the ISO download / base-image
+    // build. VMware Fusion itself is a MANUAL Broadcom-portal install (the guard
+    // below stops with a hint if it's absent); if brew is absent we stop with
+    // the brew.sh hint.
     let report = WindowsPreflight.detect()
     windowsPreflight = report
     windowsSetupBusy = true
@@ -411,7 +409,7 @@ final class AppState: ObservableObject {
     Task {
       // 1) Install missing FREE deps (off the main actor — it may shell out).
       if case .install = WindowsPreflight.installPlan(for: report) {
-        statusMessage = "Installing free Windows prerequisites (QEMU + swtpm + converter tools via Homebrew)…"
+        statusMessage = "Installing free Windows prerequisites (ISO converter tools + xorriso via Homebrew)…"
         let install = await Self.runFreeInstall(report)
         windowsPreflight = WindowsPreflight.detect()
         switch install {
@@ -433,10 +431,10 @@ final class AppState: ObservableObject {
         return
       }
 
-      // 2) Confirm a hypervisor backend is now present before the long build.
+      // 2) Confirm VMware Fusion is present before the long build.
       guard WindowsVMProviderFactory.detectInstalledCLI() != nil else {
         statusMessage =
-          "No Windows hypervisor available. Install VMware Fusion (free) from the Broadcom portal — the proven Win11-ARM backend — then try again. (Parallels/UTM are also used if already present.)"
+          "VMware Fusion isn't installed. Get it free from the Broadcom portal (it's the proven Win11-ARM backend, and not brew-installable), then try again."
         windowsSetupBusy = false
         return
       }
@@ -448,11 +446,11 @@ final class AppState: ObservableObject {
       let result = await Self.runPrepScript(script, name: image)
       windowsSetupBusy = false
       if let result, result.ok {
-        // Exit 0 means the prep RAN, not that a bootable base VM exists: the UTM
-        // path only prints manual steps, and even on Parallels the unattended OS
-        // install happens on first boot. Only flip ready when a powered-off base
-        // VM is actually verifiable, so goOnline never clones a missing/running VM.
-        let cli = WindowsVMProviderFactory.detectFreeFirstCLI()
+        // Exit 0 means the prep RAN, not that a bootable base VM exists — the
+        // unattended OS install + bootstrap happen on the first headless boot.
+        // Only flip ready when a powered-off base VM is actually verifiable, so
+        // goOnline never clones a missing/running VM.
+        let cli = WindowsVMProviderFactory.detectInstalledCLI()
         if let cli, WindowsVMProviderFactory.baseImagePoweredOff(name: image, cli: cli) {
           windowsImageReady = true
           saveConfig()

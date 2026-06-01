@@ -302,12 +302,12 @@ struct MenuContentView: View {
   }
 }
 
-/// The free-first prerequisite checklist + auto-install button. Split into its
-/// own subview so the SwiftUI type-checker stays fast and `windowsSection`
-/// doesn't balloon. Shows ✓/✗ for Homebrew, a Windows hypervisor, and the
-/// UUP-dump converter tools, plus a one-click installer for the MISSING FREE
-/// deps (the QEMU stack — qemu + swtpm — plus converter formulae) — it never
-/// installs Parallels (paid) and never installs Homebrew (points at brew.sh).
+/// The prerequisite checklist + auto-install button. Split into its own subview
+/// so the SwiftUI type-checker stays fast and `windowsSection` doesn't balloon.
+/// Shows ✓/✗ for Homebrew, VMware Fusion, and the UUP-dump converter tools, plus
+/// a one-click installer for the MISSING FREE brew deps (converter tools +
+/// xorriso). It never installs a hypervisor (Fusion is a manual Broadcom-portal
+/// download) and never installs Homebrew (points at brew.sh).
 private struct WindowsPreflightChecklist: View {
   @ObservedObject var app: AppState
 
@@ -335,7 +335,7 @@ private struct WindowsPreflightChecklist: View {
         .disabled(app.state != .offline || app.windowsPreflightBusy)
         Text(
           (report.homebrewInstalled)
-            ? "Installs only the missing FREE tools (QEMU + swtpm + converter tools) via Homebrew. Never installs paid Parallels."
+            ? "Installs only the missing FREE tools (ISO converter tools + xorriso) via Homebrew. VMware Fusion is a separate, free manual download (Broadcom portal)."
             : "Install Homebrew first: https://brew.sh — then this installs the free tools."
         )
         .font(.caption2).foregroundStyle(.secondary)
