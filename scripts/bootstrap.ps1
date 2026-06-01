@@ -32,6 +32,14 @@ $ProgressPreference    = 'SilentlyContinue'   # PS 5.1 IWR progress bar throttle
 
 $RunnerRoot = 'C:\actions-runner'
 
+# Durable build transcript: survives in the base disk, and fusion-windows-base
+# copies it out to ~/.mactions/logs if the build times out. Best-effort - never
+# fail the build over a logging hiccup.
+try {
+  New-Item -ItemType Directory -Force -Path 'C:\setup\logs' | Out-Null
+  Start-Transcript -Path 'C:\setup\logs\bootstrap.log' -Force | Out-Null
+} catch { }
+
 Write-Host '== Mactions Windows base image bootstrap (outbound/headless) =='
 
 # --- 0a. Networking: on the VMware Fusion base build, the guest NIC is vmxnet3,
@@ -318,6 +326,14 @@ Write-Host ''
 Write-Host '== Bootstrap complete. =='
 Write-Host 'Per job, the host injects the JIT via a config disc; the runner registers'
 Write-Host 'OUTBOUND, runs one job, and the VM powers itself off.'
+
+# Provisioning sentinel - written LAST, right before the orderly power-off.
+# fusion-windows-base polls for this via VMware Tools guest-ops and ONLY
+# snapshots the base if it appears, so a Setup/bootstrap failure that powers off
+# can't be mistaken for a finished base. (run.cmd, run-job.ps1, the
+# MactionsRunOnce task, and Tools are all in place by the time we reach here.)
+try { Stop-Transcript | Out-Null } catch { }
+New-Item -ItemType File -Force -Path (Join-Path $RunnerRoot '.mactions-provisioned') | Out-Null
 # Auto-power-off so fusion-windows-base detects completion via guest shutdown
 # (it polls `vmrun list`) without a human in the loop. The 30s delay lets the
 # FirstLogonCommands wrapper mark Setup complete + flush post-FLC work before the

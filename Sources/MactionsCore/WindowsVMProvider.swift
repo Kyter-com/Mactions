@@ -162,7 +162,7 @@ public struct VMwareCLI: WindowsVMCLI {
 ///   6. **Destroy** the clone on every path, then fire `onExit`.
 ///
 /// PROVEN end to end on VMware Fusion (see AGENTS.md → Windows support).
-public final class WindowsVMProvider: RunnerProvider {
+public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
   public let id: String
   private let baseImage: String
   private let cli: WindowsVMCLI
@@ -220,7 +220,7 @@ public final class WindowsVMProvider: RunnerProvider {
     return running
   }
 
-  public func start(jitConfig: String, onExit: @escaping (Int32) -> Void) throws {
+  public func start(jitConfig: String, onExit: @escaping @Sendable (Int32) -> Void) throws {
     // 1. Clone (throwaway), 2. build the per-clone config ISO, 3. inject it into
     // the still-powered-off clone, 4. boot. Steps 1-4 happen synchronously so a
     // failure surfaces from start(); the completion poll runs on a thread.
@@ -405,17 +405,30 @@ public struct WindowsVMProviderFactory: RunnerProviderFactory {
   /// repo root (useful when the app is launched from a path that isn't the repo
   /// cwd). nil if the helper isn't shipped alongside the binary (Fusion is then
   /// not offered).
-  public static var fusionHelperPath: String? = {
+  public static let fusionHelperPath: String? = {
     let fm = FileManager.default
     let rel = "scripts/mactions-fusion-vm"
+    // 1. ./scripts/<name> relative to the launch cwd (`swift run` from the repo).
     let cwd = fm.currentDirectoryPath + "/" + rel
     if fm.isExecutableFile(atPath: cwd) { return cwd }
+    // 2. Walk up from the binary (.build/<…>/Mactions → repo root with scripts/).
     var dir = URL(fileURLWithPath: CommandLine.arguments.first ?? "/").deletingLastPathComponent()
-    for _ in 0..<6 {
+    for _ in 0..<8 {
       let candidate = dir.appendingPathComponent(rel).path
       if fm.isExecutableFile(atPath: candidate) { return candidate }
       if dir.path == "/" { break }
       dir = dir.deletingLastPathComponent()
+    }
+    // 3. Walk up from THIS source file's compile-time location (Sources/
+    //    MactionsCore/…) to the repo root — robust for dev runs from ANY cwd,
+    //    where (1) and (2) can both miss. (A distributed .app would instead ship
+    //    the scripts in its Resources; not built yet — see Roadmap.)
+    var src = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+    for _ in 0..<8 {
+      let candidate = src.appendingPathComponent(rel).path
+      if fm.isExecutableFile(atPath: candidate) { return candidate }
+      if src.path == "/" { break }
+      src = src.deletingLastPathComponent()
     }
     return nil
   }()

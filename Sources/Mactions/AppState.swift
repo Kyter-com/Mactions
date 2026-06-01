@@ -75,6 +75,12 @@ final class AppState: ObservableObject {
     windowsEnabled = defaults.bool(forKey: "windowsEnabled")
     windowsBaseImage = defaults.string(forKey: "windowsBaseImage") ?? windowsBaseImage
     isSignedIn = TokenStore.load() != nil
+    // Reap anything a previous crash / force-quit left behind (orphaned runner
+    // processes, leaked Windows VM clones) BEFORE the user does anything — not
+    // just on go-online. Off the main actor so app launch isn't blocked on the
+    // shell-outs. This is the backstop for clones the 6s quit budget couldn't
+    // tear down in time.
+    Task.detached { HostCleanup.sweepOrphans() }
   }
 
   var menuBarSymbol: String {
@@ -235,6 +241,16 @@ final class AppState: ObservableObject {
             WindowsVMProviderFactory(baseImage: windowsBaseImage, cli: $0)
           }
           : nil
+        // Cap concurrent Windows VMs to what this Mac's RAM can run without
+        // thrashing — each clone is a full 8 GB VM, so N repos each booting one
+        // would otherwise swamp the host. 0 => not enough RAM to run any safely
+        // (we then skip Windows entirely and say so, rather than lag the Mac).
+        let maxWindowsVMs =
+          windowsFactory == nil
+          ? 0
+          : WindowsVMBudget.maxConcurrentVMs(
+            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory)
+        var windowsVMsStamped = 0
         for repo in repos {
           guard fleetEpoch == myEpoch else { break }
           let client = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
@@ -246,7 +262,7 @@ final class AppState: ObservableObject {
           created.append(orch)
           await orch.start()
 
-          if let windowsFactory {
+          if let windowsFactory, windowsVMsStamped < maxWindowsVMs {
             let winClient = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
             let winFleet = FleetConfig(
               owner: repo.owner, repo: repo.name, labels: windowsLabels, desiredCount: 1)
@@ -255,6 +271,7 @@ final class AppState: ObservableObject {
             winOrch.onChange = { [weak self] in self?.sync() }
             orchestrators["\(repo.fullName) (Windows)"] = winOrch
             created.append(winOrch)
+            windowsVMsStamped += 1
             await winOrch.start()
           }
         }
@@ -269,6 +286,17 @@ final class AppState: ObservableObject {
           live == 0
           ? "Online, but no runners came up — check repo permissions / labels."
           : "Online: \(live) runner\(live == 1 ? "" : "s") across \(repos.count) repo\(repos.count == 1 ? "" : "s")."
+        // If the RAM budget kept some repos from getting a Windows runner, say so
+        // (silent under-provisioning reads as a bug).
+        if windowsFactory != nil, windowsVMsStamped < repos.count {
+          let why =
+            maxWindowsVMs == 0
+            ? "this Mac's RAM can't safely run an 8 GB Windows VM"
+            : "RAM budget allows \(maxWindowsVMs) at once"
+          statusMessage =
+            (statusMessage ?? "")
+            + " Windows runners limited to \(windowsVMsStamped)/\(repos.count) repos (\(why))."
+        }
       } catch {
         guard fleetEpoch == myEpoch else { return }
         statusMessage = "Failed to start: \(error.localizedDescription)"
@@ -375,7 +403,12 @@ final class AppState: ObservableObject {
   /// and the live VM path is not yet verified end to end. The button only kicks
   /// off the prep; a human still completes the one-time install per the script's
   /// printed next steps.
-  func setUpWindowsRunner() {
+  /// `force: true` (the "Rebuild / update Windows image" button) skips the
+  /// already-built fast-path and rebuilds from scratch — that's how a newer
+  /// Windows build actually gets installed once `checkForWindowsImageUpdate`
+  /// flags one. `force: false` (initial "Set up Windows runner") fast-paths when
+  /// a ready base already exists, so a stray re-click doesn't re-download GBs.
+  func setUpWindowsRunner(force: Bool = false) {
     guard state == .offline else { statusMessage = "Go offline first."; return }
     guard !windowsSetupBusy else { return }
     guard let script = Self.prepareWindowsImageScript() else {
@@ -383,13 +416,12 @@ final class AppState: ObservableObject {
       return
     }
     let image = windowsBaseImage
-    // FAST PATH: if the base VM exists AND is powered off, the prep script has
-    // nothing useful to do — flip windowsImageReady on directly. Without this,
-    // re-pressing the button re-triggers the multi-GB UUP download + ~30-40 min
-    // convert just to confirm a powered-off VM exists. The same
-    // `baseImagePoweredOff` probe is reused post-prep below, so the freshness
-    // criterion is identical.
-    if let cli = WindowsVMProviderFactory.detectInstalledCLI(),
+    // FAST PATH (non-forced only): if the base VM exists AND is powered off, the
+    // prep script has nothing useful to do — flip windowsImageReady on directly,
+    // so a stray re-click doesn't re-trigger the multi-GB UUP download + ~30-40
+    // min convert just to confirm a powered-off VM exists. A FORCED rebuild
+    // (update to a newer Windows) deliberately skips this and rebuilds.
+    if !force, let cli = WindowsVMProviderFactory.detectInstalledCLI(),
       WindowsVMProviderFactory.baseImagePoweredOff(name: image, cli: cli)
     {
       windowsImageReady = true
@@ -444,6 +476,15 @@ final class AppState: ObservableObject {
       // drives the base-VM build. The blocking shell-out runs off the main actor.
       statusMessage = "Setting up the Windows runner (downloading + building the base image — this takes a while)…"
       let result = await Self.runPrepScript(script, name: image)
+      // Persist the FULL build transcript to ~/.mactions/logs so a failure is
+      // diagnosable from disk (survives the ephemeral clone; no Console.app
+      // spelunking). Both success + failure, so a "succeeded but didn't verify"
+      // case is inspectable too.
+      let buildLog = HostCleanup.writeLog(
+        name: "prepare-windows-image", stamp: Self.logStamp(),
+        contents:
+          "exit=\(result.map { String($0.status) } ?? "nil (could not launch)")\n\n"
+          + "=== stdout ===\n\(result?.stdout ?? "")\n\n=== stderr ===\n\(result?.stderr ?? "")\n")
       windowsSetupBusy = false
       if let result, result.ok {
         // Exit 0 means the prep RAN, not that a bootable base VM exists — the
@@ -462,15 +503,10 @@ final class AppState: ObservableObject {
             "Windows prep finished. Complete the one-time install per the printed steps, shut the VM down, then run \"Set up Windows runner\" again to confirm."
         }
       } else {
-        if let result {
-          NSLog(
-            "prepare-windows-image failed (status \(result.status))\nstdout:\n\(result.stdout)\nstderr:\n\(result.stderr)"
-          )
-        }
         // The script tags its own failures via die(): `error: <msg>`. Surface the
         // first such line (a concise human summary); never echo a raw Python
         // traceback or set -e abort into the one-line status — the full transcript
-        // is in Console.app via the NSLog above.
+        // is the durable log written above.
         let stderr = result?.stderr ?? ""
         let errorLine =
           stderr
@@ -479,14 +515,23 @@ final class AppState: ObservableObject {
           .first { $0.hasPrefix("error: ") }
         let detail =
           errorLine.map { String($0.dropFirst("error: ".count)).trimmingCharacters(in: .whitespaces) }
-          ?? "the prep script failed — see Console.app for details"
-        statusMessage = "Windows setup failed: \(detail)"
+          ?? "the prep script failed"
+        statusMessage =
+          "Windows setup failed: \(detail)" + (buildLog.map { " (log: \($0))" } ?? "")
       }
     }
   }
 
   /// Run the (long-blocking) prep script off the main actor so the popover stays
   /// responsive, returning the result back on the caller's actor.
+  /// Filename-safe timestamp for durable log names (no colons).
+  static func logStamp() -> String {
+    let f = DateFormatter()
+    f.dateFormat = "yyyyMMdd-HHmmss"
+    f.locale = Locale(identifier: "en_US_POSIX")
+    return f.string(from: Date())
+  }
+
   private nonisolated static func runPrepScript(_ script: String, name: String) async
     -> Shell.Result?
   {
@@ -523,7 +568,7 @@ final class AppState: ObservableObject {
       let installed = WindowsImage.recordedBaseImageBuild()
       if WindowsImage.updateAvailable(installed: installed, latest: latest.build) {
         statusMessage =
-          "A newer Windows 11 ARM64 build (\(latest.build)) is available — re-run \"Set up Windows runner\" to rebuild the base image."
+          "A newer Windows 11 ARM64 build (\(latest.build)) is available — click \"Rebuild / update Windows image\" to rebuild the base."
       }
     }
   }

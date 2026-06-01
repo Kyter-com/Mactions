@@ -20,7 +20,18 @@ struct MactionsApp: App {
   }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+  /// Guards `NSApp.reply(toApplicationShouldTerminate:)` so it fires exactly once
+  /// — whichever of teardown / the safety cap reaches it first. Main-actor state,
+  /// so no lock + no Sendable gymnastics.
+  private var terminationReplied = false
+  private func replyToTerminate() {
+    guard !terminationReplied else { return }
+    terminationReplied = true
+    NSApp.reply(toApplicationShouldTerminate: true)
+  }
+
   func applicationDidFinishLaunching(_ notification: Notification) {
     // Accessory = menubar-only, no dock icon, no app-switcher entry.
     NSApp.setActivationPolicy(.accessory)
@@ -34,18 +45,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let state = AppState.shared
     if state.state == .offline { return .terminateNow }
 
-    var replied = false
-    let reply = {
-      if !replied {
-        replied = true
-        NSApp.reply(toApplicationShouldTerminate: true)
-      }
-    }
+    // Two independent main-actor tasks race to reply: the teardown, and a 6 s
+    // safety cap so a hung network call can't wedge quit. `replyToTerminate()`
+    // is idempotent, so whichever finishes first wins and the other is a no-op.
     Task { @MainActor in
       await state.goOfflineAndWait()
-      reply()
+      replyToTerminate()
     }
-    DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: reply)
+    Task { @MainActor in
+      try? await Task.sleep(nanoseconds: 6 * 1_000_000_000)
+      replyToTerminate()
+    }
     return .terminateLater
   }
 }

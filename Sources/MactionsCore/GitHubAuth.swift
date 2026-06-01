@@ -133,8 +133,10 @@ public enum GitHubAuth {
 /// AGENTS.md → Roadmap.
 public enum TokenStore {
   private static let lock = NSLock()
-  // nil = not loaded yet; .some(nil) = loaded, no token present.
-  private static var cached: String??
+  // nil = not loaded yet; .some(nil) = loaded, no token present. Every access is
+  // serialized by `lock`, so this is safe despite being mutable global state —
+  // `nonisolated(unsafe)` tells the Swift 6 compiler we synchronize it ourselves.
+  nonisolated(unsafe) private static var cached: String??
 
   private static func tokenURL() -> URL {
     HostCleanup.mactionsRoot().appendingPathComponent("auth.token")

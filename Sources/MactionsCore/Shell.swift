@@ -5,7 +5,7 @@ import Foundation
 /// for long-lived processes (a runner agent) whose exit we observe via a
 /// termination handler.
 public enum Shell {
-  public struct Result {
+  public struct Result: Sendable {
     public let status: Int32
     public let stdout: String
     public let stderr: String

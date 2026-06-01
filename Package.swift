@@ -1,4 +1,4 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
 import PackageDescription
 
 // Mactions — a menubar macOS app that turns your Mac into an on-demand,
@@ -22,5 +22,6 @@ let package = Package(
       name: "MactionsCoreTests",
       dependencies: ["MactionsCore"]
     ),
-  ]
+  ],
+  swiftLanguageModes: [.v6]  // strict concurrency on — adopt Swift 6 fully
 )

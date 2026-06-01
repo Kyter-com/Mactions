@@ -34,6 +34,13 @@ public enum HostCleanup {
     mactionsRoot().appendingPathComponent("runs", isDirectory: true)
   }
 
+  /// Durable diagnostic logs (base-build transcripts, captured guest logs). Kept
+  /// across runs on purpose — this is where a failed build/run is diagnosed — so
+  /// it is NOT swept by `purgeRuns`/`sweepOrphans`; only a full `purgeAll` clears it.
+  public static func logsRoot() -> URL {
+    mactionsRoot().appendingPathComponent("logs", isDirectory: true)
+  }
+
   /// Delete all per-run working copies. Safe to call any time we're offline —
   /// these only exist for the duration of a job.
   public static func purgeRuns() {
@@ -44,7 +51,25 @@ public enum HostCleanup {
   /// the auth token in place — signing out clears that via `TokenStore.clear()`.
   public static func purgeAll() {
     try? FileManager.default.removeItem(at: agentTemplateDirectory())
+    try? FileManager.default.removeItem(at: logsRoot())
     purgeRuns()
+  }
+
+  /// Persist a build/install transcript to `logs/<name>-<stamp>.log` so a failure
+  /// is diagnosable from disk (not just Console.app) and survives the ephemeral
+  /// clone. `stamp` is passed in (callers format it) so this stays pure. Returns
+  /// the written path, or `nil` on failure. Safe to call off the main actor.
+  @discardableResult
+  public static func writeLog(name: String, stamp: String, contents: String) -> String? {
+    let dir = logsRoot()
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let url = dir.appendingPathComponent("\(name)-\(stamp).log")
+    do {
+      try contents.write(to: url, atomically: true, encoding: .utf8)
+      return url.path
+    } catch {
+      return nil
+    }
   }
 
   /// Best-effort: delete leftover ephemeral Tart VMs from a crashed session.

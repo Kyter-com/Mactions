@@ -9,6 +9,7 @@ struct MenuContentView: View {
   @EnvironmentObject private var app: AppState
   @State private var pat = ""
   @State private var repoFilter = ""
+  @State private var confirmRebuild = false
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
@@ -199,9 +200,22 @@ struct MenuContentView: View {
         .toggleStyle(.switch)
         .controlSize(.mini)
         .disabled(app.state != .offline)
-        Button("Rebuild / update Windows image") { app.setUpWindowsRunner() }
+        Button("Rebuild / update Windows image") { confirmRebuild = true }
           .buttonStyle(.bordered).controlSize(.small)
           .disabled(app.state != .offline || app.windowsSetupBusy)
+          .confirmationDialog(
+            "Rebuild the Windows base image?", isPresented: $confirmRebuild,
+            titleVisibility: .visible
+          ) {
+            Button("Rebuild (re-downloads ~8 GB)", role: .destructive) {
+              app.setUpWindowsRunner(force: true)
+            }
+            Button("Cancel", role: .cancel) {}
+          } message: {
+            Text(
+              "Re-downloads the latest Win11 ARM64 ISO (~8 GB) and rebuilds the base VM headless — about 30–40 minutes. This replaces the existing base image."
+            )
+          }
       } else {
         Button {
           app.setUpWindowsRunner()

@@ -179,20 +179,47 @@ echo "==> Watching install (autounattend.xml -> bootstrap.ps1 -> shutdown /s)."
 echo "    Guest-initiated reboots keep the VM 'running'; only bootstrap's final"
 echo "    power-off removes it from \`vmrun list\`. Hard timeout: $((INSTALL_TIMEOUT_SECS / 60)) min."
 
+# Provisioning verification (do NOT snapshot on a bare power-off). bootstrap.ps1
+# creates this sentinel as its LAST step before shutting down, so seeing it means
+# the install + agent + Tools + MactionsRunOnce task genuinely completed — not
+# that Setup merely crashed and powered off. We poll for it via VMware Tools
+# guest-ops (which come up mid-bootstrap once Tools installs); bootstrap's 30s
+# shutdown delay leaves a window to catch it. If the VM powers off WITHOUT the
+# sentinel, we refuse to snapshot a broken base.
+GUEST_USER="runner"
+GUEST_PW="${MACTIONS_GUEST_PW:-P@ssw0rd-throwaway}"   # matches autounattend.xml (throwaway)
+SENTINEL='C:\actions-runner\.mactions-provisioned'
+PROVISIONED=0
+
 START="$(date +%s)"
 LAST=0
 while vmrun_list_contains "$VMX"; do
   NOW="$(date +%s)"; ELAPSED=$((NOW - START))
   if [[ $ELAPSED -ge $INSTALL_TIMEOUT_SECS ]]; then
+    # The VM is still running here, so guest-ops work — pull the build transcript
+    # out for diagnosis BEFORE killing it.
+    mkdir -p "${MACTIONS_ROOT}/logs"
+    "$VMRUN" -T fusion -gu "$GUEST_USER" -gp "$GUEST_PW" copyFileFromGuestToHost "$VMX" \
+      'C:\setup\logs\bootstrap.log' "${MACTIONS_ROOT}/logs/base-build-bootstrap-timeout.log" >/dev/null 2>&1 || true
     "$VMRUN" -T fusion stop "$VMX" hard >/dev/null 2>&1 || true
-    die "install timeout (${INSTALL_TIMEOUT_SECS}s) — autounattend.xml + bootstrap.ps1 didn't reach shutdown. Check the VM (re-run with the install visible: \`vmrun -T fusion start $VMX\`)."
+    die "install timeout (${INSTALL_TIMEOUT_SECS}s) — never reached the provisioning sentinel. Guest log (if captured): ${MACTIONS_ROOT}/logs/base-build-bootstrap-timeout.log; else boot the VM in Fusion or read $FUSION_DIR/vmware.log."
+  fi
+  if [[ $PROVISIONED -eq 0 ]]; then
+    out="$("$VMRUN" -T fusion -gu "$GUEST_USER" -gp "$GUEST_PW" fileExistsInGuest "$VMX" "$SENTINEL" 2>/dev/null || true)"
+    case "$out" in
+      *"file exists"*) PROVISIONED=1; echo "    [${ELAPSED}s] provisioning sentinel present — bootstrap completed" ;;
+    esac
   fi
   if [[ $((NOW - LAST)) -ge 30 ]]; then
-    printf '    [%4ds] still running...\n' "$ELAPSED"; LAST="$NOW"
+    printf '    [%4ds] still running (provisioned=%s)...\n' "$ELAPSED" "$PROVISIONED"; LAST="$NOW"
   fi
   sleep 15
 done
-echo "==> Guest powered off after $(( $(date +%s) - START ))s — install + bootstrap done"
+
+if [[ $PROVISIONED -eq 0 ]]; then
+  die "guest powered off WITHOUT the provisioning sentinel ($SENTINEL) — Setup/bootstrap did NOT complete. Refusing to snapshot a broken base. Boot the VM in Fusion or read $FUSION_DIR/vmware.log to diagnose, then re-run."
+fi
+echo "==> Guest powered off after $(( $(date +%s) - START ))s — provisioning verified, install + bootstrap done"
 
 # --- finalize the pristine base ----------------------------------------------
 # Disconnect all install cdroms so per-job clones never carry a connected ISO

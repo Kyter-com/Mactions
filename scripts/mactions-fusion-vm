@@ -214,8 +214,18 @@ cmd_delete() {
   if [[ -f "$vmx" ]]; then
     "$VMRUN" -T fusion deleteVM "$vmx" >/dev/null 2>&1 || true
   fi
+  # rm -rf is the real reaper (covers a failed/partial deleteVM); then VERIFY the
+  # dir is actually gone — a surviving dir means a leaked clone (e.g. a file held
+  # open by a wedged process), which the ephemerality bar must not silently
+  # tolerate. Retry once, then report loudly so the sweep/operator can act.
   if [[ -d "$dir" ]]; then
-    rm -rf "$dir"
+    rm -rf "$dir" 2>/dev/null || true
+    if [[ -d "$dir" ]]; then
+      sleep 1; rm -rf "$dir" 2>/dev/null || true
+    fi
+    if [[ -d "$dir" ]]; then
+      die "could not fully remove clone dir $dir (something may be holding it open) — leaked clone"
+    fi
     note "deleted $clone"
   fi
 }

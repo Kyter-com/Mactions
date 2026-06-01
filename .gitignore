@@ -1,16 +1,11 @@
-# SwiftPM
-.build/
-.swiftpm/
-Package.resolved
+# Build
+/.build/
+*.xcodeproj
 
-# Xcode (if a project is added later)
-*.xcodeproj/xcuserdata/
-*.xcworkspace/xcuserdata/
-DerivedData/
-
-# Packaged output
-*.app
-*.dmg
-
-# macOS
+# Editor / OS cruft
+.vscode/
+.idea/
 .DS_Store
+*.swp
+
+# Mactions runtime state lives in ~/.mactions, never in the repo
