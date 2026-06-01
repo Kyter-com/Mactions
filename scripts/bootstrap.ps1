@@ -1,5 +1,5 @@
 <#
-  bootstrap.ps1 — runs INSIDE the Windows 11 ARM guest on first logon
+  bootstrap.ps1 - runs INSIDE the Windows 11 ARM guest on first logon
   (invoked once by autounattend.xml's FirstLogonCommands, at BUILD time).
 
   Turns a fresh Win11-ARM install into a Mactions runner base image for the
@@ -20,7 +20,7 @@
     - powers the VM off. The host detects completion purely by polling VM power
       state, then deletes the clone. Nothing inbound, nothing left behind.
 
-  After this script finishes, SHUT THE VM DOWN — the powered-off VM is the
+  After this script finishes, SHUT THE VM DOWN - the powered-off VM is the
   pristine base image. (The first clone boot applies the EnableLUA=0 reboot-gated
   change.) Runs under in-box Windows PowerShell 5.1, so everything here is
   5.1-compatible.
@@ -37,7 +37,7 @@ Write-Host '== Mactions Windows base image bootstrap (outbound/headless) =='
 # --- 0. Dev tooling GitHub Actions workflows commonly need -------------------
 # We install these BEFORE the runner agent so a failure here is loud and
 # obvious (the agent install is the cheap fast step). All are silent installs
-# baked into the BASE image once — per-job clones inherit them via the qcow2
+# baked into the BASE image once - per-job clones inherit them via the qcow2
 # overlay, so workflows pay no install cost.
 #
 # Tools we install:
@@ -75,7 +75,7 @@ function Install-Exe {
   if ($proc.ExitCode -ne 0) { throw "$LocalName installer failed with exit code $($proc.ExitCode)" }
 }
 
-# Git for Windows (ARM64) — resolve the latest release at build time so we get
+# Git for Windows (ARM64) - resolve the latest release at build time so we get
 # whatever's current. Inno Setup installer accepts a silent-install RSP file.
 Write-Host 'Installing Git for Windows (ARM64)...'
 try {
@@ -94,7 +94,7 @@ try {
   Write-Warning "Git install failed (continuing): $_"
 }
 
-# 7-Zip ARM64 — small, fast, useful for many actions. Direct URL is stable.
+# 7-Zip ARM64 - small, fast, useful for many actions. Direct URL is stable.
 Write-Host 'Installing 7-Zip (ARM64)...'
 try {
   Install-Msi -Url 'https://www.7-zip.org/a/7z2408-arm64.msi' -LocalName '7z-arm64.msi'
@@ -115,7 +115,7 @@ $RunnerVersion = $rel.tag_name -replace '^v', ''            # 'v2.334.0' -> '2.3
 $assetName     = "actions-runner-win-arm64-$RunnerVersion.zip"
 $asset         = $rel.assets | Where-Object { $_.name -eq $assetName }
 if (-not $asset) {
-  throw "No '$assetName' asset in actions-runner release $($rel.tag_name) — GitHub may have changed asset naming."
+  throw "No '$assetName' asset in actions-runner release $($rel.tag_name) - GitHub may have changed asset naming."
 }
 
 Write-Host "Installing actions-runner-win-arm64 v$RunnerVersion to $RunnerRoot ..."
@@ -133,7 +133,7 @@ do {
     Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -Headers $ghHeaders
     $len = (Get-Item $zip).Length
     if ($len -lt 20MB) {
-      throw "runner.zip is only $len bytes from $url — not the agent archive (truncated/unexpected body)."
+      throw "runner.zip is only $len bytes from $url - not the agent archive (truncated/unexpected body)."
     }
     break
   } catch {
@@ -150,12 +150,12 @@ try {
   [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $RunnerRoot)
 } catch {
   $len = (Get-Item $zip -ErrorAction SilentlyContinue).Length
-  throw "failed to extract runner.zip ($len bytes) from $url — not a valid zip (bad/partial download): $_"
+  throw "failed to extract runner.zip ($len bytes) from $url - not a valid zip (bad/partial download): $_"
 }
 Remove-Item $zip -Force
 
 if (-not (Test-Path (Join-Path $RunnerRoot 'run.cmd'))) {
-  throw "run.cmd not found in $RunnerRoot — runner extraction failed."
+  throw "run.cmd not found in $RunnerRoot - runner extraction failed."
 }
 
 # --- 2. Per-job runtime: written at build time, runs on EVERY clone boot -----
@@ -178,7 +178,7 @@ Start-Transcript -Path (Join-Path $LogDir "run-job.log") -Append -Force | Out-Nu
 function Find-Jit {
   # Scan removable + CD-ROM volumes (DriveType 2,5) for the known per-clone file,
   # then fall back to every filesystem root and the MACTIONS-labeled volume.
-  # Robust against drive-letter shuffle — mirrors autounattend.xml's bootstrap scan.
+  # Robust against drive-letter shuffle - mirrors autounattend.xml's bootstrap scan.
   $known = "mactions\jitconfig"
   $roots = @()
   $roots += (Get-CimInstance Win32_LogicalDisk -ErrorAction SilentlyContinue |
@@ -204,13 +204,13 @@ if ($jit) {
   # ephemeral run). --jitconfig makes it single-use; no --once needed.
   & "$RunnerRoot\run.cmd" --jitconfig "$jit"
   Stop-Transcript | Out-Null
-  # Self power-off — the host detects completion purely via VM power state.
+  # Self power-off - the host detects completion purely via VM power state.
   shutdown /s /t 0
 } else {
   # No JIT after the full 120s wait. The config disc is attached BEFORE the VM
   # starts on every backend (QEMU: at qemu launch via -cdrom; Parallels:
   # attach-then-boot; UTM: in-bundle overwrite while powered off), so a null
-  # result here means a genuinely broken clone, NOT a transient attach race —
+  # result here means a genuinely broken clone, NOT a transient attach race -
   # and leaving the VM up does NOT self-heal (this script never re-scans, and the
   # task is -AtLogOn only, so it won't re-fire within the same logged-on session).
   # Power off so the host's power-state poll reclaims the slot fast and the
@@ -238,7 +238,7 @@ Register-ScheduledTask -TaskName 'MactionsRunOnce' -Action $action -Trigger $tri
 # --- 3. Disable UAC for the disposable guest --------------------------------
 # `runner` is a local admin; with UAC on, the task could get a filtered token,
 # breaking job steps that need admin. This guest is destroyed after one job.
-# Reboot-gated — applied on the first clone boot for a job.
+# Reboot-gated - applied on the first clone boot for a job.
 Set-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' `
   -Name EnableLUA -Value 0
 
@@ -249,5 +249,5 @@ Write-Host 'OUTBOUND, runs one job, and the VM powers itself off.'
 # Auto-power-off so headless build scripts (QEMU) detect completion via guest
 # shutdown without a human in the loop. 30s delay lets the FirstLogonCommands
 # Windows wraps around us mark Setup complete + flush post-FLC work before the
-# VM goes down. Harmless on UTM/Parallels — the user previously did this by hand.
+# VM goes down. Harmless on UTM/Parallels - the user previously did this by hand.
 shutdown /s /t 30 /c "Mactions base image bootstrap complete"
