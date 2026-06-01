@@ -21,20 +21,26 @@ public enum WindowsPreflight {
   /// A hypervisor capable of booting a Windows 11 ARM guest. Ordered by the
   /// free-first preference the recommender uses.
   public enum Hypervisor: String, Equatable, Sendable {
+    /// VMware Fusion — free (since Nov 2024) AND the PROVEN Win11-ARM backend
+    /// (see AGENTS.md). Wired into a provider via `VMwareCLI` + the
+    /// `mactions-fusion-vm` helper. NOT brew-installable (Broadcom-portal
+    /// download), so we detect-and-prefer it but never auto-install it.
+    case vmwareFusion
     /// UTM — free + open-source, a supported runtime backend when present.
     /// Caveat: `utmctl` uses Apple's ScriptingBridge and needs an active GUI/login
     /// session (fine for this interactive app; fragile for an unattended launchd
-    /// host — see docs), which is why QEMU is the recommended default instead.
+    /// host — see docs).
     case utm
     /// Parallels — paid. Preferred ONLY if already installed; never recommended
     /// for install.
     case parallels
-    /// QEMU — fully free, fully headless (no Aqua login session). The recommended
-    /// default, wired into a provider via `QEMUCLI` + the `mactions-qemu-vm` helper.
+    /// QEMU — free + headless, BUT does NOT boot Win11-ARM on this stack (stock
+    /// Homebrew QEMU's firmware hangs — see AGENTS.md). Wired via `QEMUCLI` +
+    /// the `mactions-qemu-vm` helper; kept for parity but superseded by Fusion.
     case qemu
 
-    /// `true` for the free/OSS backends (UTM, QEMU) — the ones we may recommend
-    /// or auto-install. Parallels (paid) is excluded.
+    /// `true` for the free backends (VMware Fusion, UTM, QEMU) — the ones we may
+    /// recommend or auto-install. Parallels (paid) is excluded.
     public var isFree: Bool { self != .parallels }
   }
 
@@ -114,12 +120,17 @@ public enum WindowsPreflight {
     /// the user can pick, but we never push them to install it.
     public static let recommendedFreeBackendToInstall: Hypervisor = .qemu
 
-    /// The backend the provider should default to, free-first:
-    ///   1. QEMU if its full stack is ready (fully headless, no Aqua session),
-    ///   2. else UTM if installed (free, but needs a GUI login session),
-    ///   3. else Parallels if installed (paid — only if already present),
-    ///   4. else `nil` (none ready → the installer offers to add the QEMU stack).
+    /// The backend the provider should default to, free-first. (Advisory / for
+    /// the checklist UI — the live selection is `WindowsVMProviderFactory.
+    /// detectFreeFirstCLI()`, which uses the same ordering.)
+    ///   1. VMware Fusion if installed (free + the PROVEN Win11-ARM backend),
+    ///   2. else QEMU if its full stack is ready (headless, but doesn't boot
+    ///      Win11-ARM here — kept for parity),
+    ///   3. else UTM if installed (free, but needs a GUI login session),
+    ///   4. else Parallels if installed (paid — only if already present),
+    ///   5. else `nil` (none ready → install Fusion manually, or the QEMU stack).
     public var recommendedBackend: Hypervisor? {
+      if hypervisors[.vmwareFusion]?.installed == true { return .vmwareFusion }
       if qemuStackReady { return .qemu }
       if hypervisors[.utm]?.installed == true { return .utm }
       if hypervisors[.parallels]?.installed == true { return .parallels }
@@ -140,6 +151,9 @@ public enum WindowsPreflight {
   /// inherited PATH, so we probe them directly (mirrors `Shell.which`).
   static let brewCandidatePaths = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
   static let utmctlPath = "/Applications/UTM.app/Contents/MacOS/utmctl"
+  /// VMware Fusion's `vmrun` — inside the .app bundle (not on PATH). Its presence
+  /// is the "Fusion installed" signal; Fusion is a manual Broadcom-portal download.
+  static let vmrunPath = "/Applications/VMware Fusion.app/Contents/Library/vmrun"
   /// edk2 AArch64 UEFI firmware files ship inside Homebrew's `qemu` formula at
   /// `/opt/homebrew/share/qemu/`. The CODE file is read-only (the firmware
   /// image), the VARS file is the per-VM-copied template (boot order, Secure
@@ -172,15 +186,19 @@ public enum WindowsPreflight {
     let homebrew = Tool(name: "brew", path: brewPath)
 
     // Hypervisors, free-first:
-    //   UTM ships utmctl inside the .app bundle (not on PATH);
-    //   Parallels' prlctl + QEMU's qemu-system-aarch64 are PATH/Homebrew bins.
+    //   VMware Fusion ships vmrun + UTM ships utmctl inside their .app bundles
+    //   (not on PATH); Parallels' prlctl + QEMU's qemu-system-aarch64 are
+    //   PATH/Homebrew bins.
+    let fusion = Tool(
+      name: "vmrun",
+      path: isExecutable(vmrunPath) ? vmrunPath : nil)
     let utm = Tool(
       name: "utmctl",
       path: isExecutable(utmctlPath) ? utmctlPath : nil)
     let parallels = Tool(name: "prlctl", path: whichLookup("prlctl"))
     let qemu = Tool(name: "qemu-system-aarch64", path: whichLookup("qemu-system-aarch64"))
     let hypervisors: [Hypervisor: Tool] = [
-      .utm: utm, .parallels: parallels, .qemu: qemu,
+      .vmwareFusion: fusion, .utm: utm, .parallels: parallels, .qemu: qemu,
     ]
 
     // Converter tools for the no-ISO auto-download path. Probe by binary name;
@@ -336,14 +354,14 @@ public enum WindowsPreflight {
 }
 
 extension WindowsPreflight.Hypervisor {
-  /// Iteration order for the installed-list. Note the free-first *recommendation*
-  /// (what we install / `recommendedBackend`) is QEMU; this ordering only governs
-  /// how `installedHypervisors` is listed.
-  static let allOrdered: [WindowsPreflight.Hypervisor] = [.utm, .parallels, .qemu]
+  /// Iteration order for the installed-list. Fusion first (the proven backend),
+  /// then the rest; this ordering governs how `installedHypervisors` is listed.
+  static let allOrdered: [WindowsPreflight.Hypervisor] = [.vmwareFusion, .utm, .parallels, .qemu]
 
   /// Human label for the checklist / status line.
   public var displayName: String {
     switch self {
+    case .vmwareFusion: return "VMware Fusion (free)"
     case .utm: return "UTM (free)"
     case .parallels: return "Parallels (paid)"
     case .qemu: return "QEMU (free)"

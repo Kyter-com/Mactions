@@ -62,10 +62,11 @@ public enum HostCleanup {
   /// Best-effort: delete leftover ephemeral Windows VM clones from a crashed
   /// session. The Windows provider names its throwaway clones `mactions-…`, the
   /// same prefix we scope teardown to, so we never touch a non-Mactions VM.
-  /// Covers all three backends: Parallels (`prlctl`), UTM (`utmctl`), and QEMU
-  /// (the `mactions-qemu-vm` helper's `list`/`delete` verbs + an on-disk fallback
-  /// sweep of `~/.mactions/windows-clones/mactions-*`). No-op for a backend whose
-  /// tooling isn't present.
+  /// Covers all backends: Parallels (`prlctl`), UTM (`utmctl`), QEMU (the
+  /// `mactions-qemu-vm` helper's `list`/`delete` verbs + an on-disk fallback
+  /// sweep of `~/.mactions/windows-clones/mactions-*`), and VMware Fusion (the
+  /// `mactions-fusion-vm` helper + a fallback sweep of `~/.mactions/fusion/
+  /// mactions-*`). No-op for a backend whose tooling isn't present.
   ///
   /// Honors the ephemerality bar across crashes: if the app died mid-job the
   /// hypervisor (or a detached qemu/swtpm pair) can leave a powered-down clone
@@ -101,15 +102,32 @@ public enum HostCleanup {
         _ = try? Shell.run(qemu, ["delete", name])
       }
     }
-    // Belt-and-suspenders: even if the helper is gone (tools uninstalled) or its
-    // `require` block died, reap any leftover throwaway clone dirs by hand. The
-    // `mactions-` prefix scopes this to our own clones; the pkill-by-path first
-    // kills a leaked qemu/swtpm still holding files under the dir (both were
-    // started detached via -daemonize/--daemon, so they outlive the app), mirroring
-    // killOrphanRunnerProcesses.
-    let clonesDir = NSString(string: "~/.mactions/windows-clones").expandingTildeInPath
+    // VMware Fusion: like QEMU, clones are on-disk only (per-clone subdirs under
+    // ~/.mactions/fusion/mactions-*, not in any registry vmrun/prlctl can see).
+    // Drive the helper's `list`/`delete` verbs (delete = vmrun stop hard +
+    // deleteVM + rm -rf the clone dir). The helper self-prepends the Fusion +
+    // Homebrew bins to PATH, so this works from a Finder/launchd-launched app.
+    if let fusion = WindowsVMProviderFactory.fusionHelperPath,
+      let list = try? Shell.run(fusion, ["list"]), list.ok {
+      for name in windowsCloneNames(in: list.stdout) {
+        _ = try? Shell.run(fusion, ["delete", name])
+      }
+    }
+    // Belt-and-suspenders: even if a helper is gone (tools uninstalled) or its
+    // setup died, reap any leftover throwaway clone dirs by hand across BOTH
+    // backends' state roots. The `mactions-` prefix scopes this to our own
+    // clones; the pkill-by-path first kills a leaked qemu/swtpm (QEMU) still
+    // holding files under the dir (started detached via -daemonize/--daemon, so
+    // they outlive the app), mirroring killOrphanRunnerProcesses. (Fusion clones
+    // are powered off by `delete`/crash and hold no detached host process, but
+    // the pkill is harmless and keeps the sweep uniform.)
     let fm = FileManager.default
-    if let entries = try? fm.contentsOfDirectory(atPath: clonesDir) {
+    let cloneRoots = [
+      NSString(string: "~/.mactions/windows-clones").expandingTildeInPath,  // QEMU
+      NSString(string: "~/.mactions/fusion").expandingTildeInPath,          // VMware Fusion
+    ]
+    for clonesDir in cloneRoots {
+      guard let entries = try? fm.contentsOfDirectory(atPath: clonesDir) else { continue }
       for entry in entries where entry.hasPrefix("mactions-") {
         let dir = clonesDir + "/" + entry
         _ = try? Shell.run("/usr/bin/pkill", ["-f", dir])

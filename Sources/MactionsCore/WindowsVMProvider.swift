@@ -271,6 +271,77 @@ public struct QEMUCLI: WindowsVMCLI {
   }
 }
 
+/// VMware Fusion (free) via `vmrun` — the **PROVEN** backend for Win11-ARM on
+/// Apple Silicon (see AGENTS.md → Windows support). Fusion's EFI boots Win11-ARM
+/// cleanly where stock QEMU's firmware hangs, and `vmrun` gives a true headless
+/// CLI (clone/start/stop/deleteVM + snapshots). As with `QEMUCLI`, the lifecycle
+/// is wrapped in `scripts/mactions-fusion-vm` so the Swift side stays "one CLI +
+/// verb args" — every method here is pure command-shape, unit-testable without
+/// launching anything.
+///
+/// State layout (the helper owns these paths):
+///   ~/.mactions/fusion/<base>.vmx     — the pristine base (flat), with a
+///                                       powered-off `base-provisioned` snapshot
+///                                       that linked clones parent from.
+///   ~/.mactions/fusion/<clone>/       — per-clone subdir (linked .vmx + delta
+///                                       disk + optional config.iso)
+///
+/// Injection model: provider `inject()` copies the per-job config ISO into
+/// `<clone-dir>/config.iso`; the helper's `clone` step has already wired
+/// `sata0:0` to that path with `startConnected=TRUE`, so Fusion connects it as a
+/// CD at power-on — no new Swift injection plumbing, reusing `.copyConfigFile`.
+public struct VMwareCLI: WindowsVMCLI {
+  public let executable: String
+  /// Where the base + per-clone subdirs live. The helper builds `<dir>/<clone>/`.
+  public let clonesDir: String
+  public init(
+    executable: String,
+    clonesDir: String = NSString(string: "~/.mactions/fusion").expandingTildeInPath
+  ) {
+    self.executable = executable
+    self.clonesDir = clonesDir
+  }
+  public var displayName: String { "VMware Fusion (vmrun)" }
+  public func cloneArgs(base: String, clone: String) -> [String] {
+    ["clone", base, clone]
+  }
+  public func startArgs(clone: String) -> [String] { ["start", clone] }
+  public func stopArgs(clone: String) -> [String] { ["stop", clone] }
+  /// Helper `stop` already issues `vmrun stop … hard` (immediate power-off), so a
+  /// separate force path adds nothing — exposed to satisfy the protocol.
+  public func forceStopArgs(clone: String) -> [String] { ["stop", clone] }
+  public func deleteArgs(clone: String) -> [String] { ["delete", clone] }
+  public func statusArgs(clone: String) -> [String] { ["status", clone] }
+  /// The helper has a dedicated `base-status` verb (base .vmx exists + carries
+  /// the linked-clone snapshot + isn't powered on → "stopped"; else "in-use" /
+  /// "no-snapshot" / "missing"). Mapped to the same parseIsStopped path so
+  /// "stopped" → ready to clone from.
+  public func baseStatusArgs(base: String) -> [String] { ["base-status", base] }
+  /// `vmrun` exposes no guest IPv4 (no guest agent needed on the outbound model).
+  /// Return a benign no-op to keep the protocol total — the provider never asks
+  /// for the IP on the outbound flow.
+  public func ipArgs(clone: String) -> [String] { ["status", clone] }
+  public func parseIP(from output: String) -> String? { nil }
+  /// Helper normalizes to exactly "running" or "stopped" (vmrun itself has no
+  /// getstate; the helper reads `vmrun list`), so the substring match is correct;
+  /// explicit override here as documentation. Also correct for the `base-status`
+  /// strings — only "stopped" contains "stopped".
+  public func parseIsStopped(from output: String) -> Bool {
+    output.lowercased().contains("stopped")
+  }
+  /// Per-clone subdir, where the helper drops the linked clone + the provider's
+  /// inject step writes config.iso (which the clone's wired sata0:0 points at).
+  public func cloneBundlePath(clone: String) -> String? {
+    clonesDir + "/" + clone
+  }
+  /// Drop the JIT config ISO at <clone-dir>/config.iso; the helper's `clone` step
+  /// already pointed the clone's sata0:0 CD at that path with startConnected=TRUE.
+  public func injectionPlan(clone: String, clonePath: String?, configISO: String) -> WindowsInjectionPlan {
+    let dir = clonePath ?? cloneBundlePath(clone: clone) ?? ""
+    return .copyConfigFile(target: dir + "/config.iso")
+  }
+}
+
 // MARK: - Windows VM provider
 
 /// Runs each ephemeral runner inside a **throwaway Windows 11 ARM VM** cloned
@@ -546,34 +617,50 @@ public struct WindowsVMProviderFactory: RunnerProviderFactory {
     WindowsVMProvider(id: name, baseImage: baseImage, cli: cli)
   }
 
-  /// Path to the `mactions-qemu-vm` helper that owns QEMU+swtpm lifecycle.
-  /// Resolved at module-load time by looking next to the executable (dev builds
-  /// run via `swift run`), then a couple of well-known repo locations. nil if
-  /// the helper isn't shipped alongside the binary (the QEMU backend is then
-  /// not offered).
-  public static var qemuHelperPath: String? = {
+  /// Resolve a `scripts/<name>` lifecycle helper at module-load time: first next
+  /// to the binary's working dir (dev builds run via `swift run` from the repo),
+  /// then by walking up from the executable to a repo root (useful when the app
+  /// is launched from a path that isn't the repo cwd). nil if the helper isn't
+  /// shipped alongside the binary (that backend is then not offered).
+  static func resolveHelper(named name: String) -> String? {
     let fm = FileManager.default
-    let exeURL = URL(fileURLWithPath: CommandLine.arguments.first ?? "/")
-    // 1. ./scripts/mactions-qemu-vm relative to the binary's working dir.
-    let cwd = fm.currentDirectoryPath + "/scripts/mactions-qemu-vm"
+    let rel = "scripts/" + name
+    // 1. ./scripts/<name> relative to the binary's working dir.
+    let cwd = fm.currentDirectoryPath + "/" + rel
     if fm.isExecutableFile(atPath: cwd) { return cwd }
-    // 2. Walk up from the binary to find a repo root (.build/<…>/Mactions →
-    //    repo root containing scripts/). Useful when the app is launched from
-    //    a path that isn't the repo cwd.
-    var dir = exeURL.deletingLastPathComponent()
+    // 2. Walk up from the binary (.build/<…>/Mactions → repo root with scripts/).
+    var dir = URL(fileURLWithPath: CommandLine.arguments.first ?? "/").deletingLastPathComponent()
     for _ in 0..<6 {
-      let candidate = dir.appendingPathComponent("scripts/mactions-qemu-vm").path
+      let candidate = dir.appendingPathComponent(rel).path
       if fm.isExecutableFile(atPath: candidate) { return candidate }
       if dir.path == "/" { break }
       dir = dir.deletingLastPathComponent()
     }
     return nil
-  }()
+  }
+
+  /// Path to the `mactions-qemu-vm` helper that owns QEMU+swtpm lifecycle.
+  public static var qemuHelperPath: String? = resolveHelper(named: "mactions-qemu-vm")
+
+  /// Path to the `mactions-fusion-vm` helper that owns the VMware Fusion `vmrun`
+  /// lifecycle (the proven backend).
+  public static var fusionHelperPath: String? = resolveHelper(named: "mactions-fusion-vm")
+
+  /// Absolute path to VMware Fusion's `vmrun`. Fusion is NOT brew-installable
+  /// (Broadcom-portal download), so detection is presence-only — we never try to
+  /// install it. Pairing the helper + this binary is the "Fusion available" gate.
+  static let fusionVmrunPath = "/Applications/VMware Fusion.app/Contents/Library/vmrun"
 
   /// Pick the best installed Windows-VM backend, or `nil` if none is present.
-  /// Prefers QEMU (fully headless, no Aqua session required) for an unattended
-  /// host, then Parallels (`prlctl`), then UTM (`utmctl`, needs a GUI session).
+  /// Prefers VMware Fusion (the PROVEN Win11-ARM backend), then QEMU (headless
+  /// but does NOT boot Win11-ARM on this stack — kept for parity), then Parallels
+  /// (`prlctl`), then UTM (`utmctl`, needs a GUI session).
   public static func detectInstalledCLI() -> WindowsVMCLI? {
+    if let fusion = fusionHelperPath,
+      FileManager.default.isExecutableFile(atPath: fusionVmrunPath)
+    {
+      return VMwareCLI(executable: fusion)
+    }
     if let qemu = qemuHelperPath,
       FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/qemu-system-aarch64")
     {
@@ -590,13 +677,19 @@ public struct WindowsVMProviderFactory: RunnerProviderFactory {
     return nil
   }
 
-  /// Pick the installed backend FREE-FIRST: QEMU (free + fully headless, the
-  /// default for an unattended host), else UTM (free but needs a GUI session),
-  /// else Parallels (paid — only if already installed), else `nil`. QEMU's
-  /// "installed" condition is BOTH the helper script being present alongside
-  /// the binary AND `qemu-system-aarch64` on disk; if either is missing the
-  /// QEMU backend isn't offered.
+  /// Pick the installed backend FREE-FIRST: VMware Fusion (free since Nov 2024
+  /// AND the proven Win11-ARM backend — preferred), else QEMU (free + headless
+  /// but does NOT boot Win11-ARM here), else UTM (free but needs a GUI session),
+  /// else Parallels (paid — only if already installed), else `nil`. Fusion's
+  /// "installed" condition is BOTH the `mactions-fusion-vm` helper present
+  /// alongside the binary AND `vmrun` on disk; QEMU's is the helper AND
+  /// `qemu-system-aarch64`. If either half is missing that backend isn't offered.
   public static func detectFreeFirstCLI() -> WindowsVMCLI? {
+    if let fusion = fusionHelperPath,
+      FileManager.default.isExecutableFile(atPath: fusionVmrunPath)
+    {
+      return VMwareCLI(executable: fusion)
+    }
     if let qemu = qemuHelperPath,
       FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/qemu-system-aarch64")
     {

@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# mactions-fusion-vm — per-clone VMware Fusion lifecycle, called by `VMwareCLI`
+# (Swift) with verb args (clone/start/status/stop/delete/list/base-status) so it
+# slots into the existing WindowsVMCLI abstraction without exposing vmrun's
+# quirks (no getstate; running-state is read from `vmrun list`; the per-clone
+# config-ISO is wired onto a SATA cdrom by editing the clone .vmx) to Swift.
+# Mirrors scripts/mactions-qemu-vm's verb contract byte-for-byte so the Swift
+# side stays "one CLI + verb args" and stays unit-testable.
+#
+# Convention:
+#   - The pristine base lives FLAT at:  ~/.mactions/fusion/<base>.vmx
+#       (built once — see prepare-windows-image / AGENTS.md → Windows support;
+#        must carry a powered-off snapshot named "$SNAPSHOT" = base-provisioned,
+#        the linked-clone parent.)
+#   - Per-clone state lives in a SUBDIR:  ~/.mactions/fusion/<clone>/
+#       <clone>.vmx     # the linked clone (delta disk references the base)
+#       config.iso      # OPTIONAL per-clone JIT config CD (the provider's inject
+#                       # step copies the per-job config ISO here BEFORE start;
+#                       # `clone` wires sata0:0 to this path + startConnected).
+#       (vmware-*.log, .vmsd, etc. — vmrun's own per-clone files)
+#     Clone dirs are mactions-prefixed (the Swift clone name already carries it),
+#     so `list` globs ~/.mactions/fusion/mactions-* and never matches the base's
+#     flat <base>.* files.
+#
+# Verbs (one stable arg shape, matching what Swift's VMwareCLI expects):
+#   clone   <base-name> <clone-name>   # linked-clone the base @ $SNAPSHOT,
+#                                       #   then point sata0:0 at <clone>/config.iso
+#   start   <clone-name>               # vmrun start <vmx> nogui (headless)
+#   status  <clone-name>               # echo "running" or "stopped"
+#   stop    <clone-name>               # vmrun stop <vmx> hard; idempotent
+#   delete  <clone-name>               # stop + vmrun deleteVM + rm -rf; idempotent
+#   list                               # one clone-name per line (for sweep)
+#   base-status <base-name>            # echo "stopped" | "in-use" | "no-snapshot" | "missing"
+#
+# All verbs are idempotent + safe to call out of order; `stop` followed by
+# `delete` is the standard teardown, but `delete` alone also stops first.
+
+set -euo pipefail
+
+# A Finder-/login-item-launched .app inherits a launchd PATH that lacks both the
+# VMware Fusion CLI dir and /opt/homebrew/bin, so the bare-name tool calls below
+# would not resolve and every verb would die. Prepend the Fusion Library + the
+# Homebrew/usr-local bins, preserving any inherited PATH. `${PATH:-…}` keeps this
+# safe under `set -u` if PATH is unset. Single chokepoint that makes ALL
+# lifecycle + sweep calls work regardless of how the parent app was launched
+# (mirrors mactions-qemu-vm's PATH-prepend + AppState.runPrepScript).
+VMWARE_LIB="/Applications/VMware Fusion.app/Contents/Library"
+export PATH="${VMWARE_LIB}:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+
+MACTIONS_ROOT="${HOME}/.mactions"
+FUSION_DIR="${MACTIONS_ROOT}/fusion"
+
+# Linked-clone parent snapshot. The provisioned base is snapshotted under this
+# name once at build time; every per-job clone links from it (instant + minimal
+# disk). Overridable for future multi-base/test scenarios.
+SNAPSHOT="${MACTIONS_FUSION_SNAPSHOT:-base-provisioned}"
+
+die()  { echo "error: $*" >&2; exit 1; }
+note() { echo "[mactions-fusion-vm] $*" >&2; }
+
+# Resolve vmrun: prefer the well-known Fusion path, fall back to PATH. (vmcli /
+# vmware-vdiskmanager aren't needed at clone-time — linked clones reuse the
+# base disk — so vmrun is the only hard dependency of the per-job loop.)
+VMRUN="${VMWARE_LIB}/vmrun"
+[[ -x "$VMRUN" ]] || VMRUN="$(command -v vmrun 2>/dev/null || true)"
+[[ -n "$VMRUN" && -x "$VMRUN" ]] || die "missing: vmrun (install VMware Fusion — see AGENTS.md)"
+
+base_vmx()  { printf '%s/%s.vmx' "$FUSION_DIR" "$1"; }       # base is flat in fusion/
+clone_dir() { printf '%s/%s' "$FUSION_DIR" "$1"; }           # per-clone subdir
+clone_vmx() { printf '%s/%s/%s.vmx' "$FUSION_DIR" "$1" "$1"; }
+
+# True iff the given .vmx is in vmrun's running set. vmrun has no per-VM
+# getstate; `vmrun list` prints "Total running VMs: N" then one absolute .vmx
+# path per running VM, so a fixed-string match on the full path is the read.
+# Wrapped so `set -e`/pipefail don't trip on grep's no-match exit (callers use
+# it in `if`/`||` context, where set -e is suspended anyway).
+vmrun_list_contains() {
+  local vmx="$1"
+  "$VMRUN" -T fusion list 2>/dev/null | grep -Fq -- "$vmx"
+}
+
+# True iff the base .vmx has a snapshot named "$SNAPSHOT" (the linked-clone
+# parent). listSnapshots prints "Total snapshots: N" then one name per line.
+base_has_snapshot() {
+  local vmx="$1"
+  "$VMRUN" -T fusion listSnapshots "$vmx" 2>/dev/null | grep -Fxq -- "$SNAPSHOT"
+}
+
+# Set (or replace) a single `key = "value"` assignment in a .vmx file. Removes
+# any existing line for that EXACT key (dots escaped for the regex) then appends
+# the new one. Used to wire the per-clone config-ISO drive after `vmrun clone`.
+vmx_set() {
+  local vmx="$1" key="$2" val="$3"
+  local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/mactions-vmx.XXXXXX")"
+  # ^[space]*key[space]*=  — drop the old assignment if present.
+  grep -v -E "^[[:space:]]*${key//./\\.}[[:space:]]*=" "$vmx" > "$tmp" || true
+  printf '%s = "%s"\n' "$key" "$val" >> "$tmp"
+  mv "$tmp" "$vmx"
+}
+
+# -----------------------------------------------------------------------------
+# Verbs
+# -----------------------------------------------------------------------------
+
+cmd_list() {
+  [[ -d "$FUSION_DIR" ]] || return 0
+  # Just the clone-dir names (each mactions-prefixed) — the orchestrator's
+  # HostCleanup uses this with the mactions- filter to reap orphans on go-online.
+  # The base's flat <base>.* files aren't dirs, so they never match.
+  find "$FUSION_DIR" -maxdepth 1 -mindepth 1 -type d -name 'mactions-*' -exec basename {} \;
+}
+
+# "stopped" iff the base is BUILT (a <base>.vmx that carries the linked-clone
+# snapshot) and not currently powered on. The provider's go-online gate
+# (`baseImagePoweredOff` in Swift) calls this and treats "stopped" as
+# "safe to clone from". Anything else is non-clonable: "in-use" (the base is
+# powered on — e.g. a live provisioning session), "no-snapshot" (built but the
+# linked-clone parent snapshot is missing), or "missing" (no base .vmx at all).
+cmd_base_status() {
+  local base="${1:-win11-runner-base}"
+  local vmx; vmx="$(base_vmx "$base")"
+  if [[ ! -f "$vmx" ]]; then echo "missing"; return; fi
+  if vmrun_list_contains "$vmx"; then echo "in-use"; return; fi
+  if ! base_has_snapshot "$vmx"; then echo "no-snapshot"; return; fi
+  echo "stopped"
+}
+
+cmd_clone() {
+  local base="$1" clone="$2"
+  [[ -n "$base" && -n "$clone" ]] || die "usage: clone <base-name> <clone-name>"
+  local base_vmx_path; base_vmx_path="$(base_vmx "$base")"
+  [[ -f "$base_vmx_path" ]] || die "base vmx not found: $base_vmx_path (build the base first — see AGENTS.md)"
+  base_has_snapshot "$base_vmx_path" \
+    || die "base snapshot '$SNAPSHOT' not found on $base_vmx_path (snapshot the provisioned base first)"
+
+  mkdir -p "$FUSION_DIR"
+  local dir; dir="$(clone_dir "$clone")"
+  local vmx; vmx="$(clone_vmx "$clone")"
+  if [[ -e "$dir" ]]; then
+    # An existing dir means a prior abort. Don't clobber a running clone.
+    if vmrun_list_contains "$vmx"; then
+      die "clone '$clone' already exists and is running. Call \`stop\`/\`delete\` first."
+    fi
+    "$VMRUN" -T fusion deleteVM "$vmx" >/dev/null 2>&1 || true
+    rm -rf "$dir"
+  fi
+
+  # Linked clone from the provisioned snapshot — instant + minimal disk use
+  # (the delta disk references the base .vmdk; only diverged blocks are written).
+  # vmrun creates <dir> for the dest .vmx. -cloneName sets the clone's
+  # displayName + regenerates its uuid/MAC, so each runner gets a fresh identity.
+  "$VMRUN" -T fusion clone "$base_vmx_path" "$vmx" linked -snapshot="$SNAPSHOT" -cloneName="$clone" >/dev/null
+  [[ -f "$vmx" ]] || die "vmrun clone did not produce $vmx"
+
+  # Wire the per-clone JIT config disc onto sata0:0. The provider drops
+  # config.iso into <dir> BEFORE `start`; point the drive at it and mark it
+  # connected-at-power-on. It's a non-bootable ISO9660 disc, so EFI ignores it
+  # for boot — the in-guest MactionsRunOnce task reads \mactions\jitconfig off
+  # it (by the MACTIONS volume label) and runs ONE job, then `shutdown /s`.
+  vmx_set "$vmx" "sata0:0.present" "TRUE"
+  vmx_set "$vmx" "sata0:0.deviceType" "cdrom-image"
+  vmx_set "$vmx" "sata0:0.fileName" "$dir/config.iso"
+  vmx_set "$vmx" "sata0:0.startConnected" "TRUE"
+  # The base also carries a 2nd cdrom (the unattend ISO, used only at install).
+  # Keep it disconnected so a since-moved/removed ISO can't stall the clone boot.
+  vmx_set "$vmx" "sata0:1.startConnected" "FALSE"
+
+  note "cloned $base → $dir (linked @ $SNAPSHOT)"
+}
+
+cmd_start() {
+  local clone="$1"
+  [[ -n "$clone" ]] || die "usage: start <clone-name>"
+  local vmx; vmx="$(clone_vmx "$clone")"
+  [[ -f "$vmx" ]] || die "clone vmx not found: $vmx"
+  if vmrun_list_contains "$vmx"; then
+    note "already running: $clone"
+    return 0
+  fi
+  # `nogui` boots headless (no Fusion window) — vmrun returns once the VM is
+  # powered on; it does NOT block until power-off (matches the QEMU/prlctl model).
+  "$VMRUN" -T fusion start "$vmx" nogui >/dev/null
+  note "started $clone (nogui)"
+}
+
+cmd_status() {
+  local clone="$1"
+  [[ -n "$clone" ]] || die "usage: status <clone-name>"
+  local vmx; vmx="$(clone_vmx "$clone")"
+  if [[ ! -f "$vmx" ]]; then echo "stopped"; return; fi
+  if vmrun_list_contains "$vmx"; then echo "running"; else echo "stopped"; fi
+}
+
+cmd_stop() {
+  local clone="$1"
+  [[ -n "$clone" ]] || die "usage: stop <clone-name>"
+  local vmx; vmx="$(clone_vmx "$clone")"
+  [[ -f "$vmx" ]] || { note "stop: no clone vmx for $clone"; return 0; }
+  if vmrun_list_contains "$vmx"; then
+    # `hard` = immediate power-off (no orderly ACPI shutdown). We're about to
+    # delete the throwaway clone anyway, and the guest already `shutdown /s`'d
+    # itself on a normal job completion — this only fires for teardown/abort.
+    "$VMRUN" -T fusion stop "$vmx" hard >/dev/null 2>&1 || true
+  fi
+  note "stopped $clone"
+}
+
+cmd_delete() {
+  local clone="$1"
+  [[ -n "$clone" ]] || die "usage: delete <clone-name>"
+  cmd_stop "$clone" || true
+  local dir; dir="$(clone_dir "$clone")"
+  local vmx; vmx="$(clone_vmx "$clone")"
+  if [[ -f "$vmx" ]]; then
+    "$VMRUN" -T fusion deleteVM "$vmx" >/dev/null 2>&1 || true
+  fi
+  if [[ -d "$dir" ]]; then
+    rm -rf "$dir"
+    note "deleted $clone"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Dispatch
+# -----------------------------------------------------------------------------
+verb="${1:-}"; shift || true
+case "$verb" in
+  clone)        cmd_clone       "${1:-}" "${2:-}" ;;
+  start)        cmd_start       "${1:-}" ;;
+  status)       cmd_status      "${1:-}" ;;
+  stop)         cmd_stop        "${1:-}" ;;
+  delete)       cmd_delete      "${1:-}" ;;
+  list)         cmd_list ;;
+  base-status)  cmd_base_status "${1:-}" ;;
+  ""|help|-h|--help)
+    cat <<EOF
+Usage:
+  mactions-fusion-vm clone        <base-name> <clone-name>
+  mactions-fusion-vm start        <clone-name>
+  mactions-fusion-vm status       <clone-name>   # echoes "running" or "stopped"
+  mactions-fusion-vm stop         <clone-name>
+  mactions-fusion-vm delete       <clone-name>
+  mactions-fusion-vm list
+  mactions-fusion-vm base-status  <base-name>    # "stopped" | "in-use" | "no-snapshot" | "missing"
+EOF
+    ;;
+  *) die "unknown verb: $verb (try --help)" ;;
+esac

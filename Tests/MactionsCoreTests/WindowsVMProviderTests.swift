@@ -118,6 +118,53 @@ final class WindowsVMProviderTests: XCTestCase {
     XCTAssertFalse(cli.parseIsStopped(from: ""))
   }
 
+  // MARK: VMware Fusion (mactions-fusion-vm helper) verb shapes + injection
+
+  func testVMwareCLIVerbShapes() {
+    // Same `<helper> <verb> <clone>` shape as QEMU — the helper owns the vmrun
+    // clone/start/stop/deleteVM orchestration; Swift only pins the arg shapes.
+    let cli = VMwareCLI(executable: "/repo/scripts/mactions-fusion-vm",
+                        clonesDir: "/state/fusion")
+    XCTAssertEqual(cli.cloneArgs(base: "win11-runner-base", clone: "mactions-abc"),
+      ["clone", "win11-runner-base", "mactions-abc"])
+    XCTAssertEqual(cli.startArgs(clone: "mactions-abc"), ["start", "mactions-abc"])
+    XCTAssertEqual(cli.stopArgs(clone: "mactions-abc"), ["stop", "mactions-abc"])
+    XCTAssertEqual(cli.forceStopArgs(clone: "mactions-abc"), ["stop", "mactions-abc"])
+    XCTAssertEqual(cli.deleteArgs(clone: "mactions-abc"), ["delete", "mactions-abc"])
+    XCTAssertEqual(cli.statusArgs(clone: "mactions-abc"), ["status", "mactions-abc"])
+    XCTAssertEqual(cli.baseStatusArgs(base: "win11-runner-base"), ["base-status", "win11-runner-base"])
+    XCTAssertNil(cli.parseIP(from: "anything"))  // outbound model — no IP discovery
+    XCTAssertTrue(cli.displayName.contains("VMware Fusion"))
+  }
+
+  func testVMwareInjectionCopiesConfigFileIntoCloneDir() {
+    // The helper's `clone` step already wired the clone's sata0:0 CD to
+    // <clone-dir>/config.iso, so injection is a plain copy to that path —
+    // reusing .copyConfigFile, no new injection plumbing.
+    let cli = VMwareCLI(executable: "/repo/scripts/mactions-fusion-vm",
+                        clonesDir: "/state/fusion")
+    XCTAssertEqual(cli.cloneBundlePath(clone: "mactions-abc"), "/state/fusion/mactions-abc")
+    XCTAssertEqual(
+      cli.injectionPlan(clone: "mactions-abc", clonePath: nil, configISO: "/tmp/c.iso"),
+      .copyConfigFile(target: "/state/fusion/mactions-abc/config.iso"))
+    XCTAssertEqual(
+      cli.injectionPlan(clone: "mactions-abc", clonePath: "/elsewhere", configISO: "/tmp/c.iso"),
+      .copyConfigFile(target: "/elsewhere/config.iso"))
+  }
+
+  func testVMwareStatusParserMapsHelperOutputs() {
+    // Helper normalizes to exactly "running"/"stopped" (vmrun has no getstate);
+    // base-status adds "in-use"/"no-snapshot"/"missing" — only "stopped" is ready.
+    let cli = VMwareCLI(executable: "/x", clonesDir: "/y")
+    XCTAssertTrue(cli.parseIsStopped(from: "stopped"))
+    XCTAssertTrue(cli.parseIsStopped(from: "stopped\n"))
+    XCTAssertFalse(cli.parseIsStopped(from: "running"))
+    XCTAssertFalse(cli.parseIsStopped(from: "in-use"))
+    XCTAssertFalse(cli.parseIsStopped(from: "no-snapshot"))
+    XCTAssertFalse(cli.parseIsStopped(from: "missing"))
+    XCTAssertFalse(cli.parseIsStopped(from: ""))
+  }
+
   // MARK: Power-state completion classifier
 
   func testPhaseClassifierRequiresRunningBeforeStopped() {
@@ -190,24 +237,30 @@ final class WindowsVMProviderTests: XCTestCase {
     }
   }
 
-  func testDetectFreeFirstCLIPrefersQEMUOverUTMOverParallels() {
+  func testDetectFreeFirstCLIPrefersFusionThenQEMUThenUTMThenParallels() {
     let cli = WindowsVMProviderFactory.detectFreeFirstCLI()
     guard let cli else { return }  // None installed — vacuously satisfied.
     XCTAssertTrue(
       FileManager.default.isExecutableFile(atPath: cli.executable),
       "free-first CLI must point at a real executable")
-    // Free-first ordering: QEMU (fully headless, no Aqua session) > UTM (free
-    // but needs a GUI session) > Parallels (paid). We test which one was picked
-    // against what's actually installed on the host.
+    // Free-first ordering: VMware Fusion (free + the PROVEN Win11-ARM backend) >
+    // QEMU (headless but can't boot Win11-ARM here) > UTM (free, needs a GUI
+    // session) > Parallels (paid). We test which one was picked against what's
+    // actually installed on the host.
+    let fusionAvailable =
+      WindowsVMProviderFactory.fusionHelperPath != nil
+      && FileManager.default.isExecutableFile(atPath: WindowsVMProviderFactory.fusionVmrunPath)
     let qemuAvailable =
       WindowsVMProviderFactory.qemuHelperPath != nil
       && FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/qemu-system-aarch64")
     let utmAvailable = FileManager.default.isExecutableFile(
       atPath: "/Applications/UTM.app/Contents/MacOS/utmctl")
-    if qemuAvailable {
-      XCTAssertTrue(cli is QEMUCLI, "QEMU present -> must prefer it (fully headless, free)")
+    if fusionAvailable {
+      XCTAssertTrue(cli is VMwareCLI, "Fusion present -> must prefer it (proven Win11-ARM, free)")
+    } else if qemuAvailable {
+      XCTAssertTrue(cli is QEMUCLI, "no Fusion, QEMU present -> prefer it (headless, free)")
     } else if utmAvailable {
-      XCTAssertTrue(cli is UTMCLI, "no QEMU, UTM present -> must prefer UTM (free)")
+      XCTAssertTrue(cli is UTMCLI, "no Fusion/QEMU, UTM present -> must prefer UTM (free)")
     } else {
       XCTAssertTrue(cli is ParallelsCLI, "only Parallels installed -> must pick it")
     }

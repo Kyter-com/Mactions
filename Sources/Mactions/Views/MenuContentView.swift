@@ -215,8 +215,8 @@ struct MenuContentView: View {
         .disabled(app.state != .offline || app.windowsSetupBusy)
         Text(
           app.windowsBackendAvailable
-            ? "Downloads the latest Win11 ARM64 ISO and builds a throwaway base VM (multi-GB, one time). Not yet live-verified."
-            : "Installs the free QEMU stack (qemu + swtpm, fully headless) if needed, then downloads the latest Win11 ARM64 ISO + builds a base VM."
+            ? "Clones a throwaway Win11 ARM64 base VM per job and destroys it after (multi-GB base build, one time). Proven end to end on VMware Fusion."
+            : "Install VMware Fusion (free, from the Broadcom portal) — the proven Win11-ARM backend — then this downloads the latest Win11 ARM64 ISO + builds the one-time base VM."
         )
         .font(.caption2).foregroundStyle(.secondary)
         .fixedSize(horizontal: false, vertical: true)
@@ -360,7 +360,7 @@ private struct WindowsPreflightChecklist: View {
     if let backend = report?.recommendedBackend {
       return "Hypervisor: \(backend.displayName)"
     }
-    return "Hypervisor (QEMU recommended — free, headless)"
+    return "Hypervisor (VMware Fusion recommended — free, proven Win11-ARM)"
   }
 
   private func converterLabel(_ report: WindowsPreflight.Report?) -> String {

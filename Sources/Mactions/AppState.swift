@@ -305,9 +305,10 @@ final class AppState: ObservableObject {
 
   // MARK: Windows runner (opt-in)
 
-  /// True only if a Windows-capable backend is installed: the QEMU stack
-  /// (`mactions-qemu-vm` helper + `qemu-system-aarch64`), Parallels (`prlctl`),
-  /// or UTM (`utmctl`). Windows runners aren't offerable without one.
+  /// True only if a Windows-capable backend is installed: VMware Fusion (the
+  /// PROVEN Win11-ARM backend — `mactions-fusion-vm` helper + `vmrun`), the QEMU
+  /// stack (`mactions-qemu-vm` + `qemu-system-aarch64`), Parallels (`prlctl`), or
+  /// UTM (`utmctl`). Windows runners aren't offerable without one.
   var windowsBackendAvailable: Bool { WindowsVMProviderFactory.detectInstalledCLI() != nil }
 
   /// Run the prerequisite scan and publish it for the checklist. Cheap
@@ -435,7 +436,7 @@ final class AppState: ObservableObject {
       // 2) Confirm a hypervisor backend is now present before the long build.
       guard WindowsVMProviderFactory.detectInstalledCLI() != nil else {
         statusMessage =
-          "No Windows hypervisor available. Install the free QEMU stack via \"Install free prerequisites\", or open Parallels/UTM if you have it, then try again."
+          "No Windows hypervisor available. Install VMware Fusion (free) from the Broadcom portal — the proven Win11-ARM backend — then try again. (Parallels/UTM are also used if already present.)"
         windowsSetupBusy = false
         return
       }

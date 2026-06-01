@@ -51,8 +51,17 @@ final class WindowsPreflightTests: XCTestCase {
     XCTAssertEqual(r.hypervisors[.parallels]?.installed, true)
     XCTAssertEqual(r.hypervisors[.qemu]?.installed, true)
     XCTAssertEqual(r.hypervisors[.utm]?.installed, false)
-    // Free-first iteration order is preserved (utm absent → parallels, qemu).
+    // Free-first iteration order is preserved (fusion/utm absent → parallels, qemu).
     XCTAssertEqual(r.installedHypervisors, [.parallels, .qemu])
+  }
+
+  func testDetectsVMwareFusionInsideAppBundleNotOnPath() {
+    // vmrun ships inside VMware Fusion.app, never on PATH — probed by abs path.
+    let r = report(paths: [WindowsPreflight.vmrunPath])
+    XCTAssertEqual(r.hypervisors[.vmwareFusion]?.installed, true)
+    XCTAssertEqual(r.installedHypervisors, [.vmwareFusion])  // listed first (preferred)
+    XCTAssertTrue(r.hasHypervisor)
+    XCTAssertTrue(WindowsPreflight.Hypervisor.vmwareFusion.isFree)  // free since Nov 2024
   }
 
   func testConvertersMapMissingBinariesToBrewFormulae() {
@@ -104,6 +113,19 @@ final class WindowsPreflightTests: XCTestCase {
       ])
     XCTAssertTrue(r.qemuStackReady)
     XCTAssertEqual(r.recommendedBackend, .qemu)
+  }
+
+  func testRecommendedBackendPrefersFusionOverEverythingWhenInstalled() {
+    // VMware Fusion is the PROVEN Win11-ARM backend — preferred over a ready QEMU
+    // stack, UTM, and Parallels alike.
+    let r = report(
+      which: ["qemu-system-aarch64", "swtpm", "prlctl"],
+      paths: [
+        WindowsPreflight.vmrunPath, WindowsPreflight.utmctlPath,
+        WindowsPreflight.efiCodePath, WindowsPreflight.efiVarsPath,
+      ])
+    XCTAssertEqual(r.recommendedBackend, .vmwareFusion)
+    XCTAssertEqual(r.installedHypervisors.first, .vmwareFusion)
   }
 
   func testQEMUWithoutSwtpmOrEFIFirmwareIsNotStackReady() {

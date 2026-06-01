@@ -22,7 +22,7 @@ Proof-of-concept. Honest accounting:
 - ✅ **Local-process provider**: runs the actions-runner agent directly on the Mac (no VM isolation, but each run is an isolated clone that's wiped on exit — see Host hygiene). This is the runnable MVP path.
 - ✅ **SwiftUI menubar app**: status, config, online/offline, live runner list; deregisters on quit.
 - 🧪 **Tart provider** (VM isolation): implemented against the `tart` CLI but **experimental** — depends on a prepared base image + SSH bootstrap (see Providers).
-- 🟢 **Windows provider** (`WindowsVMProvider`): **PROVEN END TO END on VMware Fusion (2026-06-01).** A real ephemeral **Win11-ARM** GitHub Actions runner registered **outbound** to GitHub and ran a **green Windows job** (native `RUNNER_ARCH=ARM64`) on a Mac, then auto-deregistered and the clone powered itself off — host left clean. **VMware Fusion (free)** is the working backend: its `vmrun` CLI does headless clone/start/stop/deleteVM + snapshots, and its EFI boots Win11-ARM — where **stock Homebrew QEMU's firmware hangs** and **UTM is Aqua/SPICE-bound** (both attempted first; see the finding under [Windows support](#windows-support)). Per job: `vmrun clone … linked -snapshot=base-provisioned` a provisioned base, inject a JIT **config disc** (`mactions/jitconfig`), boot → the guest's `MactionsRunOnce` task runs `run.cmd --jitconfig` for ONE job + powers off → the clone is deleted. The **one-time base build is currently semi-manual** on Fusion (VMware Tools + a NIC switch to `vmxnet3` + one Space-press at boot — see the recipe under [Windows support](#windows-support)); the **per-job loop is fully scriptable**. The earlier `QEMUCLI`/UTM `WindowsVMCLI` scaffolding remains in the tree but does **not** boot Win11-ARM on this macOS/QEMU stack; a Swift `VMwareCLI` provider is the next step (Roadmap). See [Windows support](#windows-support).
+- 🟢 **Windows provider** (`WindowsVMProvider`): **PROVEN END TO END on VMware Fusion (2026-06-01).** A real ephemeral **Win11-ARM** GitHub Actions runner registered **outbound** to GitHub and ran a **green Windows job** (native `RUNNER_ARCH=ARM64`) on a Mac, then auto-deregistered and the clone powered itself off — host left clean. **VMware Fusion (free)** is the working backend: its `vmrun` CLI does headless clone/start/stop/deleteVM + snapshots, and its EFI boots Win11-ARM — where **stock Homebrew QEMU's firmware hangs** and **UTM is Aqua/SPICE-bound** (both attempted first; see the finding under [Windows support](#windows-support)). Per job: `vmrun clone … linked -snapshot=base-provisioned` a provisioned base, inject a JIT **config disc** (`mactions/jitconfig`), boot → the guest's `MactionsRunOnce` task runs `run.cmd --jitconfig` for ONE job + powers off → the clone is deleted. The **one-time base build is currently semi-manual** on Fusion (VMware Tools + a NIC switch to `vmxnet3` + one Space-press at boot — see the recipe under [Windows support](#windows-support)); the **per-job loop is fully scriptable**. The Swift **`VMwareCLI`** backend (+ the `scripts/mactions-fusion-vm` lifecycle helper) now drives this loop and **"Go online" auto-selects Fusion when present** (`detectFreeFirstCLI`); the earlier `QEMUCLI`/UTM scaffolding stays in the tree but does **not** boot Win11-ARM here. Remaining: automate the base build's manual touches + a live app-driven run. See [Windows support](#windows-support).
 
 ## Architecture
 
@@ -99,25 +99,25 @@ We tried free headless QEMU first; it does **not** boot Win11-ARM on this stack,
 5. Run `bootstrap.ps1` **elevated** (Register-ScheduledTask needs admin): installs the win-arm64 actions-runner agent → `C:\actions-runner`, drops `C:\setup\run-job.ps1`, registers the `MactionsRunOnce` logon task, disables UAC. Verify: `Test-Path C:\actions-runner\run.cmd` = True, `C:\setup\run-job.ps1` = True, `MactionsRunOnce` task = Ready.
 6. Shut down (`vmrun stop … soft`) + `vmrun snapshot … base-provisioned`. That powered-off snapshot is the pristine base.
 
-**Per-job loop** — fully scriptable, **proven**:
+**Per-job loop** — fully scriptable, **proven**. Steps 3–6's raw `vmrun` commands are wrapped by **`scripts/mactions-fusion-vm`** (verbs `clone`/`start`/`status`/`stop`/`delete`/`list`/`base-status`), which the Swift `VMwareCLI` backend shells out to (mirroring `QEMUCLI` + `mactions-qemu-vm`). Per-clone state lives in `~/.mactions/fusion/<clone>/` (the base is flat in `~/.mactions/fusion/`); the `clone` verb wires `sata0:0` to `<clone>/config.iso` so the provider's `inject()` is a plain copy:
 
 1. Mint a JIT: `gh api repos/<owner>/<repo>/actions/runners/generate-jitconfig` with `labels:["self-hosted","Windows","mactions"]`, `runner_group_id:1`, `work_folder:"_work"` → `.encoded_jit_config`.
 2. Build a config disc: stage `<dir>/mactions/jitconfig` = the encoded JIT (no trailing newline), then `hdiutil makehybrid -iso -joliet -ov -default-volume-name MACTIONS -o cfg.iso <dir>`.
-3. `vmrun -T fusion clone <base.vmx> <clone.vmx> linked -snapshot=base-provisioned -cloneName=<name>`.
-4. Edit the clone `.vmx`: point `sata0:0.fileName` at `cfg.iso`, set `sata0:0.startConnected = "TRUE"`.
+3. `vmrun -T fusion clone <base.vmx> <clone.vmx> linked -snapshot=base-provisioned -cloneName=<name>` (helper: `clone <base> <name>`; ~0.4 s, ~8 MB linked).
+4. Point the clone `.vmx`'s `sata0:0.fileName` at `<clone>/config.iso`, `sata0:0.startConnected = "TRUE"` (the helper's `clone` does this; the provider then drops `config.iso` in place).
 5. `vmrun -T fusion start <clone.vmx> nogui` → auto-login `runner` → `MactionsRunOnce` → `run-job.ps1` finds the JIT on the config disc → `run.cmd --jitconfig` registers OUTBOUND + runs ONE job → `shutdown /s`.
-6. `vmrun -T fusion deleteVM <clone.vmx>` + `rm -rf` the clone dir. The runner auto-deregisters (ephemeral JIT).
+6. `vmrun -T fusion deleteVM <clone.vmx>` + `rm -rf` the clone dir (helper: `delete <name>`). The runner auto-deregisters (ephemeral JIT).
 
 ### Known issues found live (fix before productionizing)
 
-- **Git for Windows `/VERYSILENT` still shows the installer GUI on ARM64** — fine with a human present, but **breaks the unattended FirstLogonCommands path**. Needs different silent flags (or winget / a manual extract).
-- **7-Zip URL `7z2408-arm64.msi` is 404** (stale) — optional/non-fatal (`bootstrap.ps1` continues); resolve the current version.
-- **Base build's 3 manual touches** (VMware Tools, NIC→vmxnet3, Space-at-boot) — a no-prompt ISO + a VMware-Tools install stage would make it hands-free.
-- **No Swift `VMwareCLI` provider yet** — the per-job loop is proven in shell but not wired into the app's "Go online" (next step — Roadmap).
+- **Git for Windows `/VERYSILENT` still shows the installer GUI on ARM64** — fine with a human present, but **breaks the unattended FirstLogonCommands path**. Needs different silent flags (or winget / a manual extract). STILL OPEN.
+- ~~7-Zip URL `7z2408-arm64.msi` is 404~~ — **FIXED**: the ARM64 `.msi` never existed (7-Zip ships ARM64 only as an NSIS `.exe`); `bootstrap.ps1` now uses `7z2601-arm64.exe` + `/S` (pinned — bump manually, no "latest" alias).
+- **Base build's 3 manual touches** (VMware Tools, NIC→vmxnet3, Space-at-boot) — a no-prompt ISO + a VMware-Tools install stage would make it hands-free. STILL OPEN.
+- ~~No Swift `VMwareCLI` provider yet~~ — **DONE**: `VMwareCLI` + `scripts/mactions-fusion-vm` land the per-job loop and `detectFreeFirstCLI`/`detectInstalledCLI` prefer Fusion; `Cleanup.purgeStrayWindowsClones` + `WindowsPreflight` are Fusion-aware. Remaining: a live **app-driven** end-to-end run (the shell loop is proven; the provider is unit-tested + the helper proven standalone).
 
 ---
 
-> ℹ️ **The subsections below document the earlier QEMU/UTM (`WindowsVMProvider`/`QEMUCLI`/`UTMCLI`) design.** They're **superseded** by the VMware Fusion recipe above for the working path, but kept for reference (the scaffolding is still in the tree, the prereq/preflight UI still targets it, and a Swift `VMwareCLI` provider will replace it).
+> ℹ️ **The subsections below document the earlier QEMU/UTM (`WindowsVMProvider`/`QEMUCLI`/`UTMCLI`) design.** They're **superseded** by the VMware Fusion recipe above — the `VMwareCLI` backend now ships and is preferred — but kept for reference (the scaffolding is still in the tree, and the brew-install prereq flow still installs the QEMU stack; only the *backend selection* is Fusion-first so far).
 
 🧪 **The QEMU/UTM control-plane code** (provider, factory, stray-clone reaping, image build-id auto-update) compiles and is unit-tested, but the QEMU backend does not boot Win11-ARM here (see the finding above).
 
