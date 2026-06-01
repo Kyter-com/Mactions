@@ -6,9 +6,6 @@ name: Windows smoke (Mactions runner)
 #   gh workflow run "Windows smoke (Mactions runner)"
 on:
   workflow_dispatch:
-  push:
-    branches: ["fix/qemu-clone-boot-config-and-reaping"]
-    paths: [".github/workflows/win-smoke.yml"]
 
 jobs:
   win-smoke:
