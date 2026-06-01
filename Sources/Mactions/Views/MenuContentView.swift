@@ -216,6 +216,11 @@ struct MenuContentView: View {
               "Re-downloads the latest Win11 ARM64 ISO (~8 GB) and rebuilds the base VM headless — about 30–40 minutes. This replaces the existing base image."
             )
           }
+        if let notice = app.windowsUpdateNotice {
+          Label(notice, systemImage: "arrow.up.circle")
+            .font(.caption2).foregroundStyle(.orange)
+            .fixedSize(horizontal: false, vertical: true)
+        }
       } else {
         Button {
           app.setUpWindowsRunner()

@@ -54,6 +54,26 @@ final class WindowsPreflightTests: XCTestCase {
     XCTAssertNil(r.recommendedBackend)
   }
 
+  func testFusionNotReadyWhenLifecycleHelperMissingEvenIfVmrunPresent() {
+    // The LIVE backend gate (detectInstalledCLI) needs BOTH vmrun AND the
+    // mactions-fusion-vm helper. With vmrun present but the helper missing
+    // (e.g. a packaged app without the bundled scripts), the checklist must NOT
+    // report Fusion ready — or "ready" would contradict what can actually start.
+    let notReady = WindowsPreflight.makeReport(
+      whichLookup: { _ in nil },
+      isExecutable: { $0 == WindowsPreflight.vmrunPath },
+      fusionHelperPresent: false)
+    XCTAssertFalse(notReady.fusionInstalled)
+    XCTAssertFalse(notReady.hasHypervisor)
+    XCTAssertNil(notReady.recommendedBackend)
+    // With the helper present, the same vmrun signal DOES read as installed.
+    let ready = WindowsPreflight.makeReport(
+      whichLookup: { _ in nil },
+      isExecutable: { $0 == WindowsPreflight.vmrunPath },
+      fusionHelperPresent: true)
+    XCTAssertTrue(ready.fusionInstalled)
+  }
+
   func testConvertersMapMissingBinariesToBrewFormulae() {
     // Binary→formula differs for most: wimlib-imagex→wimlib, mkisofs→cdrtools,
     // chntpw→its tap. Only the absent ones are reported, as install args.

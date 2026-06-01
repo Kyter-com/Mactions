@@ -119,8 +119,10 @@ public enum WindowsPreflight {
 
   // MARK: - Detection (impure: probes the filesystem)
 
-  /// Common absolute locations a Finder-launched GUI app won't have on its
-  /// inherited PATH, so we probe them directly (mirrors `Shell.which`).
+  /// Homebrew install prefixes. NOTE: the production `whichLookup` (`Shell.which`)
+  /// already probes `/opt/homebrew/bin` + `/usr/local/bin`, so this fallback only
+  /// fires under a deliberately-narrowed injected `whichLookup` in tests — it is a
+  /// test/seam-only safeguard, not an independent Finder-PATH net in production.
   static let brewCandidatePaths = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
   /// VMware Fusion's `vmrun` — inside the .app bundle (not on PATH). Its presence
   /// is the "Fusion installed" signal; Fusion is a manual Broadcom-portal download.
@@ -132,25 +134,37 @@ public enum WindowsPreflight {
   public static func detect() -> Report {
     makeReport(
       whichLookup: { Shell.which($0) },
-      isExecutable: { FileManager.default.isExecutableFile(atPath: $0) }
+      isExecutable: { FileManager.default.isExecutableFile(atPath: $0) },
+      // Mirror the LIVE backend gate (`detectInstalledCLI`): Fusion needs BOTH
+      // vmrun AND the `mactions-fusion-vm` helper reachable. Without this the
+      // checklist could show Fusion "ready" while no runner could actually start
+      // (e.g. a packaged app missing the bundled scripts).
+      fusionHelperPresent: WindowsVMProviderFactory.fusionHelperPath != nil
     )
   }
 
   /// Pure report assembly given two probes:
   ///   - `whichLookup`: resolve a binary on PATH + Homebrew dirs (or `nil`).
   ///   - `isExecutable`: is there an executable at this absolute path?
+  ///   - `fusionHelperPresent`: is the `mactions-fusion-vm` helper reachable?
+  ///     (`detect()` passes the real probe; defaults to `true` so the existing
+  ///     pure tests keep asserting on the vmrun signal alone.)
   /// Split out so detection logic is unit-testable without a real brew/Fusion.
   static func makeReport(
     whichLookup: (String) -> String?,
-    isExecutable: (String) -> Bool
+    isExecutable: (String) -> Bool,
+    fusionHelperPresent: Bool = true
   ) -> Report {
     // Homebrew: PATH first, then the two well-known install prefixes.
     let brewPath =
       whichLookup("brew") ?? brewCandidatePaths.first(where: isExecutable)
     let homebrew = Tool(name: "brew", path: brewPath)
 
-    // VMware Fusion ships vmrun inside the .app bundle (not on PATH).
-    let fusion = Tool(name: "vmrun", path: isExecutable(vmrunPath) ? vmrunPath : nil)
+    // VMware Fusion ships vmrun inside the .app bundle (not on PATH). "Installed"
+    // requires BOTH vmrun AND the lifecycle helper — the two-part gate the live
+    // selection uses — so a half-present Fusion can't read as ready.
+    let fusionReady = isExecutable(vmrunPath) && fusionHelperPresent
+    let fusion = Tool(name: "vmrun", path: fusionReady ? vmrunPath : nil)
 
     // Converter tools for the no-ISO auto-download path. Probe by binary name;
     // the brew formula that provides each (e.g. aria2c→aria2, mkisofs→cdrtools,

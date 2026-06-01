@@ -30,4 +30,34 @@ final class WindowsVMBudgetTests: XCTestCase {
     XCTAssertEqual(
       WindowsVMBudget.maxConcurrentVMs(physicalMemoryBytes: gb(64), perVMGB: 0), 0)
   }
+
+  // MARK: per-VM footprint read from the base .vmx (keeps the budget in sync with --ram)
+
+  func testPerVMGBParsesMemsizeFromVMX() {
+    // Linked clones inherit the base memsize, so the budget must divide by THIS,
+    // not a hardcoded 8 — a --ram 16384 base is a 16 GB clone.
+    let vmx = """
+      .encoding = "UTF-8"
+      memsize = "16384"
+      numvcpus = "4"
+      """
+    XCTAssertEqual(WindowsVMBudget.perVMGB(fromVMX: vmx), 16)
+    // The default base (8192 MB) reads back as 8 GB == defaultPerVMGB.
+    XCTAssertEqual(WindowsVMBudget.perVMGB(fromVMX: "memsize = \"8192\""), 8)
+    XCTAssertEqual(WindowsVMBudget.defaultPerVMGB, 8)
+  }
+
+  func testPerVMGBRoundsUpAndToleratesWhitespaceAndCase() {
+    // Round UP so we never UNDER-reserve (a 6144 MB / 6 GB VM must not read as 5).
+    XCTAssertEqual(WindowsVMBudget.perVMGB(fromVMX: "memsize = \"6144\""), 6)
+    XCTAssertEqual(WindowsVMBudget.perVMGB(fromVMX: "memsize = \"6145\""), 7)  // 6.0009 GB -> 7
+    XCTAssertEqual(WindowsVMBudget.perVMGB(fromVMX: "   MemSize=\"4096\"  "), 4)
+  }
+
+  func testPerVMGBReturnsNilWhenAbsentOrUnparseable() {
+    XCTAssertNil(WindowsVMBudget.perVMGB(fromVMX: "numvcpus = \"4\""))
+    XCTAssertNil(WindowsVMBudget.perVMGB(fromVMX: "memsize = \"\""))
+    XCTAssertNil(WindowsVMBudget.perVMGB(fromVMX: "memsize = \"lots\""))
+    XCTAssertNil(WindowsVMBudget.perVMGB(fromVMX: "memsize = \"0\""))
+  }
 }

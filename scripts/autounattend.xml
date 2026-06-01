@@ -8,7 +8,8 @@
     - wipes disk 0 and lays down a UEFI/GPT layout (EFI + MSR + Windows),
     - installs the "Windows 11 Pro" Arm64 edition from the multi-edition ISO,
     - creates a local admin `runner` with auto-login and skips all OOBE,
-    - runs bootstrap.ps1 on first logon (OpenSSH + the win-arm64 runner agent).
+    - runs bootstrap.ps1 on first logon (VMware Tools + the win-arm64 runner
+      agent + the MactionsRunOnce task — headless/outbound, no inbound SSH).
 
   IMPORTANT — THROWAWAY ONLY:
     - The password below is a well-known throwaway value. This VM is destroyed
@@ -206,7 +207,7 @@
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
           <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = if (Test-Path 'C:\setup\bootstrap.ps1') { 'C:\setup\bootstrap.ps1' } else { Get-PSDrive -PSProvider FileSystem | ForEach-Object { Join-Path $_.Root 'setup\bootstrap.ps1' } | Where-Object { Test-Path $_ } | Select-Object -First 1 }; if ($s) { &amp; $s } else { Write-Host 'bootstrap.ps1 not found on any drive'; exit 1 }"</CommandLine>
-          <Description>Locate + run bootstrap.ps1 from the unattend media (OpenSSH + win-arm64 runner agent)</Description>
+          <Description>Locate + run bootstrap.ps1 from the unattend media (VMware Tools + win-arm64 runner agent + MactionsRunOnce task)</Description>
         </SynchronousCommand>
       </FirstLogonCommands>
     </component>

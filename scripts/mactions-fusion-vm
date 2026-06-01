@@ -120,8 +120,12 @@ cmd_base_status() {
   local base="${1:-win11-runner-base}"
   local vmx; vmx="$(base_vmx "$base")"
   if [[ ! -f "$vmx" ]]; then echo "missing"; return; fi
-  if vmrun_list_contains "$vmx"; then echo "in-use"; return; fi
+  # Check the snapshot BEFORE power state: a snapshot-less base that happens to be
+  # powered on (e.g. an interrupted provisioning session) is more actionably
+  # "no-snapshot" than "in-use". Either way the Swift gate only clones from
+  # "stopped" (built + idle), so this never widens what's clonable.
   if ! base_has_snapshot "$vmx"; then echo "no-snapshot"; return; fi
+  if vmrun_list_contains "$vmx"; then echo "in-use"; return; fi
   echo "stopped"
 }
 
@@ -173,6 +177,12 @@ cmd_start() {
   [[ -n "$clone" ]] || die "usage: start <clone-name>"
   local vmx; vmx="$(clone_vmx "$clone")"
   [[ -f "$vmx" ]] || die "clone vmx not found: $vmx"
+  # The provider always injects config.iso (the wired sata0:0 CD) BEFORE start, so
+  # in the intended clone -> inject -> start order it's present. If start is called
+  # out of order, fail loudly here rather than booting a clone with no JIT (which
+  # would just run the no-jitconfig power-off branch and do no work).
+  [[ -f "$(clone_dir "$clone")/config.iso" ]] \
+    || die "config.iso not injected for $clone — copy the per-job config ISO into $(clone_dir "$clone") before start"
   if vmrun_list_contains "$vmx"; then
     note "already running: $clone"
     return 0

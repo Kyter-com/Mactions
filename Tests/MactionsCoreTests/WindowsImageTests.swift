@@ -188,4 +188,67 @@ final class WindowsImageTests: XCTestCase {
     XCTAssertEqual(file.deletingLastPathComponent().path, HostCleanup.mactionsRoot().path)
     XCTAssertFalse(file.path.contains("/runs/"))
   }
+
+  // MARK: GA-selection allowlist parity (Swift <-> the prepare-windows-image script)
+
+  /// The GA-major allowlist + the non-base title-substring excludes are hand-
+  /// maintained in BOTH `WindowsImage` (Swift) and `scripts/prepare-windows-image`
+  /// (Python). They MUST stay identical or the app's update nudge and the script's
+  /// actual image selection silently disagree (one builds/accepts a major the
+  /// other rejects). This is the drift guard the bump-one-forget-the-other failure
+  /// mode needs — same spirit as `testEveryConverterFormulaIsADistinctRealHomebrewArg`.
+  func testGAAllowlistAndExcludesMatchThePrepareScript() {
+    // #filePath is the absolute compile-time path, so this resolves regardless of cwd.
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()  // Tests/MactionsCoreTests
+      .deletingLastPathComponent()  // Tests
+      .deletingLastPathComponent()  // repo root
+    let scriptURL = repoRoot.appendingPathComponent("scripts/prepare-windows-image")
+    guard let script = try? String(contentsOf: scriptURL, encoding: .utf8) else {
+      return XCTFail("could not read \(scriptURL.path) to check GA-allowlist parity")
+    }
+
+    // ALLOWED_MAJORS = {22000, 22621, ...} — one line; pull the ints between { }.
+    guard
+      let majorsLine = script.split(separator: "\n").first(where: {
+        $0.contains("ALLOWED_MAJORS") && $0.contains("{")
+      }),
+      let open = majorsLine.firstIndex(of: "{"),
+      let close = majorsLine.firstIndex(of: "}")
+    else {
+      return XCTFail("couldn't locate ALLOWED_MAJORS = {…} in prepare-windows-image")
+    }
+    let scriptMajors = Set(
+      majorsLine[majorsLine.index(after: open)..<close]
+        .split(separator: ",")
+        .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) })
+    XCTAssertEqual(
+      scriptMajors, WindowsImage.knownGAMajors,
+      "knownGAMajors drifted from the script's ALLOWED_MAJORS — bump BOTH together")
+
+    // EXCLUDE = ( "insider", …, "update for windows 11 (" ) — spans lines, and one
+    // entry contains a '(', so scan the quoted strings between EXCLUDE=( and the
+    // first ')' (no ')' appears inside the strings).
+    guard let exStart = script.range(of: "EXCLUDE = (") else {
+      return XCTFail("couldn't locate EXCLUDE = (…) in prepare-windows-image")
+    }
+    let afterExclude = script[exStart.upperBound...]
+    guard let exEnd = afterExclude.firstIndex(of: ")") else {
+      return XCTFail("unterminated EXCLUDE tuple in prepare-windows-image")
+    }
+    var scriptExcludes: [String] = []
+    var inString = false
+    var current = ""
+    for ch in afterExclude[..<exEnd] {
+      if ch == "\"" {
+        if inString { scriptExcludes.append(current); current = "" }
+        inString.toggle()
+      } else if inString {
+        current.append(ch)
+      }
+    }
+    XCTAssertEqual(
+      Set(scriptExcludes), Set(WindowsImage.nonBaseTitleSubstrings),
+      "nonBaseTitleSubstrings drifted from the script's EXCLUDE — bump BOTH together")
+  }
 }

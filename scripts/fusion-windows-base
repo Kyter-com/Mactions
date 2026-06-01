@@ -22,7 +22,9 @@
 #   5. Disconnect the install cdroms + snapshot "base-provisioned" (the
 #      linked-clone parent the per-job loop + mactions-fusion-vm clone from).
 #
-# Safe to re-run: a prior base VM of the same name is stopped + deleted first.
+# Safe to re-run: a prior base VM of the same name is BACKED UP first and only
+# discarded once the new base is provisioned + snapshotted — a failed rebuild
+# restores the previous base instead of leaving none.
 
 set -euo pipefail
 
@@ -78,23 +80,55 @@ vmx_set() {
   mv "$tmp" "$vmx"
 }
 
-# --- wipe any prior base of this name (idempotent rebuild) --------------------
+# --- back up any prior base of this name (ATOMIC-ish rebuild) -----------------
+# The prior wipe destroyed the old base UPFRONT, so any downstream failure (disk
+# create, never-booted, install timeout, missing sentinel) left the operator with
+# NO working base until a full ~25-40 min rebuild succeeded. Instead, MOVE the old
+# base's files into a backup dir and only delete that backup AFTER the new base's
+# snapshot verifies. On any failure an EXIT trap restores the backup, so a flaky
+# rebuild can't lose a good base.
+#
+# We move (not deleteVM) the base's flat name-prefixed files: the base lives flat
+# in $FUSION_DIR, and `vmrun deleteVM` removes the .vmx's whole CONTAINING dir —
+# here $FUSION_DIR itself — which would nuke mactions-* clone subdirs beside it.
+# A same-name move (and same-name restore) preserves the vmx<->vmdk<->snapshot
+# references intact.
 mkdir -p "$FUSION_DIR"
+
+# Glob set for the base's own flat files (NOT the dir, NOT mactions-* clones).
+base_files() {
+  printf '%s\n' \
+    "${FUSION_DIR}/${NAME}".vmx "${FUSION_DIR}/${NAME}".vmdk \
+    "${FUSION_DIR}/${NAME}"-*.vmdk "${FUSION_DIR}/${NAME}".nvram \
+    "${FUSION_DIR}/${NAME}".vmsd "${FUSION_DIR}/${NAME}".vmxf \
+    "${FUSION_DIR}/${NAME}"*.vmsn "${FUSION_DIR}/${NAME}"*.scoreboard
+}
+remove_base_files() { rm -f $(base_files) 2>/dev/null || true; }
+
+BACKUP_DIR=""
+restore_backup() {
+  [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]] || return 0
+  echo "==> Rebuild failed — restoring the previous base VM '$NAME'" >&2
+  remove_base_files                                   # clear any half-built new files
+  mv "$BACKUP_DIR"/* "$FUSION_DIR"/ 2>/dev/null || true
+  rm -rf "$BACKUP_DIR"; BACKUP_DIR=""
+}
+# Restore the prior base on ANY non-zero exit (die, set -e abort, signal) once the
+# backup exists. Success deletes the backup explicitly + exits 0 → no restore.
+on_exit() { local rc=$?; if [[ $rc -ne 0 ]]; then restore_backup; fi; }
+trap on_exit EXIT
+
 if [[ -f "$VMX" ]]; then
-  echo "==> Removing prior base VM '$NAME'" >&2
+  echo "==> Backing up prior base VM '$NAME' before rebuild (restored if the rebuild fails)" >&2
   vmrun_list_contains "$VMX" && { "$VMRUN" -T fusion stop "$VMX" hard >/dev/null 2>&1 || true; }
+  BACKUP_DIR="${FUSION_DIR}/.${NAME}.bak.$$"
+  rm -rf "$BACKUP_DIR"; mkdir -p "$BACKUP_DIR"
+  for f in $(base_files); do
+    [[ -e "$f" ]] && mv "$f" "$BACKUP_DIR"/ 2>/dev/null || true
+  done
 fi
-# Clear the base's flat files BY HAND — do NOT `vmrun deleteVM` the base. The base
-# lives flat in $FUSION_DIR, and deleteVM removes the .vmx's whole CONTAINING dir,
-# which here is $FUSION_DIR itself — nuking the dir (so disk creation then fails
-# "file not found") AND any mactions-* clone subdirs sitting beside it. rm of the
-# name-prefixed files + VMware's per-dir runtime files leaves the dir + clones
-# intact; the trailing mkdir is belt-and-suspenders.
-rm -f "${FUSION_DIR}/${NAME}".vmx "${FUSION_DIR}/${NAME}".vmdk \
-      "${FUSION_DIR}/${NAME}"-*.vmdk "${FUSION_DIR}/${NAME}".nvram \
-      "${FUSION_DIR}/${NAME}".vmsd "${FUSION_DIR}/${NAME}".vmxf \
-      "${FUSION_DIR}/${NAME}"*.vmsn "${FUSION_DIR}/${NAME}"*.scoreboard \
-      "${FUSION_DIR}"/vmware*.log "${FUSION_DIR}"/mksSandbox*.log 2>/dev/null || true
+# VMware's per-dir runtime logs aren't part of the base — just drop them.
+rm -f "${FUSION_DIR}"/vmware*.log "${FUSION_DIR}"/mksSandbox*.log 2>/dev/null || true
 rm -rf "${FUSION_DIR}/caches" 2>/dev/null || true
 mkdir -p "$FUSION_DIR"
 
@@ -183,9 +217,10 @@ echo "    power-off removes it from \`vmrun list\`. Hard timeout: $((INSTALL_TIM
 # creates this sentinel as its LAST step before shutting down, so seeing it means
 # the install + agent + Tools + MactionsRunOnce task genuinely completed — not
 # that Setup merely crashed and powered off. We poll for it via VMware Tools
-# guest-ops (which come up mid-bootstrap once Tools installs); bootstrap's 30s
-# shutdown delay leaves a window to catch it. If the VM powers off WITHOUT the
-# sentinel, we refuse to snapshot a broken base.
+# guest-ops (which come up mid-bootstrap once Tools installs); bootstrap's 60s
+# shutdown delay + this 10s poll cadence leave ~6 attempts to catch it, so one
+# slow/failed guest-ops call can't false-negative. If the VM powers off WITHOUT
+# the sentinel, we refuse to snapshot a broken base.
 GUEST_USER="runner"
 GUEST_PW="${MACTIONS_GUEST_PW:-P@ssw0rd-throwaway}"   # matches autounattend.xml (throwaway)
 SENTINEL='C:\actions-runner\.mactions-provisioned'
@@ -213,7 +248,10 @@ while vmrun_list_contains "$VMX"; do
   if [[ $((NOW - LAST)) -ge 30 ]]; then
     printf '    [%4ds] still running (provisioned=%s)...\n' "$ELAPSED" "$PROVISIONED"; LAST="$NOW"
   fi
-  sleep 15
+  # 10s cadence (was 15) so bootstrap's 60s pre-shutdown window gives ~6 sentinel
+  # polls — one slow/failed guest-ops call then can't false-negative and make us
+  # discard a genuinely-provisioned base.
+  sleep 10
 done
 
 if [[ $PROVISIONED -eq 0 ]]; then
@@ -234,6 +272,16 @@ echo "==> Snapshotting the provisioned base as '$SNAPSHOT' (the linked-clone par
 "$VMRUN" -T fusion snapshot "$VMX" "$SNAPSHOT" >/dev/null
 "$VMRUN" -T fusion listSnapshots "$VMX" 2>/dev/null | grep -Fxq -- "$SNAPSHOT" \
   || die "snapshot '$SNAPSHOT' was not created — cannot linked-clone from this base"
+
+# New base verified end to end (provisioned + snapshotted) — discard the backup of
+# the prior base. DISARM the restore (clear BACKUP_DIR) BEFORE the rm: if the rm
+# somehow returned non-zero under set -e, the EXIT trap would otherwise fire with
+# BACKUP_DIR still armed and restore the OLD base over the just-verified good new
+# one. With BACKUP_DIR cleared first, restore_backup is a guaranteed no-op.
+if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]]; then
+  _discard="$BACKUP_DIR"; BACKUP_DIR=""
+  rm -rf "$_discard" 2>/dev/null || true
+fi
 
 echo
 echo "==> Base image ready:"

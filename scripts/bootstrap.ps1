@@ -175,12 +175,15 @@ try {
 # Inno's /VERYSILENT). There's no "latest" URL alias, so the version is pinned
 # and must be bumped manually (check https://www.7-zip.org/download.html).
 # Non-fatal: the try/catch lets the runner come up without it.
+$SevenZipUrl = 'https://www.7-zip.org/a/7z2601-arm64.exe'   # MANUAL pin (no "latest" alias) — bump at https://www.7-zip.org/download.html
 Write-Host 'Installing 7-Zip (ARM64)...'
 try {
-  Install-Exe -Url 'https://www.7-zip.org/a/7z2601-arm64.exe' -LocalName '7z-arm64.exe' `
-    -Args @('/S')
+  Install-Exe -Url $SevenZipUrl -LocalName '7z-arm64.exe' -Args @('/S')
 } catch {
-  Write-Warning "7-Zip install failed (continuing): $_"
+  # Non-fatal: the runner comes up without 7-Zip. The pinned version can 404 once
+  # 7-Zip ships a newer ARM64 build — say so explicitly so it's obvious the base
+  # is missing 7-Zip (and which URL to bump) rather than a silent omission.
+  Write-Warning "7-Zip install skipped (continuing without it): $SevenZipUrl failed - $_. If this is a 404, bump the pinned version in bootstrap.ps1."
 }
 
 # --- 1. win-arm64 actions-runner agent --------------------------------------
@@ -270,7 +273,18 @@ function Find-Jit {
   $roots += (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue).Root
   foreach ($r in ($roots | Select-Object -Unique)) {
     $p = Join-Path ($r.TrimEnd("\") + "\") $known
-    if (Test-Path $p) { return (Get-Content -Raw -LiteralPath $p).Trim() }
+    if (Test-Path $p) {
+      # Guard the read: an empty/zero-byte jitconfig makes Get-Content -Raw return
+      # $null in PS 5.1, and .Trim() on $null is a TERMINATING error that would
+      # abort run-job.ps1 before EITHER shutdown branch runs - wedging the guest
+      # powered-on for the full jobTimeout. Treat empty/whitespace (or a read
+      # error) as "no JIT here" and keep scanning, so a broken config disc
+      # degrades to the fast power-off path instead.
+      try {
+        $c = Get-Content -Raw -LiteralPath $p -ErrorAction Stop
+        if ($c) { $t = $c.Trim(); if ($t) { return $t } }
+      } catch { }
+    }
   }
   return $null
 }
@@ -335,7 +349,9 @@ Write-Host 'OUTBOUND, runs one job, and the VM powers itself off.'
 try { Stop-Transcript | Out-Null } catch { }
 New-Item -ItemType File -Force -Path (Join-Path $RunnerRoot '.mactions-provisioned') | Out-Null
 # Auto-power-off so fusion-windows-base detects completion via guest shutdown
-# (it polls `vmrun list`) without a human in the loop. The 30s delay lets the
+# (it polls `vmrun list`) without a human in the loop. The 60s delay lets the
 # FirstLogonCommands wrapper mark Setup complete + flush post-FLC work before the
-# VM goes down.
-shutdown /s /t 30 /c "Mactions base image bootstrap complete"
+# VM goes down — and, with the host polling the sentinel every ~10s via guest-ops,
+# leaves a wide enough window (~6 polls) that one slow/failed guest-ops call can't
+# false-negative and make the host discard a genuinely-provisioned base.
+shutdown /s /t 60 /c "Mactions base image bootstrap complete"
