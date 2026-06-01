@@ -46,6 +46,13 @@ ISO=""
 DISK_GB=64
 RAM_MB=8192
 CPUS=4
+# UUP dump's `updates` flag — when 1 the latest cumulative is FOLDED into the
+# ISO's install.wim, which gives a fully patched install but produces a
+# MIXED-BUILD bootloader (boot files from the RTM base + kernel from the
+# cumulative). That mismatch can hang Microsoft's `bootmgr` infinitely under
+# QEMU. `updates=0` produces a clean GA RTM ISO — slightly older patch level
+# but a boot chain that's internally consistent. Default flipped to 0 here.
+UPDATES=0
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
@@ -58,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     --disk) DISK_GB="$2"; shift 2 ;;
     --ram)  RAM_MB="$2"; shift 2 ;;
     --cpus) CPUS="$2"; shift 2 ;;
+    --updates) UPDATES="$2"; shift 2 ;;  # 0 = clean RTM, 1 = include latest cumulative
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 2 ;;
   esac
@@ -66,7 +74,15 @@ done
 die() { echo "error: $*" >&2; exit 1; }
 
 # --- Detect the hypervisor CLI ----------------------------------------------
+# Free-first: QEMU + swtpm + EDK2 firmware (fully headless, no Aqua login
+# session) is the preferred path. UTM is the free fallback that needs a GUI
+# session. Parallels is honored if already installed (paid; never recommended
+# for install).
 detect_tool() {
+  local QEMU_FW="/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
+  if command -v qemu-system-aarch64 >/dev/null 2>&1 \
+     && command -v swtpm >/dev/null 2>&1 \
+     && [[ -f "$QEMU_FW" ]]; then echo qemu; return; fi
   if command -v prlctl >/dev/null 2>&1; then echo parallels; return; fi
   if [[ -x /Applications/UTM.app/Contents/MacOS/utmctl ]]; then echo utm; return; fi
   echo none
@@ -75,13 +91,15 @@ detect_tool() {
 
 if [[ "$TOOL" == "none" ]]; then
   cat <<'EOF' >&2
-No Windows-capable hypervisor CLI found.
+No Windows-capable hypervisor backend found.
 
-Install ONE of (Parallels is recommended for an unattended host — see AGENTS.md):
-  brew install --cask parallels                    # Parallels Desktop (Pro/Business for headless + prlctl)
-  brew install --cask parallels-virtualization-sdk # prlctl tooling
-  -- or the free fallback --
+Install ONE of (the free QEMU stack is the recommended default — see AGENTS.md):
+  brew install qemu swtpm                          # QEMU + swtpm (fully headless, no GUI session required)
+  -- or --
   brew install --cask utm                          # UTM (utmctl bundled; needs a GUI login session)
+  -- or --
+  brew install --cask parallels                    # Parallels Desktop (paid; Pro/Business for headless)
+  brew install --cask parallels-virtualization-sdk # prlctl tooling
 
 Then re-run this script.
 EOF
@@ -220,7 +238,7 @@ PY
   # api host returns 400 UNSUPPORTED_COMBINATION for this query. edition stays
   # lowercase ('professional'); that's what the www ZIP route accepts.
   uup_curl "$workdir/uup.zip" \
-    "$UUP_WWW/get.php?id=$uuid&pack=en-us&edition=professional&arch=arm64&autodl=2&updates=1" \
+    "$UUP_WWW/get.php?id=$uuid&pack=en-us&edition=professional&arch=arm64&autodl=2&updates=$UPDATES" \
     || die "couldn't download the UUP package for $uuid after retries (host $UUP_WWW)."
   # Guard: a JSON error/manifest body is not a ZIP — fail loudly before unzip.
   unzip -tq "$workdir/uup.zip" >/dev/null 2>&1 \
@@ -247,12 +265,17 @@ else
   RECORDED_BUILD="$(printf '%s' "$(basename "$ISO")" | grep -Eo '[0-9]{5}\.[0-9]+' | head -n1 || true)"
 fi
 
-# --- Build the autounattend ISO ---------------------------------------------
+# --- Build the autounattend media -------------------------------------------
 # Windows Setup auto-reads autounattend.xml from removable media. We also place
 # bootstrap.ps1 under \setup; autounattend.xml's FirstLogonCommands SCANS every
 # drive root for \setup\bootstrap.ps1 (the unattend media's drive letter isn't
 # predictable) and runs the first match — so provisioning finds it regardless of
-# whether the ISO mounts as D:, E:, …
+# whether the media mounts as D:, E:, …
+#
+# We build BOTH:
+#   - an ISO (UTM/Parallels backends attach it as a second CD)
+#   - a FAT-formatted USB flash drive image (QEMU backend; two CDs on one
+#     virtio-scsi controller deadlocks cdboot.efi — see qemu-windows-base.)
 build_unattend_iso() {
   local staging out
   staging="$(mktemp -d)"
@@ -260,22 +283,49 @@ build_unattend_iso() {
   mkdir -p "$staging/setup"
   cp "$HERE/autounattend.xml" "$staging/autounattend.xml"
   cp "$HERE/bootstrap.ps1"    "$staging/setup/bootstrap.ps1"
-  # hdiutil ships with macOS; produce a Joliet/UDF ISO Setup can read.
   hdiutil makehybrid -iso -joliet -default-volume-name UNATTEND \
     -o "$out" "$staging" >/dev/null
   rm -rf "$staging"
   echo "$out"
 }
 
+build_unattend_fat() {
+  local out tmp_dmg mnt
+  out="${MACTIONS_ROOT}/unattend.img"
+  mkdir -p "$MACTIONS_ROOT"
+  rm -f "$out"
+  # hdiutil makes the .dmg; we rename to .img. 4 MB is plenty for the two
+  # small files + FAT12 overhead; volume name MACTIONS is what the in-guest
+  # run-job.ps1 also looks for as the per-clone JIT volume label.
+  tmp_dmg="$(mktemp -t mactions-unattend.XXXXXX.dmg)"
+  rm -f "$tmp_dmg"
+  hdiutil create -size 4m -fs MS-DOS -volname MACTIONS -layout NONE \
+    "${tmp_dmg%.dmg}" >/dev/null
+  mv "$tmp_dmg" "$out"
+  mnt="$(mktemp -d)"
+  hdiutil attach -nobrowse -mountpoint "$mnt" "$out" >/dev/null
+  mkdir -p "$mnt/setup"
+  cp "$HERE/autounattend.xml" "$mnt/autounattend.xml"
+  cp "$HERE/bootstrap.ps1"    "$mnt/setup/bootstrap.ps1"
+  sync
+  hdiutil detach "$mnt" >/dev/null 2>&1
+  rmdir "$mnt"
+  echo "$out"
+}
+
+MACTIONS_ROOT="${HOME}/.mactions"
 echo "==> Building unattended-install ISO (autounattend.xml + bootstrap.ps1)"
 UNATTEND_ISO="$(build_unattend_iso)"
 echo "    $UNATTEND_ISO"
+echo "==> Building unattend FAT image (USB flash drive for the QEMU backend)"
+UNATTEND_FAT="$(build_unattend_fat)"
+echo "    $UNATTEND_FAT"
 
 # Record the build id this base image is built from so the app's auto-update
 # check (WindowsImage.recordedBaseImageBuild) can compare it to the latest
 # available and nudge a rebuild when Microsoft ships a newer Win11. Lives at the
-# mactions root (NOT under runs/, which is swept every go-online).
-MACTIONS_ROOT="${HOME}/.mactions"
+# mactions root (NOT under runs/, which is swept every go-online). MACTIONS_ROOT
+# is already set above for the unattend FAT build.
 if [[ -n "${RECORDED_BUILD:-}" ]]; then
   mkdir -p "$MACTIONS_ROOT"
   printf '%s\n' "$RECORDED_BUILD" > "$MACTIONS_ROOT/windows-base.build"
@@ -291,6 +341,22 @@ echo "Disk/RAM/CPU: ${DISK_GB}GB / ${RAM_MB}MB / ${CPUS}"
 echo
 
 case "$TOOL" in
+  qemu)
+    # QEMU + swtpm + edk2: fully headless, no manual GUI step. The unattend FAT
+    # image is already at the canonical path (build_unattend_fat writes there).
+    # We just stash the Win11 ISO at the canonical path the helper looks for.
+    BASE_DIR="${MACTIONS_ROOT}/windows-base"
+    mkdir -p "$BASE_DIR"
+    echo "==> Stashing Win11 ISO at the canonical path for the QEMU base-build helper"
+    cp -f "$ISO" "$MACTIONS_ROOT/win11-base.iso"
+    echo "==> Running QEMU headless base-image build (autounattend → bootstrap → auto-shutdown)"
+    DISPLAY_MODE="${DISPLAY_MODE:-none}" "$HERE/qemu-windows-base"
+    echo
+    echo "==> QEMU base build done. Base lives at $BASE_DIR/ (base.qcow2 + efi_vars.fd"
+    echo "    + tpm-state/). Per job the runtime helper (mactions-qemu-vm) clones it"
+    echo "    into ~/.mactions/windows-clones/<id>/ and attaches a config.iso CD."
+    ;;
+
   parallels)
     # Parallels CAN create + drive a VM headlessly from the CLI.
     echo "==> Creating Parallels Win11-ARM VM '$NAME'"

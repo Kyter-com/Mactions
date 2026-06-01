@@ -74,6 +74,50 @@ final class WindowsVMProviderTests: XCTestCase {
       .attachCommands([["set", "mactions-abc", "--device-set", "cdrom0", "--image", "/tmp/c.iso", "--connect"]]))
   }
 
+  // MARK: QEMU (mactions-qemu-vm helper) verb shapes + injection
+
+  func testQEMUCLIVerbShapes() {
+    // Every verb is `<helper> <verb> <clone>` (clone takes both base + clone).
+    // Shape stability is what unit tests pin — the helper itself owns the
+    // multi-process QEMU + swtpm orchestration the verbs trigger.
+    let cli = QEMUCLI(executable: "/repo/scripts/mactions-qemu-vm",
+                     clonesDir: "/state/clones")
+    XCTAssertEqual(cli.cloneArgs(base: "win11-runner-base", clone: "mactions-abc"),
+      ["clone", "win11-runner-base", "mactions-abc"])
+    XCTAssertEqual(cli.startArgs(clone: "mactions-abc"), ["start", "mactions-abc"])
+    XCTAssertEqual(cli.stopArgs(clone: "mactions-abc"), ["stop", "mactions-abc"])
+    XCTAssertEqual(cli.forceStopArgs(clone: "mactions-abc"), ["stop", "mactions-abc"])
+    XCTAssertEqual(cli.deleteArgs(clone: "mactions-abc"), ["delete", "mactions-abc"])
+    XCTAssertEqual(cli.statusArgs(clone: "mactions-abc"), ["status", "mactions-abc"])
+    XCTAssertTrue(cli.displayName.contains("QEMU"))
+  }
+
+  func testQEMUInjectionCopiesConfigFileIntoCloneDir() {
+    // QEMU's helper attaches <clone-dir>/config.iso as a real -cdrom on start,
+    // so injection is a plain copy to that path. No pre-existence guard needed
+    // (the helper creates the clone dir before injection happens).
+    let cli = QEMUCLI(executable: "/repo/scripts/mactions-qemu-vm",
+                     clonesDir: "/state/clones")
+    XCTAssertEqual(cli.cloneBundlePath(clone: "mactions-abc"), "/state/clones/mactions-abc")
+    XCTAssertEqual(
+      cli.injectionPlan(clone: "mactions-abc", clonePath: nil, configISO: "/tmp/c.iso"),
+      .copyConfigFile(target: "/state/clones/mactions-abc/config.iso"))
+    XCTAssertEqual(
+      cli.injectionPlan(clone: "mactions-abc", clonePath: "/elsewhere", configISO: "/tmp/c.iso"),
+      .copyConfigFile(target: "/elsewhere/config.iso"))
+  }
+
+  func testQEMUStatusParserMapsHelperOutputs() {
+    // The helper prints exactly "running" or "stopped" — assert both parse,
+    // and that the substring match doesn't fire false positives on common
+    // synonyms.
+    let cli = QEMUCLI(executable: "/x", clonesDir: "/y")
+    XCTAssertTrue(cli.parseIsStopped(from: "stopped"))
+    XCTAssertTrue(cli.parseIsStopped(from: "stopped\n"))
+    XCTAssertFalse(cli.parseIsStopped(from: "running"))
+    XCTAssertFalse(cli.parseIsStopped(from: ""))
+  }
+
   // MARK: Power-state completion classifier
 
   func testPhaseClassifierRequiresRunningBeforeStopped() {
@@ -146,18 +190,26 @@ final class WindowsVMProviderTests: XCTestCase {
     }
   }
 
-  func testDetectFreeFirstCLIPrefersUTMOrIsNilWhenNoneInstalled() {
+  func testDetectFreeFirstCLIPrefersQEMUOverUTMOverParallels() {
     let cli = WindowsVMProviderFactory.detectFreeFirstCLI()
-    if let cli {
-      XCTAssertTrue(
-        FileManager.default.isExecutableFile(atPath: cli.executable),
-        "free-first CLI must point at a real executable")
-      let utmctl = "/Applications/UTM.app/Contents/MacOS/utmctl"
-      if FileManager.default.isExecutableFile(atPath: utmctl) {
-        XCTAssertTrue(cli is UTMCLI, "UTM present -> must prefer the free UTM backend")
-      }
+    guard let cli else { return }  // None installed — vacuously satisfied.
+    XCTAssertTrue(
+      FileManager.default.isExecutableFile(atPath: cli.executable),
+      "free-first CLI must point at a real executable")
+    // Free-first ordering: QEMU (fully headless, no Aqua session) > UTM (free
+    // but needs a GUI session) > Parallels (paid). We test which one was picked
+    // against what's actually installed on the host.
+    let qemuAvailable =
+      WindowsVMProviderFactory.qemuHelperPath != nil
+      && FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/qemu-system-aarch64")
+    let utmAvailable = FileManager.default.isExecutableFile(
+      atPath: "/Applications/UTM.app/Contents/MacOS/utmctl")
+    if qemuAvailable {
+      XCTAssertTrue(cli is QEMUCLI, "QEMU present -> must prefer it (fully headless, free)")
+    } else if utmAvailable {
+      XCTAssertTrue(cli is UTMCLI, "no QEMU, UTM present -> must prefer UTM (free)")
     } else {
-      XCTAssertNil(cli)
+      XCTAssertTrue(cli is ParallelsCLI, "only Parallels installed -> must pick it")
     }
   }
 

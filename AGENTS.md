@@ -22,7 +22,7 @@ Proof-of-concept. Honest accounting:
 - ✅ **Local-process provider**: runs the actions-runner agent directly on the Mac (no VM isolation, but each run is an isolated clone that's wiped on exit — see Host hygiene). This is the runnable MVP path.
 - ✅ **SwiftUI menubar app**: status, config, online/offline, live runner list; deregisters on quit.
 - 🧪 **Tart provider** (VM isolation): implemented against the `tart` CLI but **experimental** — depends on a prepared base image + SSH bootstrap (see Providers).
-- 🧪 **Windows provider** (`WindowsVMProvider`): implemented + unit-tested, but **experimental and not yet live-verified end to end**. **Opt-in only** — OFF by default and gated behind a **"Set up Windows runner"** button; nothing heavy (ISO download, VM build) ever happens automatically. Clones a throwaway Win11-ARM VM per job (**UTM `utmctl` — free/OSS, the default**; Parallels `prlctl` used only if already installed), injects a per-clone config ISO so the guest registers the runner **outbound** + powers itself off (headless — no inbound SSH), and destroys the clone on exit. Prerequisites are **free-first and installed by the app**: `WindowsPreflight` detects what's present (Homebrew, hypervisor, ISO-converter tools) and a button installs the *missing free* deps via Homebrew (never Parallels, never Homebrew itself). The one-time base image is built by `scripts/prepare-windows-image`, which **auto-downloads the latest Win11 ARM64 ISO** (UUP dump) when you don't supply one, and an **auto-update** check (`WindowsImage`) tells you when a newer Windows build is out. See [Windows support](#windows-support).
+- 🧪 **Windows provider** (`WindowsVMProvider`): implemented + unit-tested, plus a NEW free-first **QEMU + swtpm + edk2 (AArch64 UEFI)** backend (`QEMUCLI`) that's fully headless, no Aqua login session required (vs. UTM's ScriptingBridge dep). **Opt-in only** — OFF by default and gated behind a **"Set up Windows runner"** button; nothing heavy (ISO download, VM build) ever happens automatically. Clones a throwaway Win11-ARM VM per job, injects per-clone JIT (real `-cdrom` attach on QEMU; CLI attach on Parallels; in-bundle-disk overwrite on UTM), boots headless so the guest registers the runner **outbound** + powers itself off, and destroys the clone on exit. Backends in free-first order: **QEMU (truly headless, the default)** → UTM (free, needs a GUI session) → Parallels (paid, only if already present). Prerequisites are **free-first and installed by the app**: `WindowsPreflight` detects what's present (Homebrew, hypervisor stack, ISO-converter tools, swtpm, edk2 firmware) and a button installs the *missing free* deps via Homebrew (`brew install qemu swtpm` for the new default; never Parallels). The one-time base image is built **fully unattended** by `scripts/qemu-windows-base` (or the legacy UTM/Parallels branches of `prepare-windows-image`), with an **auto-update** check (`WindowsImage`) for newer Windows builds. See [Windows support](#windows-support).
 
 ## Architecture
 
@@ -40,6 +40,16 @@ MactionsCore (library, pure Foundation)        Mactions (executable, SwiftUI/App
   WindowsPreflight free-first prereq detect + brew installer (pure plan)
   WindowsImage    UUP-dump latest-ISO resolve + build-id auto-update
   Cleanup, Shell  host hygiene + process helper
+
+  WindowsVMCLI impls (free-first):
+    QEMUCLI       fully-headless QEMU + swtpm + edk2 (driven by helper script)
+    UTMCLI        free, but `utmctl` needs an Aqua login session
+    ParallelsCLI  paid, only honored if already installed
+scripts/                                       (driven by AppState + provider)
+  prepare-windows-image     UUP-dump → ISO + autounattend ISO + FAT image
+  qemu-windows-base         headless Win11-ARM install via QEMU (new)
+  mactions-qemu-vm          per-clone QEMU+swtpm lifecycle (clone/start/stop/...)
+  autounattend.xml, bootstrap.ps1  unattended Setup + base-image bootstrap
 ```
 
 **The loop** (`RunnerOrchestrator`):
@@ -118,15 +128,31 @@ The provider drives a `WindowsVMCLI` backend (a pure-function abstraction so the
 
 A throwaway VM discards the **entire guest disk** per job — npm cache, `%TEMP%`, registry, the `_work` checkout, profile, everything. There is no Windows equivalent of the local provider's APFS-clone HOME-redirect trick, and none is needed: the only thing that persists is the **pristine base image template**; only ephemeral clones are ever booted. `HostCleanup.purgeStrayWindowsClones()` (called from `sweepOrphans()` on go-online) reaps any `mactions-…` clone a crash left behind, so the host accumulates nothing across crashes either. The clone name carries the `mactions-` prefix, so reaping never touches a non-Mactions VM.
 
-### Backends: UTM vs Parallels (free-first)
+### Backends: QEMU vs UTM vs Parallels (free-first)
 
-The app is **free/OSS-first**, so UTM is the default and the only hypervisor we'll install for you. Parallels is honored if you already have it, never recommended for purchase.
+The app is **free/OSS-first**, and the new default is the headless **QEMU + swtpm + edk2** stack. UTM remains as a runtime option (free but needs a GUI session); Parallels is honored if you already have it, never recommended for purchase.
 
-- **UTM (`utmctl`) — free/OSS, the default.** Free + open-source (QEMU backend), so it's what `WindowsPreflight` installs (`brew install --cask utm`) and what `detectFreeFirstCLI()` prefers. Caveat: `utmctl` uses Apple's ScriptingBridge and **requires an active GUI (Aqua) login session** — it silently fails over SSH or from a pure launchd/headless context. Fine for this interactive foreground app; fragile for an unattended host.
-- **Parallels (`prlctl`) — paid, only if already installed.** The only Microsoft-authorized hypervisor for Win11 ARM on Apple Silicon with full HW acceleration, and the only one with a **true background-service headless mode** plus a complete CLI lifecycle that works **without a GUI login session** — so it's the more robust choice *if you already own a Pro/Business license* (paid, plus Full Disk Access). We **never** install it (it's paid); the free-first picker uses it only when it's the sole backend present.
-- **QEMU+hvf** is the fully-free, no-GUI-dependency DIY path (you build more plumbing yourself); `WindowsPreflight` detects `qemu-system-aarch64` and the recommender lists it as a free fallback, but it is **not yet wired to a `WindowsVMCLI`**, so a QEMU-only host can't run a Windows fleet today.
+- **QEMU + swtpm + edk2 (`QEMUCLI`) — free, fully headless, the default.** Drives a `qemu-system-aarch64` VM directly via the `scripts/mactions-qemu-vm` helper. No Aqua login session required — runs from launchd, an SSH session, anywhere. swtpm is the software TPM 2.0 emulator (Win11 hard-requires TPM); edk2 ARM64 firmware ships with Homebrew's `qemu` formula. Per-clone JIT delivery is a real `-cdrom` attach (cleaner than UTM's in-bundle-overwrite hack). `WindowsPreflight` installs the stack with `brew install qemu swtpm`. The base-image build is fully automated by `scripts/qemu-windows-base` (see [Win11-ARM QEMU boot quirks](#win11-arm-qemu-boot-quirks)).
+- **UTM (`utmctl`) — free, but Aqua-bound.** Open-source (QEMU backend). Caveat: `utmctl` uses Apple's ScriptingBridge and **requires an active GUI login session** — silently fails over SSH or from a pure launchd context. Honored when present (`detectFreeFirstCLI()` falls back to it after QEMU). Base-image build needs a one-time GUI wizard (no `utmctl create` verb).
+- **Parallels (`prlctl`) — paid, only if already installed.** The only Microsoft-authorized hypervisor for Win11 ARM with full HW acceleration + a complete headless CLI. We **never** install it (it's paid); the free-first picker uses it only when it's the sole backend present.
 
-Two pickers exist: `WindowsVMProviderFactory.detectFreeFirstCLI()` (UTM, else an existing Parallels — the app's default) and the older `detectInstalledCLI()` (Parallels, else UTM — robustness-first, kept for reference).
+Pickers: `WindowsVMProviderFactory.detectFreeFirstCLI()` (QEMU → UTM → Parallels) is the default; `detectInstalledCLI()` follows the same order. The QEMU backend's "installed" condition is BOTH the `mactions-qemu-vm` helper being present alongside the binary AND `qemu-system-aarch64` on disk.
+
+### Win11-ARM QEMU boot quirks
+
+Booting the UUP-dump Win11 ARM ISO under stock Homebrew QEMU needs five non-obvious knobs — figured out the hard way (debugged 2026-05-31, see issue #5 for the full investigation log). All five are baked into `scripts/qemu-windows-base` + `scripts/mactions-qemu-vm`.
+
+1. **`-M virt,iommu=smmuv3`** — without SMMU exposure, EDK2's console redirector stays silent past device enumeration and the boot loader's prompt never reaches the serial sink (which we tail for the auto-keypress watchdog, below).
+2. **Auto-keypress sprayer** — Microsoft's `cdboot.efi` prints "Press any key to boot from CD or DVD......" and times out in ~5 s. We daemonize QEMU then spam Enter via QMP `send-key` at 4 Hz for 30 s, guaranteeing the prompt is satisfied even with cache-cold paths.
+3. **Single boot CD on virtio-scsi** — two `scsi-cd` devices on the same `virtio-scsi-pci` controller deadlocks `cdboot.efi` (it stops printing the prompt entirely). The Win11 ISO stays on virtio-scsi; the unattend payload moves to a USB flash image.
+4. **Unattend on USB flash with `bootindex=99`** — a FAT-formatted image attached as `usb-storage,removable=on,bootindex=99` (NOT a CD) on the xhci bus. The high bootindex deprioritizes it in EDK2's boot-order enumeration; with a low bootindex EDK2 tried to PXE/USB-boot from it and broke cdboot in the same way two CDs did. Windows Setup scans removable USB media for `autounattend.xml`, so functionality is identical.
+5. **`virtio-net-pci,romfile=`** — the iPXE option ROM that ships with virtio-net causes EDK2 to attempt PXE boot during BdsDxe and never fall through to cdboot. Disabling the OPROM with `romfile=` fixes it cleanly.
+
+Other details for the QEMU base build:
+- **Homebrew edk2 firmware** (`/opt/homebrew/share/qemu/edk2-aarch64-code.fd` + `edk2-arm-vars.fd`) is the right pair. UTM's bundled EDK2 firmware redirects Microsoft's text-mode output to the framebuffer ONLY, not to serial — so our watchdog can't see "Press any key".
+- **`-cpu host`** (HVF passthrough) works; `-cpu max` works too. The `pauth-impdef=on` property is version-dependent and missing in QEMU 11.0.1 from Homebrew — relying on defaults.
+- **`bootstrap.ps1` ends with `shutdown /s /t 30`** so the headless install path can detect "install complete" purely from guest power-off (no need to scrape logs). Harmless on UTM/Parallels (user previously did this by hand).
+- **The base image lives at `~/.mactions/windows-base/`** as a directory: `base.qcow2` + `efi_vars.fd` + `tpm-state/`. Per-job clones overlay these into `~/.mactions/windows-clones/<id>/`.
 
 ### One-time base image prep (the button / the script)
 

@@ -34,6 +34,74 @@ $RunnerRoot = 'C:\actions-runner'
 
 Write-Host '== Mactions Windows base image bootstrap (outbound/headless) =='
 
+# --- 0. Dev tooling GitHub Actions workflows commonly need -------------------
+# We install these BEFORE the runner agent so a failure here is loud and
+# obvious (the agent install is the cheap fast step). All are silent installs
+# baked into the BASE image once — per-job clones inherit them via the qcow2
+# overlay, so workflows pay no install cost.
+#
+# Tools we install:
+#   - Git for Windows: actions/checkout falls back to a slow REST tarball
+#     download when `git` isn't on PATH. With git installed, checkout uses a
+#     real clone and respects fetch-depth, submodules, LFS, etc.
+#   - 7-Zip: common need for archive actions; also a fast unzip path.
+#
+# Tools the runner agent itself bootstraps on demand (so we DON'T install):
+#   - Node.js (actions/setup-node downloads the right version per .nvmrc)
+#   - .NET (actions/setup-dotnet)
+#   - Python (actions/setup-python)
+#   - PowerShell 7 (Windows ships PS 5.1; actions request PS 7 via the action)
+function Install-Msi {
+  param([Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$LocalName)
+  $tmp = Join-Path $env:TEMP $LocalName
+  if (Test-Path $tmp) { Remove-Item $tmp -Force }
+  Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing
+  $proc = Start-Process msiexec.exe -ArgumentList '/i', $tmp, '/quiet', '/norestart' -Wait -PassThru
+  Remove-Item $tmp -Force
+  if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+    throw "msiexec /i $LocalName failed with exit code $($proc.ExitCode)"
+  }
+}
+function Install-Exe {
+  param([Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$LocalName,
+        [string[]]$Args = @('/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES'))
+  $tmp = Join-Path $env:TEMP $LocalName
+  if (Test-Path $tmp) { Remove-Item $tmp -Force }
+  Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing
+  $proc = Start-Process $tmp -ArgumentList $Args -Wait -PassThru
+  Remove-Item $tmp -Force
+  if ($proc.ExitCode -ne 0) { throw "$LocalName installer failed with exit code $($proc.ExitCode)" }
+}
+
+# Git for Windows (ARM64) — resolve the latest release at build time so we get
+# whatever's current. Inno Setup installer accepts a silent-install RSP file.
+Write-Host 'Installing Git for Windows (ARM64)...'
+try {
+  $gitRel = Invoke-RestMethod 'https://api.github.com/repos/git-for-windows/git/releases/latest' `
+    -Headers @{ 'User-Agent' = 'mactions'; 'Accept' = 'application/vnd.github+json' }
+  $gitAsset = $gitRel.assets |
+    Where-Object { $_.name -match '^Git-.*-arm64\.exe$' } |
+    Select-Object -First 1
+  if (-not $gitAsset) {
+    Write-Warning "No Git-for-Windows ARM64 asset in release $($gitRel.tag_name); skipping Git install."
+  } else {
+    Install-Exe -Url $gitAsset.browser_download_url -LocalName 'git-arm64-setup.exe' `
+      -Args @('/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES','/NOCANCEL','/CLOSEAPPLICATIONS')
+  }
+} catch {
+  Write-Warning "Git install failed (continuing): $_"
+}
+
+# 7-Zip ARM64 — small, fast, useful for many actions. Direct URL is stable.
+Write-Host 'Installing 7-Zip (ARM64)...'
+try {
+  Install-Msi -Url 'https://www.7-zip.org/a/7z2408-arm64.msi' -LocalName '7z-arm64.msi'
+} catch {
+  Write-Warning "7-Zip install failed (continuing): $_"
+}
+
 # --- 1. win-arm64 actions-runner agent --------------------------------------
 # Resolve the LATEST runner release at build time. The agent self-updates at job
 # time anyway, so pinning buys nothing and only risks a 404 on a yanked/aged tag.
@@ -165,6 +233,10 @@ Set-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Syste
 
 Write-Host ''
 Write-Host '== Bootstrap complete. =='
-Write-Host 'Now SHUT THIS VM DOWN; the powered-off VM is your pristine base image.'
 Write-Host 'Per job, the host injects the JIT via a config disc; the runner registers'
 Write-Host 'OUTBOUND, runs one job, and the VM powers itself off.'
+# Auto-power-off so headless build scripts (QEMU) detect completion via guest
+# shutdown without a human in the loop. 30s delay lets the FirstLogonCommands
+# Windows wraps around us mark Setup complete + flush post-FLC work before the
+# VM goes down. Harmless on UTM/Parallels — the user previously did this by hand.
+shutdown /s /t 30 /c "Mactions base image bootstrap complete"
