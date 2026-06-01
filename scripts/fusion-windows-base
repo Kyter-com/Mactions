@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# fusion-windows-base — build a hands-free Win11-ARM base VM under VMware Fusion
+# (vmrun/vmware-vdiskmanager), the PROVEN backend. The free/headless replacement
+# for the QEMU base-build path (stock QEMU can't boot Win11-ARM — see AGENTS.md).
+#
+# Expects the Win11 ISO + the unattend ISO to already exist at the canonical
+# paths (prepare-windows-image builds them and stashes them there — and on the
+# fusion path it remasters the Win11 ISO to a NO-PROMPT boot ISO so there's no
+# "Press any key to boot from CD" keypress). What this script does, hands-free:
+#
+#   1. Author ~/.mactions/fusion/<name>.vmx (firmware=efi, vmxnet3 NIC, an NVMe
+#      data disk, and THREE SATA cdroms: the Win11 no-prompt ISO, the unattend
+#      ISO, and Fusion's bundled VMware Tools ARM64 ISO).
+#   2. Create the NVMe disk with vmware-vdiskmanager.
+#   3. vmrun start <vmx> nogui (headless). The no-prompt ISO boots Setup with no
+#      keypress; autounattend.xml installs Win11 unattended; FirstLogonCommands
+#      runs bootstrap.ps1, which installs VMware Tools (→ vmxnet3 networking),
+#      then the win-arm64 runner agent + the MactionsRunOnce task, then
+#      `shutdown /s` — powering the VM OFF.
+#   4. Poll `vmrun list`. When the VM leaves the running set (guest powered off),
+#      the install+bootstrap is done.
+#   5. Disconnect the install cdroms + snapshot "base-provisioned" (the
+#      linked-clone parent the per-job loop + mactions-fusion-vm clone from).
+#
+# Safe to re-run: a prior base VM of the same name is stopped + deleted first.
+
+set -euo pipefail
+
+# A Finder/login-item-launched .app inherits a launchd PATH without the VMware
+# Fusion CLI dir, so prepend it (+ Homebrew bins). prepare-windows-image already
+# augments PATH before delegating here, but self-fix so this is correct when run
+# directly. ${PATH:-...} keeps it safe under set -u.
+VMWARE_LIB="/Applications/VMware Fusion.app/Contents/Library"
+export PATH="${VMWARE_LIB}:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+
+# --- paths + defaults --------------------------------------------------------
+MACTIONS_ROOT="${HOME}/.mactions"
+FUSION_DIR="${MACTIONS_ROOT}/fusion"
+
+NAME="${NAME:-win11-runner-base}"
+SNAPSHOT="${MACTIONS_FUSION_SNAPSHOT:-base-provisioned}"
+
+VMX="${FUSION_DIR}/${NAME}.vmx"
+DISK="${FUSION_DIR}/${NAME}.vmdk"
+
+WIN11_ISO="${WIN11_ISO:-${MACTIONS_ROOT}/win11-base.iso}"
+UNATTEND_ISO="${UNATTEND_ISO:-${MACTIONS_ROOT}/mactions-unattend.iso}"
+# Fusion ships the Windows-ARM64 VMware Tools ISO inside the app bundle; bootstrap
+# installs from it to bring up the vmxnet3 NIC (no in-box Win11-ARM driver).
+TOOLS_ISO="${TOOLS_ISO:-${VMWARE_LIB}/isoimages/arm64/windows.iso}"
+
+DISK_GB="${DISK_GB:-64}"
+RAM_MB="${RAM_MB:-8192}"
+CPUS="${CPUS:-4}"
+INSTALL_TIMEOUT_SECS="${INSTALL_TIMEOUT_SECS:-$((90 * 60))}"  # 90 min cap (typical 25-40)
+
+# --- preflight ----------------------------------------------------------------
+die() { echo "error: $*" >&2; exit 1; }
+
+VMRUN="${VMWARE_LIB}/vmrun"
+VDISK="${VMWARE_LIB}/vmware-vdiskmanager"
+[[ -x "$VMRUN"  ]] || VMRUN="$(command -v vmrun 2>/dev/null || true)"
+[[ -x "$VDISK"  ]] || VDISK="$(command -v vmware-vdiskmanager 2>/dev/null || true)"
+[[ -n "$VMRUN" && -x "$VMRUN" ]] || die "missing: vmrun (install VMware Fusion — see AGENTS.md)"
+[[ -n "$VDISK" && -x "$VDISK" ]] || die "missing: vmware-vdiskmanager (part of VMware Fusion)"
+[[ -f "$WIN11_ISO"    ]] || die "missing Win11 ISO at $WIN11_ISO — build it with prepare-windows-image first"
+[[ -f "$UNATTEND_ISO" ]] || die "missing unattend ISO at $UNATTEND_ISO — build it with prepare-windows-image first"
+[[ -f "$TOOLS_ISO"    ]] || die "missing VMware Tools ISO at $TOOLS_ISO (Fusion install incomplete?)"
+
+vmrun_list_contains() { "$VMRUN" -T fusion list 2>/dev/null | grep -Fq -- "$1"; }
+
+# Set (or replace) a `key = "value"` line in a .vmx (dots escaped for the regex).
+vmx_set() {
+  local vmx="$1" key="$2" val="$3" tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/mactions-vmx.XXXXXX")"
+  grep -v -E "^[[:space:]]*${key//./\\.}[[:space:]]*=" "$vmx" > "$tmp" || true
+  printf '%s = "%s"\n' "$key" "$val" >> "$tmp"
+  mv "$tmp" "$vmx"
+}
+
+# --- wipe any prior base of this name (idempotent rebuild) --------------------
+mkdir -p "$FUSION_DIR"
+if [[ -f "$VMX" ]]; then
+  echo "==> Removing prior base VM '$NAME'" >&2
+  vmrun_list_contains "$VMX" && { "$VMRUN" -T fusion stop "$VMX" hard >/dev/null 2>&1 || true; }
+  "$VMRUN" -T fusion deleteVM "$VMX" >/dev/null 2>&1 || true
+fi
+# deleteVM leaves the dir; clear the base's flat files (NOT the mactions-* clone
+# subdirs) so a rebuild starts clean.
+rm -f "${FUSION_DIR}/${NAME}".vmx "${FUSION_DIR}/${NAME}".vmdk \
+      "${FUSION_DIR}/${NAME}"-*.vmdk "${FUSION_DIR}/${NAME}".nvram \
+      "${FUSION_DIR}/${NAME}".vmsd "${FUSION_DIR}/${NAME}".vmxf \
+      "${FUSION_DIR}/${NAME}"*.vmsn 2>/dev/null || true
+
+# --- create the NVMe data disk ------------------------------------------------
+echo "==> Creating ${DISK_GB} GB disk: $DISK"
+# -t 0 = single growable sparse file; -a lsilogic is an advisory descriptor hint
+# (we attach via NVMe in the .vmx, which the proven base does too).
+"$VDISK" -c -s "${DISK_GB}GB" -a lsilogic -t 0 "$DISK" >/dev/null
+
+# --- author the .vmx ----------------------------------------------------------
+# Mirrors the proven base: arm-windows11-64 guest, EFI firmware (VMware supplies
+# its own; no external edk2 needed), an NVMe system disk, and SATA cdroms. The
+# NIC is vmxnet3 FROM CREATION (no manual e1000e->vmxnet3 switch) — it has no
+# in-box Win11-ARM driver, so bootstrap.ps1 installs VMware Tools first to bind
+# it. vTPM/SecureBoot are skipped; autounattend.xml's LabConfig bypasses the
+# Win11 hardware checks.
+echo "==> Authoring $VMX"
+cat > "$VMX" <<VMXEOF
+.encoding = "UTF-8"
+config.version = "8"
+virtualHW.version = "20"
+displayName = "${NAME}"
+guestOS = "arm-windows11-64"
+firmware = "efi"
+numvcpus = "${CPUS}"
+cpuid.coresPerSocket = "${CPUS}"
+memsize = "${RAM_MB}"
+nvme0.present = "TRUE"
+nvme0:0.present = "TRUE"
+nvme0:0.fileName = "${NAME}.vmdk"
+nvme0:0.deviceType = "disk"
+sata0.present = "TRUE"
+sata0:0.present = "TRUE"
+sata0:0.deviceType = "cdrom-image"
+sata0:0.fileName = "${WIN11_ISO}"
+sata0:0.startConnected = "TRUE"
+sata0:1.present = "TRUE"
+sata0:1.deviceType = "cdrom-image"
+sata0:1.fileName = "${UNATTEND_ISO}"
+sata0:1.startConnected = "TRUE"
+sata0:2.present = "TRUE"
+sata0:2.deviceType = "cdrom-image"
+sata0:2.fileName = "${TOOLS_ISO}"
+sata0:2.startConnected = "TRUE"
+ethernet0.present = "TRUE"
+ethernet0.connectionType = "nat"
+ethernet0.virtualDev = "vmxnet3"
+ethernet0.addressType = "generated"
+usb_xhci.present = "TRUE"
+svga.present = "TRUE"
+tools.syncTime = "FALSE"
+tools.upgrade.policy = "manual"
+VMXEOF
+
+# --- boot headless + drive the unattended install ----------------------------
+echo "==> Booting headless for the unattended install (no keypress — no-prompt ISO)"
+"$VMRUN" -T fusion start "$VMX" nogui >/dev/null
+
+# Confirm it powered on (vmrun start returns after power-on).
+for _ in $(seq 1 30); do vmrun_list_contains "$VMX" && break; sleep 2; done
+vmrun_list_contains "$VMX" || die "VM did not power on (see Fusion logs in $FUSION_DIR)"
+
+echo "==> Watching install (autounattend.xml -> bootstrap.ps1 -> shutdown /s)."
+echo "    Guest-initiated reboots keep the VM 'running'; only bootstrap's final"
+echo "    power-off removes it from \`vmrun list\`. Hard timeout: $((INSTALL_TIMEOUT_SECS / 60)) min."
+
+START="$(date +%s)"
+LAST=0
+while vmrun_list_contains "$VMX"; do
+  NOW="$(date +%s)"; ELAPSED=$((NOW - START))
+  if [[ $ELAPSED -ge $INSTALL_TIMEOUT_SECS ]]; then
+    "$VMRUN" -T fusion stop "$VMX" hard >/dev/null 2>&1 || true
+    die "install timeout (${INSTALL_TIMEOUT_SECS}s) — autounattend.xml + bootstrap.ps1 didn't reach shutdown. Check the VM (re-run with the install visible: \`vmrun -T fusion start $VMX\`)."
+  fi
+  if [[ $((NOW - LAST)) -ge 30 ]]; then
+    printf '    [%4ds] still running...\n' "$ELAPSED"; LAST="$NOW"
+  fi
+  sleep 15
+done
+echo "==> Guest powered off after $(( $(date +%s) - START ))s — install + bootstrap done"
+
+# --- finalize the pristine base ----------------------------------------------
+# Disconnect all install cdroms so per-job clones never carry a connected ISO
+# whose path may move (the mactions-fusion-vm `clone` verb repurposes sata0:0 for
+# the JIT config disc; sata0:1/:2 stay disconnected). VM is powered off, so this
+# edit lands in the snapshot.
+vmx_set "$VMX" "sata0:0.startConnected" "FALSE"
+vmx_set "$VMX" "sata0:1.startConnected" "FALSE"
+vmx_set "$VMX" "sata0:2.startConnected" "FALSE"
+
+echo "==> Snapshotting the provisioned base as '$SNAPSHOT' (the linked-clone parent)"
+"$VMRUN" -T fusion snapshot "$VMX" "$SNAPSHOT" >/dev/null
+"$VMRUN" -T fusion listSnapshots "$VMX" 2>/dev/null | grep -Fxq -- "$SNAPSHOT" \
+  || die "snapshot '$SNAPSHOT' was not created — cannot linked-clone from this base"
+
+echo
+echo "==> Base image ready:"
+echo "    vmx:      $VMX"
+echo "    snapshot: $SNAPSHOT (powered-off, linked-clone parent)"
+echo
+echo "Per job, mactions-fusion-vm linked-clones this snapshot, attaches a JIT"
+echo "config disc, and boots headless; the guest's MactionsRunOnce task runs ONE"
+echo "job outbound, then powers off and the clone is deleted."

@@ -34,6 +34,50 @@ $RunnerRoot = 'C:\actions-runner'
 
 Write-Host '== Mactions Windows base image bootstrap (outbound/headless) =='
 
+# --- 0a. Networking: on the VMware Fusion base build, the guest NIC is vmxnet3,
+# which has NO in-box Win11-ARM driver - so there is NO network until VMware
+# Tools installs it. Everything below downloads from the internet, so we MUST
+# bring the network up first. Install Tools silently from its attached CD (the
+# Fusion isoimages ISO mounts with volume label "VMware Tools" + a root
+# setup.exe), then wait for outbound connectivity. This whole block is a no-op on
+# the other backends (no Tools CD present) and on a re-run (Tools already
+# installed), so the shared bootstrap stays correct everywhere.
+function Test-Outbound {
+  try {
+    $r = Invoke-WebRequest -Uri 'https://api.github.com/zen' -UseBasicParsing -TimeoutSec 10
+    return ($r.StatusCode -eq 200)
+  } catch { return $false }
+}
+
+if (-not (Test-Outbound)) {
+  if (-not (Get-Service -Name 'VMTools' -ErrorAction SilentlyContinue)) {
+    $toolsVol = Get-Volume -ErrorAction SilentlyContinue |
+      Where-Object { $_.FileSystemLabel -eq 'VMware Tools' -and $_.DriveLetter } |
+      Select-Object -First 1
+    $setup = if ($toolsVol) { "$($toolsVol.DriveLetter):\setup.exe" } else { $null }
+    if ($setup -and (Test-Path $setup)) {
+      Write-Host 'Installing VMware Tools (silent, no reboot) to bring up vmxnet3 networking...'
+      try {
+        # InstallShield wrapper: /S = silent setup, /v passes the quoted args to
+        # msiexec; /qn = no MSI UI, REBOOT=R = suppress the reboot (the vmxnet3
+        # NIC driver binds via PnP without one). Routed through cmd so the
+        # embedded /v"..." quoting survives.
+        & "$env:ComSpec" /c "`"$setup`" /S /v`"/qn REBOOT=R`"" 2>&1 | Out-Null
+        Write-Host "VMware Tools setup exit: $LASTEXITCODE"
+      } catch {
+        Write-Warning "VMware Tools install failed (continuing; network wait will decide): $_"
+      }
+    }
+  }
+  Write-Host 'Waiting for outbound network (vmxnet3 binds after the Tools PnP driver install)...'
+  $deadline = (Get-Date).AddSeconds(180)
+  while ((Get-Date) -lt $deadline -and -not (Test-Outbound)) { Start-Sleep -Seconds 5 }
+  if (-not (Test-Outbound)) {
+    throw 'No outbound network after 180s. On VMware Fusion this means the vmxnet3 driver never bound (VMware Tools may need a reboot on this build); cannot download the runner agent.'
+  }
+  Write-Host 'Network is up.'
+}
+
 # --- 0. Dev tooling GitHub Actions workflows commonly need -------------------
 # We install these BEFORE the runner agent so a failure here is loud and
 # obvious (the agent install is the cheap fast step). All are silent installs
@@ -75,20 +119,44 @@ function Install-Exe {
   if ($proc.ExitCode -ne 0) { throw "$LocalName installer failed with exit code $($proc.ExitCode)" }
 }
 
-# Git for Windows (ARM64) - resolve the latest release at build time so we get
-# whatever's current. Inno Setup installer accepts a silent-install RSP file.
-Write-Host 'Installing Git for Windows (ARM64)...'
+# Git for Windows (ARM64) - use MinGit, a PLAIN .zip, NOT the Inno installer.
+# The `Git-*-arm64.exe` Inno installer still pops a GUI under an unattended
+# FirstLogonCommands session on ARM64 (its /VERYSILENT is honored on x64 but the
+# ARM64 build surfaces a window with no desktop to click), which STALLS the base
+# build. MinGit is Git-for-Windows' minimal redistributable (exactly what
+# automation needs: git.exe under \cmd) and extracts with the same ZipFile path
+# as the runner agent - zero installer UI possible. We add \cmd to the MACHINE
+# PATH so actions/checkout (and the runner service) resolve `git`.
+Write-Host 'Installing Git for Windows (ARM64, MinGit)...'
 try {
   $gitRel = Invoke-RestMethod 'https://api.github.com/repos/git-for-windows/git/releases/latest' `
     -Headers @{ 'User-Agent' = 'mactions'; 'Accept' = 'application/vnd.github+json' }
+  # Prefer the standard MinGit (skip the busybox variant for fewer surprises).
   $gitAsset = $gitRel.assets |
-    Where-Object { $_.name -match '^Git-.*-arm64\.exe$' } |
+    Where-Object { $_.name -match '^MinGit-.*-arm64\.zip$' -and $_.name -notmatch 'busybox' } |
     Select-Object -First 1
   if (-not $gitAsset) {
-    Write-Warning "No Git-for-Windows ARM64 asset in release $($gitRel.tag_name); skipping Git install."
+    Write-Warning "No MinGit ARM64 asset in release $($gitRel.tag_name); skipping Git install."
   } else {
-    Install-Exe -Url $gitAsset.browser_download_url -LocalName 'git-arm64-setup.exe' `
-      -Args @('/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES','/NOCANCEL','/CLOSEAPPLICATIONS')
+    $gitDir = 'C:\Git'
+    $gitZip = Join-Path $env:TEMP 'mingit-arm64.zip'
+    if (Test-Path $gitZip) { Remove-Item $gitZip -Force }
+    Invoke-WebRequest -Uri $gitAsset.browser_download_url -OutFile $gitZip -UseBasicParsing
+    if (Test-Path $gitDir) { Remove-Item $gitDir -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $gitDir | Out-Null
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($gitZip, $gitDir)
+    Remove-Item $gitZip -Force
+    $gitCmd = Join-Path $gitDir 'cmd'
+    if (-not (Test-Path (Join-Path $gitCmd 'git.exe'))) {
+      throw "git.exe not found under $gitCmd after MinGit extract"
+    }
+    $machPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    if ($machPath -notlike "*$gitCmd*") {
+      [Environment]::SetEnvironmentVariable('Path', ($machPath.TrimEnd(';') + ';' + $gitCmd), 'Machine')
+    }
+    $env:Path = $env:Path + ';' + $gitCmd
+    & "$gitCmd\git.exe" --version | Write-Host
   }
 } catch {
   Write-Warning "Git install failed (continuing): $_"

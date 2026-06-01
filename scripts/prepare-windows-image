@@ -32,7 +32,8 @@
 #                     the latest Win11 ARM64 retail build is auto-downloaded via
 #                     UUP dump and converted to an ISO.
 #   --name NAME       Base VM name to create (default: win11-runner-base).
-#   --tool TOOL       parallels | utm   (default: auto-detect).
+#   --tool TOOL       fusion | qemu | parallels | utm   (default: auto-detect;
+#                     fusion is the proven Win11-ARM backend).
 #   --disk GB         Guest disk size in GB (default: 64).
 #   --ram MB          Guest RAM in MB (default: 8192).
 #   --cpus N          Guest vCPU count (default: 4).
@@ -74,12 +75,15 @@ done
 die() { echo "error: $*" >&2; exit 1; }
 
 # --- Detect the hypervisor CLI ----------------------------------------------
-# Free-first: QEMU + swtpm + EDK2 firmware (fully headless, no Aqua login
-# session) is the preferred path. UTM is the free fallback that needs a GUI
-# session. Parallels is honored if already installed (paid; never recommended
-# for install).
+# Free-first AND proven-first: VMware Fusion (free since Nov 2024) is the PROVEN
+# Win11-ARM backend and is preferred. QEMU + swtpm + EDK2 is next (fully
+# headless, but stock QEMU can't boot Win11-ARM on this stack — see AGENTS.md).
+# UTM is the free fallback that needs a GUI session. Parallels is honored if
+# already installed (paid; never recommended for install).
 detect_tool() {
+  local VMRUN="/Applications/VMware Fusion.app/Contents/Library/vmrun"
   local QEMU_FW="/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
+  if [[ -x "$VMRUN" ]]; then echo fusion; return; fi
   if command -v qemu-system-aarch64 >/dev/null 2>&1 \
      && command -v swtpm >/dev/null 2>&1 \
      && [[ -f "$QEMU_FW" ]]; then echo qemu; return; fi
@@ -93,12 +97,14 @@ if [[ "$TOOL" == "none" ]]; then
   cat <<'EOF' >&2
 No Windows-capable hypervisor backend found.
 
-Install ONE of (the free QEMU stack is the recommended default — see AGENTS.md):
-  brew install qemu swtpm                          # QEMU + swtpm (fully headless, no GUI session required)
-  -- or --
-  brew install --cask utm                          # UTM (utmctl bundled; needs a GUI login session)
-  -- or --
-  brew install --cask parallels                    # Parallels Desktop (paid; Pro/Business for headless)
+RECOMMENDED — VMware Fusion (free, and the PROVEN Win11-ARM backend; see AGENTS.md):
+  Download + install VMware Fusion from the Broadcom portal (it is NOT
+  brew-installable). Then re-run this script — it auto-detects Fusion.
+
+Other backends (kept for parity; stock QEMU does NOT boot Win11-ARM here):
+  brew install qemu swtpm                          # QEMU + swtpm (headless)
+  brew install --cask utm                          # UTM (needs a GUI login session)
+  brew install --cask parallels                    # Parallels Desktop (paid)
   brew install --cask parallels-virtualization-sdk # prlctl tooling
 
 Then re-run this script.
@@ -324,6 +330,58 @@ build_unattend_fat() {
   echo "$out"
 }
 
+# Re-master the Win11 install ISO so EFI boot doesn't stop on Microsoft's
+# "Press any key to boot from CD" prompt (cdboot). The source ISO ships
+# efisys_noprompt.bin next to efisys.bin; we rebuild the El Torito EFI boot image
+# from the no-prompt variant with xorriso. Falls back to the ORIGINAL ISO (one
+# Space-press at the VM's first boot) when xorriso is absent or the remaster /
+# validation fails — so there's never a regression. Echoes the ISO path to use;
+# progress to stderr. (The output ISO + its El Torito EFI entry are validated
+# here; a clean boot is confirmed on the live base build — the one live-verify
+# step. If it ever fails to boot, delete it and the build uses the prompting ISO.)
+make_noprompt_iso() {
+  local src="$1" out mnt vol
+  if ! command -v xorriso >/dev/null 2>&1; then
+    echo "    xorriso not installed (brew install xorriso) — using the prompting ISO (one Space-press at boot)" >&2
+    echo "$src"; return
+  fi
+  out="${MACTIONS_ROOT}/win11-base.iso"
+  mnt="$(mktemp -d)"
+  if ! hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$src" >/dev/null 2>&1; then
+    rmdir "$mnt" 2>/dev/null || true
+    echo "    couldn't mount $src — using prompting ISO" >&2; echo "$src"; return
+  fi
+  if [[ ! -f "$mnt/efi/microsoft/boot/efisys_noprompt.bin" ]]; then
+    hdiutil detach "$mnt" >/dev/null 2>&1 || true; rmdir "$mnt" 2>/dev/null || true
+    echo "    no efisys_noprompt.bin in $src — using prompting ISO" >&2; echo "$src"; return
+  fi
+  vol="$(/usr/sbin/diskutil info "$mnt" 2>/dev/null | sed -n 's/.*Volume Name: *//p' | head -1)"
+  [[ -n "$vol" ]] || vol="CCCOMA_X64FRE"
+  vol="${vol:0:16}"   # Joliet volid limit is 16 chars (a longer one warns + can abort)
+  rm -f "$out"
+  echo "    remastering no-prompt ISO with xorriso (multi-GB copy; one-time)..." >&2
+  # iso-level 3 (install.wim < 4 GB), Joliet + Rock Ridge, El Torito EFI boot
+  # from efisys_noprompt.bin (platform efi, no emulation) — mirrors the source's
+  # UEFI-only boot (ARM has no BIOS boot entry). The source ships its own
+  # boot.catalog; EXCLUDE it (-m) and regenerate (-c) or xorriso aborts grafting
+  # the reserved catalog path. Validate the EFI El Torito entry landed.
+  if xorriso -as mkisofs \
+       -iso-level 3 -J -joliet-long -R -V "$vol" \
+       -m boot.catalog -c boot.catalog \
+       -eltorito-platform efi \
+       -eltorito-boot efi/microsoft/boot/efisys_noprompt.bin -no-emul-boot \
+       -o "$out" "$mnt" >/dev/null 2>&1 \
+     && [[ -s "$out" ]] \
+     && xorriso -indev "$out" -report_el_torito plain 2>/dev/null | grep -qi 'efi'; then
+    hdiutil detach "$mnt" >/dev/null 2>&1 || true; rmdir "$mnt" 2>/dev/null || true
+    echo "$out"
+  else
+    rm -f "$out"; hdiutil detach "$mnt" >/dev/null 2>&1 || true; rmdir "$mnt" 2>/dev/null || true
+    echo "    xorriso remaster/validation failed — using prompting ISO (one Space-press at boot)" >&2
+    echo "$src"
+  fi
+}
+
 MACTIONS_ROOT="${HOME}/.mactions"
 echo "==> Building unattended-install ISO (autounattend.xml + bootstrap.ps1)"
 UNATTEND_ISO="$(build_unattend_iso)"
@@ -352,6 +410,32 @@ echo "Disk/RAM/CPU: ${DISK_GB}GB / ${RAM_MB}MB / ${CPUS}"
 echo
 
 case "$TOOL" in
+  fusion)
+    # VMware Fusion: fully automated, headless base build via vmrun (the PROVEN
+    # Win11-ARM backend). Stash the unattend ISO + a NO-PROMPT remaster of the
+    # Win11 ISO at the canonical paths fusion-windows-base reads, then run it
+    # (authors the .vmx with a vmxnet3 NIC, boots headless, lets autounattend +
+    # bootstrap run — bootstrap installs VMware Tools then the runner agent —
+    # then snapshots "base-provisioned").
+    echo "==> Stashing unattend ISO at the canonical path for the Fusion base build"
+    cp -f "$UNATTEND_ISO" "$MACTIONS_ROOT/mactions-unattend.iso"
+    echo "==> Preparing the Win11 boot ISO (no-prompt remaster so there's no boot keypress)"
+    NOPROMPT_ISO="$(make_noprompt_iso "$ISO")"
+    if [[ "$NOPROMPT_ISO" != "$MACTIONS_ROOT/win11-base.iso" ]]; then
+      # Fallback returned the original (prompting) ISO — stash it at the canonical path.
+      cp -f "$NOPROMPT_ISO" "$MACTIONS_ROOT/win11-base.iso"
+    fi
+    echo "==> Running VMware Fusion headless base build (autounattend -> bootstrap -> snapshot)"
+    NAME="$NAME" DISK_GB="$DISK_GB" RAM_MB="$RAM_MB" CPUS="$CPUS" \
+      WIN11_ISO="$MACTIONS_ROOT/win11-base.iso" \
+      UNATTEND_ISO="$MACTIONS_ROOT/mactions-unattend.iso" \
+      "$HERE/fusion-windows-base"
+    echo
+    echo "==> Fusion base build done. Base lives at ~/.mactions/fusion/$NAME.vmx"
+    echo "    (snapshot 'base-provisioned'). Per job, mactions-fusion-vm linked-clones"
+    echo "    it into ~/.mactions/fusion/<id>/ and attaches a config.iso CD."
+    ;;
+
   qemu)
     # QEMU + swtpm + edk2: fully headless, no manual GUI step. The unattend FAT
     # image is already at the canonical path (build_unattend_fat writes there).
