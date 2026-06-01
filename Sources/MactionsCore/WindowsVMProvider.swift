@@ -162,7 +162,7 @@ public struct VMwareCLI: WindowsVMCLI {
 ///   6. **Destroy** the clone on every path, then fire `onExit`.
 ///
 /// PROVEN end to end on VMware Fusion (see AGENTS.md → Windows support).
-public final class WindowsVMProvider: RunnerProvider {
+public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
   public let id: String
   private let baseImage: String
   private let cli: WindowsVMCLI
@@ -220,7 +220,7 @@ public final class WindowsVMProvider: RunnerProvider {
     return running
   }
 
-  public func start(jitConfig: String, onExit: @escaping (Int32) -> Void) throws {
+  public func start(jitConfig: String, onExit: @escaping @Sendable (Int32) -> Void) throws {
     // 1. Clone (throwaway), 2. build the per-clone config ISO, 3. inject it into
     // the still-powered-off clone, 4. boot. Steps 1-4 happen synchronously so a
     // failure surfaces from start(); the completion poll runs on a thread.
@@ -405,7 +405,7 @@ public struct WindowsVMProviderFactory: RunnerProviderFactory {
   /// repo root (useful when the app is launched from a path that isn't the repo
   /// cwd). nil if the helper isn't shipped alongside the binary (Fusion is then
   /// not offered).
-  public static var fusionHelperPath: String? = {
+  public static let fusionHelperPath: String? = {
     let fm = FileManager.default
     let rel = "scripts/mactions-fusion-vm"
     // 1. ./scripts/<name> relative to the launch cwd (`swift run` from the repo).

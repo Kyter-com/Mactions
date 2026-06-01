@@ -1,0 +1,24 @@
+{
+  "configurations": [
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:Mactions}",
+      "name": "Debug Mactions",
+      "target": "Mactions",
+      "configuration": "debug",
+      "preLaunchTask": "swift: Build Debug Mactions"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:Mactions}",
+      "name": "Release Mactions",
+      "target": "Mactions",
+      "configuration": "release",
+      "preLaunchTask": "swift: Build Release Mactions"
+    }
+  ]
+}

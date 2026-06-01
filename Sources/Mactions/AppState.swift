@@ -476,6 +476,15 @@ final class AppState: ObservableObject {
       // drives the base-VM build. The blocking shell-out runs off the main actor.
       statusMessage = "Setting up the Windows runner (downloading + building the base image — this takes a while)…"
       let result = await Self.runPrepScript(script, name: image)
+      // Persist the FULL build transcript to ~/.mactions/logs so a failure is
+      // diagnosable from disk (survives the ephemeral clone; no Console.app
+      // spelunking). Both success + failure, so a "succeeded but didn't verify"
+      // case is inspectable too.
+      let buildLog = HostCleanup.writeLog(
+        name: "prepare-windows-image", stamp: Self.logStamp(),
+        contents:
+          "exit=\(result.map { String($0.status) } ?? "nil (could not launch)")\n\n"
+          + "=== stdout ===\n\(result?.stdout ?? "")\n\n=== stderr ===\n\(result?.stderr ?? "")\n")
       windowsSetupBusy = false
       if let result, result.ok {
         // Exit 0 means the prep RAN, not that a bootable base VM exists — the
@@ -494,22 +503,10 @@ final class AppState: ObservableObject {
             "Windows prep finished. Complete the one-time install per the printed steps, shut the VM down, then run \"Set up Windows runner\" again to confirm."
         }
       } else {
-        if let result {
-          // Pass the transcript as a `%@` ARGUMENT, never as NSLog's format
-          // string: a multi-GB build log is full of bare `%` (aria2c "47%",
-          // batch `%TEMP%`/`%~dp0`, etc.), which NSLog would treat as printf
-          // specifiers with no matching args — the source of the "Overflow
-          // occurred / Failed to format string" failures that hid the real
-          // error.
-          NSLog(
-            "%@",
-            "prepare-windows-image failed (status \(result.status))\nstdout:\n\(result.stdout)\nstderr:\n\(result.stderr)"
-          )
-        }
         // The script tags its own failures via die(): `error: <msg>`. Surface the
         // first such line (a concise human summary); never echo a raw Python
         // traceback or set -e abort into the one-line status — the full transcript
-        // is in Console.app via the NSLog above.
+        // is the durable log written above.
         let stderr = result?.stderr ?? ""
         let errorLine =
           stderr
@@ -518,14 +515,23 @@ final class AppState: ObservableObject {
           .first { $0.hasPrefix("error: ") }
         let detail =
           errorLine.map { String($0.dropFirst("error: ".count)).trimmingCharacters(in: .whitespaces) }
-          ?? "the prep script failed — see Console.app for details"
-        statusMessage = "Windows setup failed: \(detail)"
+          ?? "the prep script failed"
+        statusMessage =
+          "Windows setup failed: \(detail)" + (buildLog.map { " (log: \($0))" } ?? "")
       }
     }
   }
 
   /// Run the (long-blocking) prep script off the main actor so the popover stays
   /// responsive, returning the result back on the caller's actor.
+  /// Filename-safe timestamp for durable log names (no colons).
+  static func logStamp() -> String {
+    let f = DateFormatter()
+    f.dateFormat = "yyyyMMdd-HHmmss"
+    f.locale = Locale(identifier: "en_US_POSIX")
+    return f.string(from: Date())
+  }
+
   private nonisolated static func runPrepScript(_ script: String, name: String) async
     -> Shell.Result?
   {

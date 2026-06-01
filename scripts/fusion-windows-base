@@ -196,8 +196,13 @@ LAST=0
 while vmrun_list_contains "$VMX"; do
   NOW="$(date +%s)"; ELAPSED=$((NOW - START))
   if [[ $ELAPSED -ge $INSTALL_TIMEOUT_SECS ]]; then
+    # The VM is still running here, so guest-ops work — pull the build transcript
+    # out for diagnosis BEFORE killing it.
+    mkdir -p "${MACTIONS_ROOT}/logs"
+    "$VMRUN" -T fusion -gu "$GUEST_USER" -gp "$GUEST_PW" copyFileFromGuestToHost "$VMX" \
+      'C:\setup\logs\bootstrap.log' "${MACTIONS_ROOT}/logs/base-build-bootstrap-timeout.log" >/dev/null 2>&1 || true
     "$VMRUN" -T fusion stop "$VMX" hard >/dev/null 2>&1 || true
-    die "install timeout (${INSTALL_TIMEOUT_SECS}s) — never reached the provisioning sentinel. Boot the VM in Fusion (\`vmrun -T fusion start $VMX gui\`) or read $FUSION_DIR/vmware.log to see where it stalled."
+    die "install timeout (${INSTALL_TIMEOUT_SECS}s) — never reached the provisioning sentinel. Guest log (if captured): ${MACTIONS_ROOT}/logs/base-build-bootstrap-timeout.log; else boot the VM in Fusion or read $FUSION_DIR/vmware.log."
   fi
   if [[ $PROVISIONED -eq 0 ]]; then
     out="$("$VMRUN" -T fusion -gu "$GUEST_USER" -gp "$GUEST_PW" fileExistsInGuest "$VMX" "$SENTINEL" 2>/dev/null || true)"

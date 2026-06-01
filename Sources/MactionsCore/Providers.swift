@@ -9,7 +9,7 @@ public protocol RunnerProvider: AnyObject {
   var id: String { get }
   /// Launch the agent with `jitConfig`. `onExit` fires (any thread) when the
   /// agent process/VM finishes — a clean ephemeral exit or a crash.
-  func start(jitConfig: String, onExit: @escaping (Int32) -> Void) throws
+  func start(jitConfig: String, onExit: @escaping @Sendable (Int32) -> Void) throws
   /// Tear down immediately (user went offline / quit).
   func stop()
   var isRunning: Bool { get }
@@ -31,7 +31,7 @@ public protocol RunnerProviderFactory {
 /// `runsRoot/<id>`, deleted the instant the job exits. The job's `_work`
 /// checkout, `_tool`/`_actions` caches, `_diag` logs and `.credentials` all
 /// live inside that clone, so nothing accumulates on the host across runs.
-public final class LocalProcessProvider: RunnerProvider {
+public final class LocalProcessProvider: RunnerProvider, @unchecked Sendable {
   public let id: String
   private let templateDirectory: URL
   private let runDirectory: URL
@@ -52,7 +52,7 @@ public final class LocalProcessProvider: RunnerProvider {
     return process?.isRunning ?? false
   }
 
-  public func start(jitConfig: String, onExit: @escaping (Int32) -> Void) throws {
+  public func start(jitConfig: String, onExit: @escaping @Sendable (Int32) -> Void) throws {
     try FileManager.default.createDirectory(
       at: runDirectory.deletingLastPathComponent(), withIntermediateDirectories: true)
     try? FileManager.default.removeItem(at: runDirectory)
@@ -138,7 +138,7 @@ public struct LocalProcessProviderFactory: RunnerProviderFactory {
 /// SSH in to launch the agent with the JIT config, and delete the clone on
 /// stop. Marked experimental: image prep + the SSH bootstrap are environment
 /// specific. See AGENTS.md → "Providers".
-public final class TartProvider: RunnerProvider {
+public final class TartProvider: RunnerProvider, @unchecked Sendable {
   public let id: String
   private let baseImage: String
   private let tartPath: String
@@ -159,7 +159,7 @@ public final class TartProvider: RunnerProvider {
     return running
   }
 
-  public func start(jitConfig: String, onExit: @escaping (Int32) -> Void) throws {
+  public func start(jitConfig: String, onExit: @escaping @Sendable (Int32) -> Void) throws {
     try Shell.runChecked(tartPath, ["clone", baseImage, cloneName])
     lock.lock(); running = true; lock.unlock()
 

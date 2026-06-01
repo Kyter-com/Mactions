@@ -62,7 +62,10 @@ public final class RunnerOrchestrator {
   /// Fired (on the main actor) whenever `state`/`runners` change.
   public var onChange: (() -> Void)?
 
-  private final class Slot {
+  // @MainActor-isolated (like its enclosing orchestrator): only ever touched on
+  // the main actor, which also makes it Sendable so it can be captured by the
+  // provider's @Sendable onExit closure (which immediately hops back here).
+  @MainActor private final class Slot {
     let name: String
     var remoteId: Int?
     var phase: ManagedRunner.Phase
