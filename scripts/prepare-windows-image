@@ -283,25 +283,36 @@ build_unattend_iso() {
   mkdir -p "$staging/setup"
   cp "$HERE/autounattend.xml" "$staging/autounattend.xml"
   cp "$HERE/bootstrap.ps1"    "$staging/setup/bootstrap.ps1"
-  hdiutil makehybrid -iso -joliet -default-volume-name UNATTEND \
+  # -ov + an explicit rm so a re-run is idempotent; without it makehybrid aborts
+  # with "already exists" / "Bad file descriptor" when a prior ISO is present.
+  rm -f "$out"
+  hdiutil makehybrid -ov -iso -joliet -default-volume-name UNATTEND \
     -o "$out" "$staging" >/dev/null
   rm -rf "$staging"
   echo "$out"
 }
 
 build_unattend_fat() {
-  local out tmp_dmg mnt
+  local out staging dmg mnt
   out="${MACTIONS_ROOT}/unattend.img"
   mkdir -p "$MACTIONS_ROOT"
   rm -f "$out"
-  # hdiutil makes the .dmg; we rename to .img. 4 MB is plenty for the two
-  # small files + FAT12 overhead; volume name MACTIONS is what the in-guest
-  # run-job.ps1 also looks for as the per-clone JIT volume label.
-  tmp_dmg="$(mktemp -t mactions-unattend.XXXXXX.dmg)"
-  rm -f "$tmp_dmg"
-  hdiutil create -size 4m -fs MS-DOS -volname MACTIONS -layout NONE \
-    "${tmp_dmg%.dmg}" >/dev/null
-  mv "$tmp_dmg" "$out"
+  # hdiutil create APPENDS .dmg to the output base and (with -fs MS-DOS -layout
+  # NONE) writes a RAW FAT12 superfloppy — verified with `file`: a DOS/MBR FAT
+  # boot sector, which QEMU reads directly as `-drive format=raw`. So build into a
+  # temp dir at a known basename and rename "<base>.dmg" -> our ".img". 4 MB fits
+  # the two small files; volume MACTIONS is also what the in-guest run-job.ps1
+  # looks for as the per-clone JIT volume label.
+  #
+  # Do NOT use `mktemp -t …dmg` + `${x%.dmg}` here: macOS BSD `mktemp` keeps the
+  # literal XXXXXX and appends its random suffix AFTER ".dmg", so the `%.dmg`
+  # strip no-ops and `hdiutil` writes a filename the `mv` can't find — which
+  # aborted the whole QEMU base build before the install ever started.
+  staging="$(mktemp -d)"
+  dmg="$staging/unattend"            # hdiutil writes "$staging/unattend.dmg"
+  hdiutil create -size 4m -fs MS-DOS -volname MACTIONS -layout NONE "$dmg" >/dev/null
+  mv "$dmg.dmg" "$out"
+  rm -rf "$staging"
   mnt="$(mktemp -d)"
   hdiutil attach -nobrowse -mountpoint "$mnt" "$out" >/dev/null
   mkdir -p "$mnt/setup"
@@ -309,7 +320,7 @@ build_unattend_fat() {
   cp "$HERE/bootstrap.ps1"    "$mnt/setup/bootstrap.ps1"
   sync
   hdiutil detach "$mnt" >/dev/null 2>&1
-  rmdir "$mnt"
+  rmdir "$mnt" 2>/dev/null || true
   echo "$out"
 }
 
