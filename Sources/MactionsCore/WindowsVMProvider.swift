@@ -220,6 +220,14 @@ public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
     return running
   }
 
+  /// Whether the clone has already been torn down (by `stop()` or the start()
+  /// error path). The completion-poll thread reads this to bail out promptly
+  /// instead of polling a deleted VM until its timeout.
+  private var isTornDown: Bool {
+    lock.lock(); defer { lock.unlock() }
+    return tornDown
+  }
+
   public func start(jitConfig: String, onExit: @escaping @Sendable (Int32) -> Void) throws {
     // 1. Clone (throwaway), 2. build the per-clone config ISO, 3. inject it into
     // the still-powered-off clone, 4. boot. Steps 1-4 happen synchronously so a
@@ -232,8 +240,14 @@ public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
       try inject(configISO: iso)
       try Shell.runChecked(cli.executable, cli.startArgs(clone: cloneName))
     } catch {
-      // Clone exists but couldn't be prepared/started — reclaim it and report.
-      if teardown() { onExit(1) }
+      // Clone exists but couldn't be prepared/started — reclaim it and report by
+      // THROWING only. We deliberately do NOT also fire onExit here: the
+      // orchestrator appends this provider's slot only AFTER start() returns, so
+      // a thrown start() means no slot exists yet — its provisionOne catch is the
+      // sole handler. Firing onExit too would drive a redundant reconcile against
+      // a phantom slot (and mismatches LocalProcessProvider/TartProvider, which
+      // throw without onExit). The thread below is never started on this path.
+      teardown()
       throw error
     }
 
@@ -244,6 +258,10 @@ public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
       let bootDeadline = Date().addingTimeInterval(bootTimeout)
       var sawRunning = false
       while Date() < bootDeadline {
+        // stop()/teardown ran (user went offline / quit) — bail out instead of
+        // polling a deleted clone until bootTimeout. teardown already reaped it
+        // and stop() owns its own (no-onExit) teardown path.
+        if isTornDown { return }
         if let r = try? Shell.run(cli.executable, cli.statusArgs(clone: cloneName)), r.ok,
           phase(from: r.stdout) == .running
         {
@@ -259,6 +277,7 @@ public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
         let jobDeadline = Date().addingTimeInterval(jobTimeout)
         var done = false
         while Date() < jobDeadline {
+          if isTornDown { return }  // torn down meanwhile — stop polling a gone VM
           if let r = try? Shell.run(cli.executable, cli.statusArgs(clone: cloneName)), r.ok,
             phase(from: r.stdout) == .stopped
           {

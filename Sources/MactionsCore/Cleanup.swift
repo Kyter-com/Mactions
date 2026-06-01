@@ -117,6 +117,16 @@ public enum HostCleanup {
         try? fm.removeItem(atPath: clonesDir + "/" + entry)
       }
     }
+    // Also reap any per-clone config-ISO staging dir the provider builds under
+    // $TMPDIR (`mactions-cfg-<clone>`). teardown() removes it on every normal
+    // path, so a leftover here means a hard crash before teardown ran; without
+    // this sweep it'd linger until the OS's periodic temp purge.
+    let tmp = NSTemporaryDirectory()
+    if let tmpEntries = try? fm.contentsOfDirectory(atPath: tmp) {
+      for entry in tmpEntries where entry.hasPrefix("mactions-cfg-") {
+        try? fm.removeItem(atPath: tmp + entry)
+      }
+    }
   }
 
   /// Pull our `mactions-…` clone names out of a VM-CLI listing (pure → testable).

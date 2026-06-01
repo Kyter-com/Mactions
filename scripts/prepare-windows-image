@@ -35,6 +35,9 @@
 #   --disk GB         Guest disk size in GB (default: 64).
 #   --ram MB          Guest RAM in MB (default: 8192).
 #   --cpus N          Guest vCPU count (default: 4).
+#   --updates 0|1     0 (default) = clean GA RTM ISO; 1 = fold the latest
+#                     cumulative into install.wim (fully patched, but a
+#                     mixed-build boot chain — see the note by UPDATES below).
 #   -h, --help        Show this help.
 
 set -euo pipefail
@@ -54,7 +57,7 @@ CPUS=4
 UPDATES=0
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -71,6 +74,26 @@ while [[ $# -gt 0 ]]; do
 done
 
 die() { echo "error: $*" >&2; exit 1; }
+
+# --- Temp cleanup (success OR failure) ---------------------------------------
+# The multi-GB UUP download/convert workdir, the unattend staging dir, and the
+# no-prompt-ISO mountpoint all used to leak on early exit / interrupt (only the
+# success paths cleaned up), accumulating GBs in $TMPDIR across rebuilds. Track
+# them in globals and reap on EXIT so every path — die(), set -e abort, SIGINT —
+# cleans up. The canonical artifacts (~/.mactions/win11-base.iso etc.) are copied
+# out before exit, so reaping these scratch dirs is always safe.
+WORKDIR=""           # auto_download_iso: UUP zip + unpacked payload + source ISO
+UNATTEND_STAGING=""  # build_unattend_iso: autounattend.xml + bootstrap.ps1 stage
+NOPROMPT_MNT=""      # make_noprompt_iso: read-only DMG mountpoint of the Win11 ISO
+cleanup_temp() {
+  [[ -n "$NOPROMPT_MNT" && -d "$NOPROMPT_MNT" ]] && {
+    hdiutil detach "$NOPROMPT_MNT" >/dev/null 2>&1 || true
+    rmdir "$NOPROMPT_MNT" 2>/dev/null || true
+  }
+  [[ -n "$WORKDIR"          ]] && rm -rf "$WORKDIR" 2>/dev/null || true
+  [[ -n "$UNATTEND_STAGING" ]] && rm -rf "$UNATTEND_STAGING" 2>/dev/null || true
+}
+trap cleanup_temp EXIT
 
 # --- Detect the hypervisor CLI ----------------------------------------------
 # VMware Fusion (free since Nov 2024) is the sole backend — the PROVEN Win11-ARM
@@ -93,6 +116,15 @@ Install VMware Fusion (free, and the PROVEN Win11-ARM backend; see AGENTS.md):
 EOF
   exit 1
 fi
+
+# Fusion is the SOLE backend (QEMU/UTM/Parallels were removed). An explicit
+# --tool value bypasses both auto-detect and the `none` guard above, and the
+# dispatch `case "$TOOL"` near the end has only a `fusion` arm — so any other
+# value (e.g. `--tool qemu`, or a casing typo `--tool Fusion`) would run the full
+# multi-GB ISO download + remaster and then match nothing, printing "Done" while
+# NO base VM was built. Reject it LOUDLY here, before any of that work.
+[[ "$TOOL" == "fusion" ]] \
+  || die "unsupported --tool '$TOOL' — VMware Fusion is the only backend (use --tool fusion, or omit it to auto-detect)."
 
 # --- Resolve the ISO: user-supplied, or auto-download the latest -------------
 # UUP dump JSON API: list arm64 builds newest-first, take the first, fetch the
@@ -168,7 +200,7 @@ auto_download_iso() {
   # 3.2, which mis-parses a heredoc nested inside `<(…)` process substitution
   # ("ambiguous redirect" + garbled stdin). Plain command substitution is safe.
   resolved="$(python3 - "$listing" <<'PY'
-import json, sys, re
+import json, sys
 try:
     with open(sys.argv[1]) as f:
         data = json.load(f)
@@ -185,7 +217,14 @@ EXCLUDE = ("insider", "preview update", "cumulative update", ".net framework",
            "update for windows 11 (")
 
 def ver(b):
-    return tuple(int(x) for x in re.findall(r"\d+", str(b or "")))
+    # Split on '.' (NOT a digit-run regex) so this agrees with Swift's
+    # WindowsImage.compareBuilds for the well-formed major.minor build strings UUP
+    # actually emits (e.g. "26100.1742"). (The old re.findall(r"\d+") also pulled
+    # digits out of any trailing parenthetical noise.) NOTE: this isn't byte-for-
+    # byte identical to Swift for DEGENERATE inputs — Swift keeps a non-numeric
+    # segment as 0 (Int($0) ?? 0) whereas this drops it — but such build strings
+    # never occur in the GA listing, so selection is unaffected.
+    return tuple(int(x) for x in str(b or "").split(".") if x.isdigit())
 
 best = None  # (sortkey, uuid, build)
 for r in rows:
@@ -219,7 +258,7 @@ PY
   echo "    build $build  (uuid $uuid)" >&2
 
   local workdir
-  workdir="$(mktemp -d)"
+  workdir="$(mktemp -d)"; WORKDIR="$workdir"   # reaped by the EXIT trap
   echo "==> Fetching the UUP download package + converting to ISO (this is the slow, multi-GB step)" >&2
   # The autodl=2 convert package (the ZIP holding uup_download_macos.sh + the
   # aria2 download list) is served ONLY by the front-end host uupdump.net — the
@@ -238,7 +277,11 @@ PY
   [[ -f "$conv" ]] || die "UUP package didn't contain a macOS convert script — convert manually, then re-run with --iso."
   chmod +x "$conv"
   ( cd "$workdir" && "./$(basename "$conv")" ) || die "ISO conversion failed (see output above)."
-  ISO="$(find "$workdir" -maxdepth 1 -name '*.ISO' -o -maxdepth 1 -name '*.iso' | head -n1)"
+  # -iname folds .iso/.ISO into ONE branch (the duplicated -maxdepth on each side
+  # of -o was fragile, since -maxdepth is a global option, not a per-branch test),
+  # and `sort` makes the pick deterministic if the converter ever leaves more than
+  # one ISO (filesystem order is otherwise unspecified).
+  ISO="$(find "$workdir" -maxdepth 1 -iname '*.iso' | sort | head -n1)"
   [[ -n "$ISO" && -f "$ISO" ]] || die "converter finished but produced no ISO in $workdir."
   echo "==> Built ISO: $ISO" >&2
 }
@@ -262,8 +305,10 @@ fi
 #
 # An ISO9660 disc the Fusion base build attaches as a SATA cdrom (sata0:1).
 build_unattend_iso() {
-  local staging out
-  staging="$(mktemp -d)"
+  # The staging dir is created + tracked by the PARENT (see the call site) so the
+  # top-level EXIT trap can reap it on a mid-build interrupt — a var assigned in
+  # this $(...) command-substitution subshell would NOT propagate to the parent.
+  local staging="$1" out
   out="${TMPDIR:-/tmp}/mactions-unattend.iso"
   mkdir -p "$staging/setup"
   cp "$HERE/autounattend.xml" "$staging/autounattend.xml"
@@ -287,13 +332,15 @@ build_unattend_iso() {
 # here; a clean boot is confirmed on the live base build — the one live-verify
 # step. If it ever fails to boot, delete it and the build uses the prompting ISO.)
 make_noprompt_iso() {
-  local src="$1" out mnt vol
+  # The source-ISO mountpoint is created + tracked by the PARENT (see the call
+  # site) so the top-level EXIT trap can detach+remove it on a mid-remaster
+  # interrupt — a var assigned in this $(...) subshell would NOT reach the parent.
+  local src="$1" mnt="$2" out vol
   if ! command -v xorriso >/dev/null 2>&1; then
     echo "    xorriso not installed (brew install xorriso) — using the prompting ISO (one Space-press at boot)" >&2
     echo "$src"; return
   fi
   out="${MACTIONS_ROOT}/win11-base.iso"
-  mnt="$(mktemp -d)"
   if ! hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$src" >/dev/null 2>&1; then
     rmdir "$mnt" 2>/dev/null || true
     echo "    couldn't mount $src — using prompting ISO" >&2; echo "$src"; return
@@ -331,18 +378,17 @@ make_noprompt_iso() {
 
 MACTIONS_ROOT="${HOME}/.mactions"
 echo "==> Building unattended-install ISO (autounattend.xml + bootstrap.ps1)"
-UNATTEND_ISO="$(build_unattend_iso)"
+# Create the staging dir in the PARENT (not inside the $(...) subshell) so the
+# top-level EXIT trap reaps it even if interrupted mid-build.
+UNATTEND_STAGING="$(mktemp -d)"
+UNATTEND_ISO="$(build_unattend_iso "$UNATTEND_STAGING")"
 echo "    $UNATTEND_ISO"
 
-# Record the build id this base image is built from so the app's auto-update
-# check (WindowsImage.recordedBaseImageBuild) can compare it to the latest
-# available and nudge a rebuild when Microsoft ships a newer Win11. Lives at the
-# mactions root (NOT under runs/, which is swept every go-online). MACTIONS_ROOT
-# is already set above for the unattend FAT build.
-if [[ -n "${RECORDED_BUILD:-}" ]]; then
-  mkdir -p "$MACTIONS_ROOT"
-  printf '%s\n' "$RECORDED_BUILD" > "$MACTIONS_ROOT/windows-base.build"
-fi
+# NOTE: windows-base.build (the recorded build id the app's auto-update check
+# reads) is written AFTER the base build SUCCEEDS — see the fusion arm below.
+# Recording it here, before the headless install, meant a failed build left a
+# recorded build for an image that was never produced (so the app would report
+# "up to date" against a base that doesn't exist).
 
 echo
 echo "Tool:        $TOOL"
@@ -364,7 +410,10 @@ case "$TOOL" in
     echo "==> Stashing unattend ISO at the canonical path for the Fusion base build"
     cp -f "$UNATTEND_ISO" "$MACTIONS_ROOT/mactions-unattend.iso"
     echo "==> Preparing the Win11 boot ISO (no-prompt remaster so there's no boot keypress)"
-    NOPROMPT_ISO="$(make_noprompt_iso "$ISO")"
+    # Create the mountpoint in the PARENT (not inside the $(...) subshell) so the
+    # top-level EXIT trap detaches+reaps it even if interrupted mid-remaster.
+    NOPROMPT_MNT="$(mktemp -d)"
+    NOPROMPT_ISO="$(make_noprompt_iso "$ISO" "$NOPROMPT_MNT")"
     if [[ "$NOPROMPT_ISO" != "$MACTIONS_ROOT/win11-base.iso" ]]; then
       # Fallback returned the original (prompting) ISO — stash it at the canonical path.
       cp -f "$NOPROMPT_ISO" "$MACTIONS_ROOT/win11-base.iso"
@@ -374,10 +423,26 @@ case "$TOOL" in
       WIN11_ISO="$MACTIONS_ROOT/win11-base.iso" \
       UNATTEND_ISO="$MACTIONS_ROOT/mactions-unattend.iso" \
       "$HERE/fusion-windows-base"
+    # Record the build id ONLY now that fusion-windows-base returned success (it
+    # verifies the provisioning sentinel + snapshot before exiting 0; under set -e
+    # a failed build would have aborted the script before reaching here). So the
+    # app's auto-update check (WindowsImage.recordedBaseImageBuild) never trusts a
+    # build id for a base that wasn't actually produced. Lives at the mactions root
+    # (NOT under runs/, which is swept every go-online).
+    if [[ -n "${RECORDED_BUILD:-}" ]]; then
+      mkdir -p "$MACTIONS_ROOT"
+      printf '%s\n' "$RECORDED_BUILD" > "$MACTIONS_ROOT/windows-base.build"
+    fi
     echo
     echo "==> Fusion base build done. Base lives at ~/.mactions/fusion/$NAME.vmx"
     echo "    (snapshot 'base-provisioned'). Per job, mactions-fusion-vm linked-clones"
     echo "    it into ~/.mactions/fusion/<id>/ and attaches a config.iso CD."
+    ;;
+  *)
+    # Unreachable: TOOL was validated to be exactly "fusion" above. Defensive arm
+    # so a future backend added to --tool without a dispatch arm fails loudly
+    # instead of printing "Done" with no VM built.
+    die "internal: no base-build dispatch for tool '$TOOL'"
     ;;
 esac
 

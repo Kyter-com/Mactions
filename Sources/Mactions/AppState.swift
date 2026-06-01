@@ -43,6 +43,14 @@ final class AppState: ObservableObject {
   /// True while the free-deps installer (`brew install …`) is running. Disables
   /// the "Install free prerequisites" button so it can't be double-fired.
   @Published var windowsPreflightBusy = false
+  /// A "newer Windows build available — rebuild" nudge, surfaced in the Windows
+  /// section as its OWN line. Deliberately NOT folded into `statusMessage`: the
+  /// check fires on every popover `onAppear`, and writing the status line there
+  /// clobbered the live "Online: N runners…" line just because the menu reopened.
+  @Published var windowsUpdateNotice: String?
+  /// Throttle the update check's network request so reopening the popover doesn't
+  /// hit UUP dump every time. `nil` until the first check.
+  private var lastWindowsUpdateCheck: Date?
 
   // Repo discovery (for the searchable picker).
   @Published var availableRepos: [RepoRef] = []
@@ -219,13 +227,19 @@ final class AppState: ObservableObject {
     guard let token = TokenStore.load() else { statusMessage = "Sign in first."; return }
     guard !selectedRepos.isEmpty else { statusMessage = "Pick at least one repository."; return }
     saveConfig()
-    HostCleanup.sweepOrphans()
     fleetEpoch += 1
     let myEpoch = fleetEpoch
     state = .starting
     statusMessage = "Preparing runner agent…"
     let repos = selectedRepos
     Task {
+      // Reap a prior crash/force-quit's orphans OFF the main actor — sweepOrphans
+      // shells out (pkill + `vmrun stop hard`/`deleteVM` + `rm -rf`), which can
+      // block for seconds with leftover clones and would otherwise stall the UI
+      // (the launch-time sweep is detached for the same reason). Sequenced BEFORE
+      // any provisioning so a stale clone can't survive into this generation.
+      await Task.detached { HostCleanup.sweepOrphans() }.value
+      guard fleetEpoch == myEpoch else { return }  // went offline during the sweep
       var created: [RunnerOrchestrator] = []
       do {
         let template = try await RunnerInstaller.ensureInstalled(token: token)
@@ -242,14 +256,18 @@ final class AppState: ObservableObject {
           }
           : nil
         // Cap concurrent Windows VMs to what this Mac's RAM can run without
-        // thrashing — each clone is a full 8 GB VM, so N repos each booting one
-        // would otherwise swamp the host. 0 => not enough RAM to run any safely
-        // (we then skip Windows entirely and say so, rather than lag the Mac).
+        // thrashing — each clone is a full VM, so N repos each booting one would
+        // otherwise swamp the host. 0 => not enough RAM to run any safely (we then
+        // skip Windows entirely and say so, rather than lag the Mac). The per-VM
+        // footprint is the base VMX's real `memsize` (linked clones inherit it),
+        // so a non-default `--ram` base stays in sync with the budget — not a
+        // hardcoded 8 GB. Falls back to the default when the VMX can't be read.
+        let perVMGB = Self.windowsPerVMGB(baseImage: windowsBaseImage)
         let maxWindowsVMs =
           windowsFactory == nil
           ? 0
           : WindowsVMBudget.maxConcurrentVMs(
-            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory)
+            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory, perVMGB: perVMGB)
         var windowsVMsStamped = 0
         for repo in repos {
           guard fleetEpoch == myEpoch else { break }
@@ -291,7 +309,7 @@ final class AppState: ObservableObject {
         if windowsFactory != nil, windowsVMsStamped < repos.count {
           let why =
             maxWindowsVMs == 0
-            ? "this Mac's RAM can't safely run an 8 GB Windows VM"
+            ? "this Mac's RAM can't safely run a \(perVMGB) GB Windows VM"
             : "RAM budget allows \(maxWindowsVMs) at once"
           statusMessage =
             (statusMessage ?? "")
@@ -426,6 +444,7 @@ final class AppState: ObservableObject {
     {
       windowsImageReady = true
       saveConfig()
+      clearWindowsUpdateNudge()
       statusMessage = "Windows base image '\(image)' is ready."
       return
     }
@@ -495,6 +514,10 @@ final class AppState: ObservableObject {
         if let cli, WindowsVMProviderFactory.baseImagePoweredOff(name: image, cli: cli) {
           windowsImageReady = true
           saveConfig()
+          // A just-built base IS the latest — drop any stale "newer build
+          // available" nudge and reset the throttle so the next popover open
+          // re-checks against the freshly recorded build rather than waiting 6h.
+          clearWindowsUpdateNudge()
           statusMessage = "Windows base image '\(image)' is ready."
         } else {
           windowsImageReady = false  // never persist a stale-true
@@ -559,18 +582,49 @@ final class AppState: ObservableObject {
   }
 
   /// Check whether a newer Win11 ARM64 build is available than the one the base
-  /// image was built from, and surface it (the auto-update nudge). Pure compare
-  /// logic lives in `WindowsImage`; this just wires it to the status line.
+  /// image was built from, and surface it as the dedicated `windowsUpdateNotice`
+  /// (NOT `statusMessage` — see that property). Pure compare logic lives in
+  /// `WindowsImage`. Throttled so reopening the popover doesn't re-hit the
+  /// network; the nudge is informational and a stale-by-hours result is fine.
+  /// Drop any "newer build available" nudge and reset the throttle. Called right
+  /// after a (re)build succeeds — the base now IS the latest, so a leftover nudge
+  /// would be stale, and clearing the throttle lets the next check recompute
+  /// immediately instead of waiting out the 6h window.
+  private func clearWindowsUpdateNudge() {
+    windowsUpdateNotice = nil
+    lastWindowsUpdateCheck = nil
+  }
+
   func checkForWindowsImageUpdate() {
-    guard windowsImageReady else { return }
+    guard windowsImageReady else { windowsUpdateNotice = nil; return }
+    if let last = lastWindowsUpdateCheck, Date().timeIntervalSince(last) < 6 * 3600 {
+      return  // checked recently — keep any existing notice, skip the request
+    }
+    lastWindowsUpdateCheck = Date()
     Task {
       guard let latest = try? await WindowsImage.latestBuild() else { return }
       let installed = WindowsImage.recordedBaseImageBuild()
-      if WindowsImage.updateAvailable(installed: installed, latest: latest.build) {
-        statusMessage =
-          "A newer Windows 11 ARM64 build (\(latest.build)) is available — click \"Rebuild / update Windows image\" to rebuild the base."
-      }
+      windowsUpdateNotice =
+        WindowsImage.updateAvailable(installed: installed, latest: latest.build)
+        ? "A newer Windows 11 ARM64 build (\(latest.build)) is available — click \"Rebuild / update Windows image\" to rebuild the base."
+        : nil
     }
+  }
+
+  /// Per-VM RAM footprint (GB) for the Windows budget: the base VMX's real
+  /// `memsize` (which every linked clone inherits) when readable, else the
+  /// default. Read off the main actor would be ideal, but it's a single tiny
+  /// file read — cheap enough to do inline on the goOnline Task.
+  static func windowsPerVMGB(baseImage: String) -> Int {
+    let vmx = HostCleanup.mactionsRoot()
+      .appendingPathComponent("fusion", isDirectory: true)
+      .appendingPathComponent("\(baseImage).vmx", isDirectory: false)
+    if let contents = try? String(contentsOf: vmx, encoding: .utf8),
+      let gb = WindowsVMBudget.perVMGB(fromVMX: contents)
+    {
+      return gb
+    }
+    return WindowsVMBudget.defaultPerVMGB
   }
 
   /// Locate `scripts/prepare-windows-image`. In `swift run` dev the cwd is the
