@@ -83,14 +83,20 @@ mkdir -p "$FUSION_DIR"
 if [[ -f "$VMX" ]]; then
   echo "==> Removing prior base VM '$NAME'" >&2
   vmrun_list_contains "$VMX" && { "$VMRUN" -T fusion stop "$VMX" hard >/dev/null 2>&1 || true; }
-  "$VMRUN" -T fusion deleteVM "$VMX" >/dev/null 2>&1 || true
 fi
-# deleteVM leaves the dir; clear the base's flat files (NOT the mactions-* clone
-# subdirs) so a rebuild starts clean.
+# Clear the base's flat files BY HAND — do NOT `vmrun deleteVM` the base. The base
+# lives flat in $FUSION_DIR, and deleteVM removes the .vmx's whole CONTAINING dir,
+# which here is $FUSION_DIR itself — nuking the dir (so disk creation then fails
+# "file not found") AND any mactions-* clone subdirs sitting beside it. rm of the
+# name-prefixed files + VMware's per-dir runtime files leaves the dir + clones
+# intact; the trailing mkdir is belt-and-suspenders.
 rm -f "${FUSION_DIR}/${NAME}".vmx "${FUSION_DIR}/${NAME}".vmdk \
       "${FUSION_DIR}/${NAME}"-*.vmdk "${FUSION_DIR}/${NAME}".nvram \
       "${FUSION_DIR}/${NAME}".vmsd "${FUSION_DIR}/${NAME}".vmxf \
-      "${FUSION_DIR}/${NAME}"*.vmsn 2>/dev/null || true
+      "${FUSION_DIR}/${NAME}"*.vmsn "${FUSION_DIR}/${NAME}"*.scoreboard \
+      "${FUSION_DIR}"/vmware*.log "${FUSION_DIR}"/mksSandbox*.log 2>/dev/null || true
+rm -rf "${FUSION_DIR}/caches" 2>/dev/null || true
+mkdir -p "$FUSION_DIR"
 
 # --- create the NVMe data disk ------------------------------------------------
 echo "==> Creating ${DISK_GB} GB disk: $DISK"
@@ -101,6 +107,10 @@ echo "==> Creating ${DISK_GB} GB disk: $DISK"
 # --- author the .vmx ----------------------------------------------------------
 # Mirrors the proven base: arm-windows11-64 guest, EFI firmware (VMware supplies
 # its own; no external edk2 needed), an NVMe system disk, and SATA cdroms. The
+# pciBridge4-7 pcieRootPorts are REQUIRED, not decoration: without them VMware
+# runs out of PCIe slots for NVMe + 3 cdroms + vmxnet3 + xHCI + SVGA and aborts
+# power-on with "Vmxnet3 PCI: failed to reserve slot" / "Module 'DevicePowerOn'
+# power on failed" (the VM exits instantly, never reaching the installer). The
 # NIC is vmxnet3 FROM CREATION (no manual e1000e->vmxnet3 switch) — it has no
 # in-box Win11-ARM driver, so bootstrap.ps1 installs VMware Tools first to bind
 # it. vTPM/SecureBoot are skipped; autounattend.xml's LabConfig bypasses the
@@ -109,13 +119,27 @@ echo "==> Authoring $VMX"
 cat > "$VMX" <<VMXEOF
 .encoding = "UTF-8"
 config.version = "8"
-virtualHW.version = "20"
+virtualHW.version = "22"
 displayName = "${NAME}"
 guestOS = "arm-windows11-64"
 firmware = "efi"
 numvcpus = "${CPUS}"
 cpuid.coresPerSocket = "${CPUS}"
 memsize = "${RAM_MB}"
+pciBridge4.present = "TRUE"
+pciBridge4.virtualDev = "pcieRootPort"
+pciBridge4.functions = "8"
+pciBridge5.present = "TRUE"
+pciBridge5.virtualDev = "pcieRootPort"
+pciBridge5.functions = "8"
+pciBridge6.present = "TRUE"
+pciBridge6.virtualDev = "pcieRootPort"
+pciBridge6.functions = "8"
+pciBridge7.present = "TRUE"
+pciBridge7.virtualDev = "pcieRootPort"
+pciBridge7.functions = "8"
+vmci0.present = "TRUE"
+hpet0.present = "TRUE"
 nvme0.present = "TRUE"
 nvme0:0.present = "TRUE"
 nvme0:0.fileName = "${NAME}.vmdk"
