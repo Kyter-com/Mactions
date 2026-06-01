@@ -94,10 +94,15 @@ try {
   Write-Warning "Git install failed (continuing): $_"
 }
 
-# 7-Zip ARM64 - small, fast, useful for many actions. Direct URL is stable.
+# 7-Zip ARM64 - small, fast, useful for many actions. NOTE: 7-Zip ships NO
+# ARM64 .msi (only x64) - the ARM64 build is an NSIS .exe that takes /S (NOT
+# Inno's /VERYSILENT). There's no "latest" URL alias, so the version is pinned
+# and must be bumped manually (check https://www.7-zip.org/download.html).
+# Non-fatal: the try/catch lets the runner come up without it.
 Write-Host 'Installing 7-Zip (ARM64)...'
 try {
-  Install-Msi -Url 'https://www.7-zip.org/a/7z2408-arm64.msi' -LocalName '7z-arm64.msi'
+  Install-Exe -Url 'https://www.7-zip.org/a/7z2601-arm64.exe' -LocalName '7z-arm64.exe' `
+    -Args @('/S')
 } catch {
   Write-Warning "7-Zip install failed (continuing): $_"
 }
