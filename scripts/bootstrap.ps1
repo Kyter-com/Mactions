@@ -1,5 +1,5 @@
 <#
-  bootstrap.ps1 — runs INSIDE the Windows 11 ARM guest on first logon
+  bootstrap.ps1 - runs INSIDE the Windows 11 ARM guest on first logon
   (invoked once by autounattend.xml's FirstLogonCommands, at BUILD time).
 
   Turns a fresh Win11-ARM install into a Mactions runner base image for the
@@ -12,15 +12,15 @@
     3. Disable UAC for this disposable guest so the task gets a full admin token.
 
   Per job, the host clones this base, injects a tiny config ISO carrying the JIT
-  registration (Parallels attaches it; UTM overwrites a fixed in-bundle drive),
-  and boots the clone headless. run-job.ps1 then:
+  registration (VMware Fusion: the clone's sata0:0 CD is wired to it at clone
+  time), and boots the clone headless. run-job.ps1 then:
     - finds the JIT on the config disc (by volume label / drive scan),
     - runs `run.cmd --jitconfig <JIT>` for exactly ONE job (registers OUTBOUND to
       GitHub, auto-deregisters when done),
     - powers the VM off. The host detects completion purely by polling VM power
       state, then deletes the clone. Nothing inbound, nothing left behind.
 
-  After this script finishes, SHUT THE VM DOWN — the powered-off VM is the
+  After this script finishes, SHUT THE VM DOWN - the powered-off VM is the
   pristine base image. (The first clone boot applies the EnableLUA=0 reboot-gated
   change.) Runs under in-box Windows PowerShell 5.1, so everything here is
   5.1-compatible.
@@ -34,10 +34,54 @@ $RunnerRoot = 'C:\actions-runner'
 
 Write-Host '== Mactions Windows base image bootstrap (outbound/headless) =='
 
+# --- 0a. Networking: on the VMware Fusion base build, the guest NIC is vmxnet3,
+# which has NO in-box Win11-ARM driver - so there is NO network until VMware
+# Tools installs it. Everything below downloads from the internet, so we MUST
+# bring the network up first. Install Tools silently from its attached CD (the
+# Fusion isoimages ISO mounts with volume label "VMware Tools" + a root
+# setup.exe), then wait for outbound connectivity. This whole block is a no-op on
+# the other backends (no Tools CD present) and on a re-run (Tools already
+# installed), so the shared bootstrap stays correct everywhere.
+function Test-Outbound {
+  try {
+    $r = Invoke-WebRequest -Uri 'https://api.github.com/zen' -UseBasicParsing -TimeoutSec 10
+    return ($r.StatusCode -eq 200)
+  } catch { return $false }
+}
+
+if (-not (Test-Outbound)) {
+  if (-not (Get-Service -Name 'VMTools' -ErrorAction SilentlyContinue)) {
+    $toolsVol = Get-Volume -ErrorAction SilentlyContinue |
+      Where-Object { $_.FileSystemLabel -eq 'VMware Tools' -and $_.DriveLetter } |
+      Select-Object -First 1
+    $setup = if ($toolsVol) { "$($toolsVol.DriveLetter):\setup.exe" } else { $null }
+    if ($setup -and (Test-Path $setup)) {
+      Write-Host 'Installing VMware Tools (silent, no reboot) to bring up vmxnet3 networking...'
+      try {
+        # InstallShield wrapper: /S = silent setup, /v passes the quoted args to
+        # msiexec; /qn = no MSI UI, REBOOT=R = suppress the reboot (the vmxnet3
+        # NIC driver binds via PnP without one). Routed through cmd so the
+        # embedded /v"..." quoting survives.
+        & "$env:ComSpec" /c "`"$setup`" /S /v`"/qn REBOOT=R`"" 2>&1 | Out-Null
+        Write-Host "VMware Tools setup exit: $LASTEXITCODE"
+      } catch {
+        Write-Warning "VMware Tools install failed (continuing; network wait will decide): $_"
+      }
+    }
+  }
+  Write-Host 'Waiting for outbound network (vmxnet3 binds after the Tools PnP driver install)...'
+  $deadline = (Get-Date).AddSeconds(180)
+  while ((Get-Date) -lt $deadline -and -not (Test-Outbound)) { Start-Sleep -Seconds 5 }
+  if (-not (Test-Outbound)) {
+    throw 'No outbound network after 180s. On VMware Fusion this means the vmxnet3 driver never bound (VMware Tools may need a reboot on this build); cannot download the runner agent.'
+  }
+  Write-Host 'Network is up.'
+}
+
 # --- 0. Dev tooling GitHub Actions workflows commonly need -------------------
 # We install these BEFORE the runner agent so a failure here is loud and
 # obvious (the agent install is the cheap fast step). All are silent installs
-# baked into the BASE image once — per-job clones inherit them via the qcow2
+# baked into the BASE image once - per-job clones inherit them via the qcow2
 # overlay, so workflows pay no install cost.
 #
 # Tools we install:
@@ -75,29 +119,58 @@ function Install-Exe {
   if ($proc.ExitCode -ne 0) { throw "$LocalName installer failed with exit code $($proc.ExitCode)" }
 }
 
-# Git for Windows (ARM64) — resolve the latest release at build time so we get
-# whatever's current. Inno Setup installer accepts a silent-install RSP file.
-Write-Host 'Installing Git for Windows (ARM64)...'
+# Git for Windows (ARM64) - use MinGit, a PLAIN .zip, NOT the Inno installer.
+# The `Git-*-arm64.exe` Inno installer still pops a GUI under an unattended
+# FirstLogonCommands session on ARM64 (its /VERYSILENT is honored on x64 but the
+# ARM64 build surfaces a window with no desktop to click), which STALLS the base
+# build. MinGit is Git-for-Windows' minimal redistributable (exactly what
+# automation needs: git.exe under \cmd) and extracts with the same ZipFile path
+# as the runner agent - zero installer UI possible. We add \cmd to the MACHINE
+# PATH so actions/checkout (and the runner service) resolve `git`.
+Write-Host 'Installing Git for Windows (ARM64, MinGit)...'
 try {
   $gitRel = Invoke-RestMethod 'https://api.github.com/repos/git-for-windows/git/releases/latest' `
     -Headers @{ 'User-Agent' = 'mactions'; 'Accept' = 'application/vnd.github+json' }
+  # Prefer the standard MinGit (skip the busybox variant for fewer surprises).
   $gitAsset = $gitRel.assets |
-    Where-Object { $_.name -match '^Git-.*-arm64\.exe$' } |
+    Where-Object { $_.name -match '^MinGit-.*-arm64\.zip$' -and $_.name -notmatch 'busybox' } |
     Select-Object -First 1
   if (-not $gitAsset) {
-    Write-Warning "No Git-for-Windows ARM64 asset in release $($gitRel.tag_name); skipping Git install."
+    Write-Warning "No MinGit ARM64 asset in release $($gitRel.tag_name); skipping Git install."
   } else {
-    Install-Exe -Url $gitAsset.browser_download_url -LocalName 'git-arm64-setup.exe' `
-      -Args @('/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES','/NOCANCEL','/CLOSEAPPLICATIONS')
+    $gitDir = 'C:\Git'
+    $gitZip = Join-Path $env:TEMP 'mingit-arm64.zip'
+    if (Test-Path $gitZip) { Remove-Item $gitZip -Force }
+    Invoke-WebRequest -Uri $gitAsset.browser_download_url -OutFile $gitZip -UseBasicParsing
+    if (Test-Path $gitDir) { Remove-Item $gitDir -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $gitDir | Out-Null
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($gitZip, $gitDir)
+    Remove-Item $gitZip -Force
+    $gitCmd = Join-Path $gitDir 'cmd'
+    if (-not (Test-Path (Join-Path $gitCmd 'git.exe'))) {
+      throw "git.exe not found under $gitCmd after MinGit extract"
+    }
+    $machPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    if ($machPath -notlike "*$gitCmd*") {
+      [Environment]::SetEnvironmentVariable('Path', ($machPath.TrimEnd(';') + ';' + $gitCmd), 'Machine')
+    }
+    $env:Path = $env:Path + ';' + $gitCmd
+    & "$gitCmd\git.exe" --version | Write-Host
   }
 } catch {
   Write-Warning "Git install failed (continuing): $_"
 }
 
-# 7-Zip ARM64 — small, fast, useful for many actions. Direct URL is stable.
+# 7-Zip ARM64 - small, fast, useful for many actions. NOTE: 7-Zip ships NO
+# ARM64 .msi (only x64) - the ARM64 build is an NSIS .exe that takes /S (NOT
+# Inno's /VERYSILENT). There's no "latest" URL alias, so the version is pinned
+# and must be bumped manually (check https://www.7-zip.org/download.html).
+# Non-fatal: the try/catch lets the runner come up without it.
 Write-Host 'Installing 7-Zip (ARM64)...'
 try {
-  Install-Msi -Url 'https://www.7-zip.org/a/7z2408-arm64.msi' -LocalName '7z-arm64.msi'
+  Install-Exe -Url 'https://www.7-zip.org/a/7z2601-arm64.exe' -LocalName '7z-arm64.exe' `
+    -Args @('/S')
 } catch {
   Write-Warning "7-Zip install failed (continuing): $_"
 }
@@ -115,7 +188,7 @@ $RunnerVersion = $rel.tag_name -replace '^v', ''            # 'v2.334.0' -> '2.3
 $assetName     = "actions-runner-win-arm64-$RunnerVersion.zip"
 $asset         = $rel.assets | Where-Object { $_.name -eq $assetName }
 if (-not $asset) {
-  throw "No '$assetName' asset in actions-runner release $($rel.tag_name) — GitHub may have changed asset naming."
+  throw "No '$assetName' asset in actions-runner release $($rel.tag_name) - GitHub may have changed asset naming."
 }
 
 Write-Host "Installing actions-runner-win-arm64 v$RunnerVersion to $RunnerRoot ..."
@@ -133,7 +206,7 @@ do {
     Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -Headers $ghHeaders
     $len = (Get-Item $zip).Length
     if ($len -lt 20MB) {
-      throw "runner.zip is only $len bytes from $url — not the agent archive (truncated/unexpected body)."
+      throw "runner.zip is only $len bytes from $url - not the agent archive (truncated/unexpected body)."
     }
     break
   } catch {
@@ -150,12 +223,12 @@ try {
   [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $RunnerRoot)
 } catch {
   $len = (Get-Item $zip -ErrorAction SilentlyContinue).Length
-  throw "failed to extract runner.zip ($len bytes) from $url — not a valid zip (bad/partial download): $_"
+  throw "failed to extract runner.zip ($len bytes) from $url - not a valid zip (bad/partial download): $_"
 }
 Remove-Item $zip -Force
 
 if (-not (Test-Path (Join-Path $RunnerRoot 'run.cmd'))) {
-  throw "run.cmd not found in $RunnerRoot — runner extraction failed."
+  throw "run.cmd not found in $RunnerRoot - runner extraction failed."
 }
 
 # --- 2. Per-job runtime: written at build time, runs on EVERY clone boot -----
@@ -163,9 +236,12 @@ $JobScript = 'C:\setup\run-job.ps1'
 New-Item -ItemType Directory -Force -Path 'C:\setup' | Out-Null
 
 # run-job.ps1 finds the per-clone JIT on the injected config disc, runs ONE job,
-# then powers the VM off (the host's only completion signal). NOTE: it must NOT
-# power off when no JIT is found — a media-attach race should self-heal, not look
-# like a completed job to the host's power-state poll.
+# then powers the VM off (the host's only completion signal). It ALSO powers off
+# if no JIT is found after the full wait: the config disc is always pre-attached
+# before the VM starts (no attach race on any backend), and leaving the VM up
+# never self-heals (no re-scan, -AtLogOn task won't re-fire this session), so a
+# fast power-off lets the host reclaim the slot and reconcile a fresh clone
+# instead of stalling the full jobTimeout on a wedged guest.
 @'
 $ErrorActionPreference = "Continue"
 $RunnerRoot = "C:\actions-runner"
@@ -175,7 +251,7 @@ Start-Transcript -Path (Join-Path $LogDir "run-job.log") -Append -Force | Out-Nu
 function Find-Jit {
   # Scan removable + CD-ROM volumes (DriveType 2,5) for the known per-clone file,
   # then fall back to every filesystem root and the MACTIONS-labeled volume.
-  # Robust against drive-letter shuffle — mirrors autounattend.xml's bootstrap scan.
+  # Robust against drive-letter shuffle - mirrors autounattend.xml's bootstrap scan.
   $known = "mactions\jitconfig"
   $roots = @()
   $roots += (Get-CimInstance Win32_LogicalDisk -ErrorAction SilentlyContinue |
@@ -201,13 +277,20 @@ if ($jit) {
   # ephemeral run). --jitconfig makes it single-use; no --once needed.
   & "$RunnerRoot\run.cmd" --jitconfig "$jit"
   Stop-Transcript | Out-Null
-  # Self power-off — the host detects completion purely via VM power state.
+  # Self power-off - the host detects completion purely via VM power state.
   shutdown /s /t 0
 } else {
-  # No JIT yet: do NOT power off (a media race would look like a finished job to
-  # the host). Leave the VM up; the host's jobTimeout + force-kill is the backstop.
-  Write-Output "no jitconfig found on any removable/CD volume after wait; leaving VM up"
+  # No JIT after the full 120s wait. The config disc is wired to the clone's
+  # sata0:0 CD BEFORE the VM starts (mactions-fusion-vm's clone verb), so a null
+  # result here means a genuinely broken clone, NOT a transient attach race -
+  # and leaving the VM up does NOT self-heal (this script never re-scans, and the
+  # task is -AtLogOn only, so it won't re-fire within the same logged-on session).
+  # Power off so the host's power-state poll reclaims the slot fast and the
+  # orchestrator reconciles a fresh clone (with a fresh JIT) instead of burning
+  # the full ~50-min jobTimeout on an idle guest while the JIT token expires.
+  Write-Output "no jitconfig found on any removable/CD volume after wait; powering off so the host reclaims the slot"
   Stop-Transcript | Out-Null
+  shutdown /s /t 0
 }
 '@ | Set-Content -Path $JobScript -Encoding UTF8
 
@@ -227,7 +310,7 @@ Register-ScheduledTask -TaskName 'MactionsRunOnce' -Action $action -Trigger $tri
 # --- 3. Disable UAC for the disposable guest --------------------------------
 # `runner` is a local admin; with UAC on, the task could get a filtered token,
 # breaking job steps that need admin. This guest is destroyed after one job.
-# Reboot-gated — applied on the first clone boot for a job.
+# Reboot-gated - applied on the first clone boot for a job.
 Set-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' `
   -Name EnableLUA -Value 0
 
@@ -235,8 +318,8 @@ Write-Host ''
 Write-Host '== Bootstrap complete. =='
 Write-Host 'Per job, the host injects the JIT via a config disc; the runner registers'
 Write-Host 'OUTBOUND, runs one job, and the VM powers itself off.'
-# Auto-power-off so headless build scripts (QEMU) detect completion via guest
-# shutdown without a human in the loop. 30s delay lets the FirstLogonCommands
-# Windows wraps around us mark Setup complete + flush post-FLC work before the
-# VM goes down. Harmless on UTM/Parallels — the user previously did this by hand.
+# Auto-power-off so fusion-windows-base detects completion via guest shutdown
+# (it polls `vmrun list`) without a human in the loop. The 30s delay lets the
+# FirstLogonCommands wrapper mark Setup complete + flush post-FLC work before the
+# VM goes down.
 shutdown /s /t 30 /c "Mactions base image bootstrap complete"

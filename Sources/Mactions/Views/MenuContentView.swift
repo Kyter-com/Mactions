@@ -215,8 +215,8 @@ struct MenuContentView: View {
         .disabled(app.state != .offline || app.windowsSetupBusy)
         Text(
           app.windowsBackendAvailable
-            ? "Downloads the latest Win11 ARM64 ISO and builds a throwaway base VM (multi-GB, one time). Not yet live-verified."
-            : "Needs Parallels (recommended) or UTM installed. Downloads the latest Win11 ARM64 ISO + builds a base VM when set up."
+            ? "Clones a throwaway Win11 ARM64 base VM per job and destroys it after (multi-GB base build, one time). Proven end to end on VMware Fusion."
+            : "Install VMware Fusion (free, from the Broadcom portal) — the proven Win11-ARM backend — then this downloads the latest Win11 ARM64 ISO + builds the one-time base VM."
         )
         .font(.caption2).foregroundStyle(.secondary)
         .fixedSize(horizontal: false, vertical: true)
@@ -302,12 +302,12 @@ struct MenuContentView: View {
   }
 }
 
-/// The free-first prerequisite checklist + auto-install button. Split into its
-/// own subview so the SwiftUI type-checker stays fast and `windowsSection`
-/// doesn't balloon. Shows ✓/✗ for Homebrew, a Windows hypervisor, and the
-/// UUP-dump converter tools, plus a one-click installer for the MISSING FREE
-/// deps (UTM + converter formulae) — it never installs Parallels (paid) and
-/// never installs Homebrew (points at brew.sh instead).
+/// The prerequisite checklist + auto-install button. Split into its own subview
+/// so the SwiftUI type-checker stays fast and `windowsSection` doesn't balloon.
+/// Shows ✓/✗ for Homebrew, VMware Fusion, and the UUP-dump converter tools, plus
+/// a one-click installer for the MISSING FREE brew deps (converter tools +
+/// xorriso). It never installs a hypervisor (Fusion is a manual Broadcom-portal
+/// download) and never installs Homebrew (points at brew.sh).
 private struct WindowsPreflightChecklist: View {
   @ObservedObject var app: AppState
 
@@ -335,7 +335,7 @@ private struct WindowsPreflightChecklist: View {
         .disabled(app.state != .offline || app.windowsPreflightBusy)
         Text(
           (report.homebrewInstalled)
-            ? "Installs only the missing FREE tools (UTM + converter tools) via Homebrew. Never installs paid Parallels."
+            ? "Installs only the missing FREE tools (ISO converter tools + xorriso) via Homebrew. VMware Fusion is a separate, free manual download (Broadcom portal)."
             : "Install Homebrew first: https://brew.sh — then this installs the free tools."
         )
         .font(.caption2).foregroundStyle(.secondary)
@@ -360,7 +360,7 @@ private struct WindowsPreflightChecklist: View {
     if let backend = report?.recommendedBackend {
       return "Hypervisor: \(backend.displayName)"
     }
-    return "Hypervisor (UTM recommended — free)"
+    return "Hypervisor (VMware Fusion recommended — free, proven Win11-ARM)"
   }
 
   private func converterLabel(_ report: WindowsPreflight.Report?) -> String {

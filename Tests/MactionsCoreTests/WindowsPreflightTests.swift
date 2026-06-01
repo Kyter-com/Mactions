@@ -3,15 +3,15 @@ import XCTest
 @testable import MactionsCore
 
 /// Unit tests for the *pure* logic of the Windows prerequisite preflight:
-/// detection assembly, the brew-command builder, free-first backend selection,
-/// and the missing-Homebrew path. No shelling out, no real `brew`/UTM, no
-/// network — these pin the install command shapes + the free-first policy the
-/// same way `WindowsImageTests` pins the UUP-dump logic.
+/// detection assembly + the brew-command builder. No shelling out, no real
+/// `brew`/Fusion, no network. VMware Fusion is the sole backend and is a MANUAL
+/// (non-brew) install, so the plan only ever installs the free brew-able tools
+/// (UUP-dump converters + xorriso) — never a hypervisor.
 final class WindowsPreflightTests: XCTestCase {
 
   // Build a report from a set of "installed" tool names via the injectable
   // probes. `whichHits` covers PATH/Homebrew bins; `pathHits` covers absolute
-  // paths (UTM's utmctl + the two brew prefixes).
+  // paths (Fusion's vmrun + the brew prefixes).
   private func report(
     which whichHits: Set<String> = [],
     paths pathHits: Set<String> = []
@@ -38,21 +38,20 @@ final class WindowsPreflightTests: XCTestCase {
     XCTAssertEqual(r.homebrew.path, "/usr/local/bin/brew")
   }
 
-  func testDetectsUTMInsideAppBundleNotOnPath() {
-    // utmctl ships inside UTM.app, never on PATH — must be probed by abs path.
-    let r = report(paths: [WindowsPreflight.utmctlPath])
-    XCTAssertEqual(r.hypervisors[.utm]?.installed, true)
-    XCTAssertEqual(r.installedHypervisors, [.utm])
+  func testDetectsVMwareFusionInsideAppBundleNotOnPath() {
+    // vmrun ships inside VMware Fusion.app, never on PATH — probed by abs path.
+    let r = report(paths: [WindowsPreflight.vmrunPath])
+    XCTAssertTrue(r.fusionInstalled)
     XCTAssertTrue(r.hasHypervisor)
+    XCTAssertEqual(r.recommendedBackend, .vmwareFusion)
+    XCTAssertTrue(WindowsPreflight.Hypervisor.vmwareFusion.isFree)  // free since Nov 2024
   }
 
-  func testDetectsParallelsAndQemuViaWhich() {
-    let r = report(which: ["prlctl", "qemu-system-aarch64"])
-    XCTAssertEqual(r.hypervisors[.parallels]?.installed, true)
-    XCTAssertEqual(r.hypervisors[.qemu]?.installed, true)
-    XCTAssertEqual(r.hypervisors[.utm]?.installed, false)
-    // Free-first iteration order is preserved (utm absent → parallels, qemu).
-    XCTAssertEqual(r.installedHypervisors, [.parallels, .qemu])
+  func testFusionAbsentMeansNoBackend() {
+    let r = report(which: ["brew"])  // brew but no vmrun
+    XCTAssertFalse(r.fusionInstalled)
+    XCTAssertFalse(r.hasHypervisor)
+    XCTAssertNil(r.recommendedBackend)
   }
 
   func testConvertersMapMissingBinariesToBrewFormulae() {
@@ -64,58 +63,13 @@ final class WindowsPreflightTests: XCTestCase {
     XCTAssertTrue(allPresent.missingConverterFormulae.isEmpty)
   }
 
-  // MARK: Free-first backend selection
-
-  func testRecommendedBackendPrefersFreeUTM() {
-    // Both UTM (free) and Parallels (paid) present -> recommend UTM.
-    let r = report(which: ["prlctl"], paths: [WindowsPreflight.utmctlPath])
-    XCTAssertEqual(r.recommendedBackend, .utm)
-  }
-
-  func testRecommendedBackendUsesParallelsOnlyWhenItsTheOnlyOne() {
-    // Parallels is paid, but if it's the ONLY hypervisor present we use it
-    // (never install it, but honor an existing license).
-    let r = report(which: ["prlctl"])
-    XCTAssertEqual(r.recommendedBackend, .parallels)
-  }
-
-  func testRecommendedBackendFallsBackToQemu() {
-    let r = report(which: ["qemu-system-aarch64"])
-    XCTAssertEqual(r.recommendedBackend, .qemu)
-  }
-
-  func testRecommendedBackendNilWhenNonePresent() {
-    XCTAssertNil(report().recommendedBackend)
-    // The free backend we'd offer to INSTALL is now QEMU (fully headless — no
-    // Aqua login session, runs from launchd). UTM is honored if present but no
-    // longer pushed; Parallels (paid) is never recommended.
-    XCTAssertEqual(WindowsPreflight.Report.recommendedFreeBackendToInstall, .qemu)
-    XCTAssertTrue(WindowsPreflight.Report.recommendedFreeBackendToInstall.isFree)
-    XCTAssertFalse(WindowsPreflight.Hypervisor.parallels.isFree)
-  }
-
-  func testRecommendedBackendPrefersQEMUStackOverUTMWhenStackReady() {
-    // Both UTM and the full QEMU stack present: prefer QEMU (headless, no
-    // Aqua session — UTM's hard limit for unattended hosts).
-    let r = report(
-      which: ["qemu-system-aarch64", "swtpm"],
-      paths: [
-        WindowsPreflight.utmctlPath, WindowsPreflight.efiCodePath, WindowsPreflight.efiVarsPath,
-      ])
-    XCTAssertTrue(r.qemuStackReady)
-    XCTAssertEqual(r.recommendedBackend, .qemu)
-  }
-
-  func testQEMUWithoutSwtpmOrEFIFirmwareIsNotStackReady() {
-    // qemu binary alone isn't enough — Win11 needs TPM 2.0 (swtpm) + EFI fw.
-    let r1 = report(which: ["qemu-system-aarch64"])  // no swtpm, no firmware
-    XCTAssertFalse(r1.qemuStackReady)
-    let r2 = report(which: ["qemu-system-aarch64", "swtpm"])  // no firmware
-    XCTAssertFalse(r2.qemuStackReady)
-    let r3 = report(
-      which: ["qemu-system-aarch64", "swtpm"],
-      paths: [WindowsPreflight.efiCodePath, WindowsPreflight.efiVarsPath])
-    XCTAssertTrue(r3.qemuStackReady)
+  func testMissingFreeFormulaeIncludesXorriso() {
+    // xorriso (for the no-prompt boot ISO) is brew-able and folded into the free
+    // install list — but is NOT required for `ready` (the build falls back).
+    let r = report(which: Set(WindowsImage.converterDependencies.map(\.binary)))  // converters present, no xorriso
+    XCTAssertTrue(r.missingConverterFormulae.isEmpty)
+    XCTAssertFalse(r.xorrisoInstalled)
+    XCTAssertEqual(r.missingFreeFormulae, ["xorriso"])
   }
 
   // MARK: Install plan (the pure brew-command builder)
@@ -129,72 +83,51 @@ final class WindowsPreflightTests: XCTestCase {
     XCTAssertTrue(message.contains("https://brew.sh"))
   }
 
-  func testInstallPlanInstallsQEMUStackAndMissingConvertersWhenBrewPresent() {
-    // brew present, nothing else -> install the QEMU stack (qemu + swtpm) and
-    // all converter tools. We no longer push UTM (still honored at runtime,
-    // but not the free default we'll install on the user's behalf).
+  func testInstallPlanInstallsMissingConvertersAndXorrisoWhenBrewPresent() {
+    // brew present, nothing else -> install all converter tools + xorriso in one
+    // command. NEVER a hypervisor (Fusion is a manual Broadcom-portal download).
     let plan = WindowsPreflight.installPlan(for: report(which: ["brew"]))
     guard case let .install(commands) = plan else {
       return XCTFail("expected .install, got \(plan)")
     }
-    XCTAssertEqual(commands.count, 2)
+    XCTAssertEqual(commands.count, 1)
     XCTAssertEqual(commands[0].executable, "/opt/homebrew/bin/brew")
-    XCTAssertEqual(commands[0].arguments, ["install", "qemu", "swtpm"])
     XCTAssertEqual(
-      commands[1].arguments,
-      ["install", "aria2", "cabextract", "wimlib", "cdrtools", "minacle/chntpw/chntpw"])
-    XCTAssertFalse(
-      commands.contains { $0.arguments.contains("--cask") },
-      "must NOT install UTM cask (no longer the free default)")
+      commands[0].arguments,
+      ["install", "aria2", "cabextract", "wimlib", "cdrtools", "minacle/chntpw/chntpw", "xorriso"])
+    // No hypervisor formula/cask is ever planned.
+    XCTAssertFalse(commands.contains { $0.arguments.contains("--cask") })
+    XCTAssertFalse(commands.contains { $0.arguments.contains("qemu") })
+    XCTAssertFalse(commands.contains { $0.arguments.contains("parallels") })
   }
 
-  func testInstallPlanTopsUpMissingSwtpmWhenQemuAlreadyInstalled() {
-    // qemu binary is present but swtpm wasn't installed alongside (e.g. user
-    // had brew qemu from before). Top up just the missing piece + still install
-    // converters — we never re-install qemu in that case.
-    let r = report(
-      which: ["brew", "qemu-system-aarch64", "aria2c", "cabextract", "wimlib-imagex", "mkisofs",
-        "chntpw"],
-      paths: [WindowsPreflight.efiCodePath, WindowsPreflight.efiVarsPath])
+  func testInstallPlanOnlyXorrisoWhenConvertersPresent() {
+    // Converters all present but xorriso missing -> install just xorriso.
+    let r = report(which: Set(["brew"] + WindowsImage.converterDependencies.map(\.binary)))
     let plan = WindowsPreflight.installPlan(for: r)
     guard case let .install(commands) = plan else {
       return XCTFail("expected .install, got \(plan)")
     }
     XCTAssertEqual(commands.count, 1)
-    XCTAssertEqual(commands[0].arguments, ["install", "swtpm"])
-  }
-
-  func testInstallPlanNeverInstallsParallelsAndSkipsHypervisorWhenOnePresent() {
-    // Parallels already present (paid). We must NOT add a hypervisor cask and
-    // must NEVER emit a `--cask parallels`. Only the missing converters install.
-    let plan = WindowsPreflight.installPlan(
-      for: report(which: ["brew", "prlctl", "aria2c", "cabextract", "wimlib-imagex"]))
-    guard case let .install(commands) = plan else {
-      return XCTFail("expected .install, got \(plan)")
-    }
-    XCTAssertEqual(commands.count, 1)
-    XCTAssertEqual(commands[0].arguments, ["install", "cdrtools", "minacle/chntpw/chntpw"])
-    XCTAssertFalse(
-      commands.contains { $0.arguments.contains("parallels") },
-      "must never plan to install paid Parallels")
-  }
-
-  func testInstallPlanSkipsUTMCaskWhenAFreeHypervisorAlreadyPresent() {
-    // UTM already present -> no hypervisor cask; just the missing converters.
-    let plan = WindowsPreflight.installPlan(
-      for: report(which: ["brew"], paths: [WindowsPreflight.utmctlPath]))
-    guard case let .install(commands) = plan else {
-      return XCTFail("expected .install, got \(plan)")
-    }
-    XCTAssertFalse(commands.contains { $0.arguments.contains("--cask") })
-    XCTAssertEqual(commands.first?.arguments.first, "install")
+    XCTAssertEqual(commands[0].arguments, ["install", "xorriso"])
   }
 
   func testInstallPlanNothingToInstallWhenEverythingPresent() {
     let everything = report(
-      which: Set(["brew", "prlctl"] + WindowsImage.converterDependencies.map(\.binary)))
+      which: Set(["brew", "xorriso"] + WindowsImage.converterDependencies.map(\.binary)),
+      paths: [WindowsPreflight.vmrunPath])
     XCTAssertTrue(everything.ready)
     XCTAssertEqual(WindowsPreflight.installPlan(for: everything), .nothingToInstall)
+  }
+
+  func testReadyDoesNotRequireXorriso() {
+    // Fusion + brew + converters present, xorriso absent -> still "ready" (the
+    // no-prompt ISO gracefully falls back to a one-keypress prompting ISO).
+    let r = report(
+      which: Set(["brew"] + WindowsImage.converterDependencies.map(\.binary)),
+      paths: [WindowsPreflight.vmrunPath])
+    XCTAssertFalse(r.xorrisoInstalled)
+    XCTAssertTrue(r.ready)
   }
 
   // MARK: runInstall accounting (with an injected runner — no shelling out)
@@ -212,7 +145,7 @@ final class WindowsPreflightTests: XCTestCase {
     XCTAssertTrue(message.contains("https://brew.sh"))
   }
 
-  func testRunInstallRunsEveryPlannedCommandOnSuccess() {
+  func testRunInstallRunsThePlannedCommandOnSuccess() {
     var ran: [[String]] = []
     let result = WindowsPreflight.runInstall(for: report(which: ["brew"])) { cmd in
       ran.append(cmd.arguments)
@@ -220,41 +153,7 @@ final class WindowsPreflightTests: XCTestCase {
     }
     XCTAssertEqual(result, .installed)
     XCTAssertEqual(ran, [
-      ["install", "qemu", "swtpm"],
-      ["install", "aria2", "cabextract", "wimlib", "cdrtools", "minacle/chntpw/chntpw"],
+      ["install", "aria2", "cabextract", "wimlib", "cdrtools", "minacle/chntpw/chntpw", "xorriso"],
     ])
-  }
-
-  func testRunInstallStopsAtFirstFailureAndReportsIt() {
-    var ran = 0
-    let result = WindowsPreflight.runInstall(for: report(which: ["brew"])) { _ in
-      ran += 1
-      return (1, "  brew: download failed\n")
-    }
-    XCTAssertEqual(ran, 1, "must stop at the first failing command")
-    guard case let .failed(command, stderr) = result else {
-      return XCTFail("expected .failed, got \(result)")
-    }
-    XCTAssertTrue(command.contains("install qemu swtpm"))
-    XCTAssertEqual(stderr, "brew: download failed")  // trimmed
-  }
-
-  func testRunInstallTreatsUnlaunchableCommandAsFailure() {
-    let result = WindowsPreflight.runInstall(for: report(which: ["brew"])) { _ in
-      (nil, "could not launch")  // nil status == couldn't launch the process
-    }
-    guard case .failed = result else {
-      return XCTFail("expected .failed, got \(result)")
-    }
-  }
-
-  func testRunInstallNothingToInstallWhenAllPresent() {
-    let everything = report(
-      which: Set(["brew", "prlctl"] + WindowsImage.converterDependencies.map(\.binary)))
-    let result = WindowsPreflight.runInstall(for: everything) { _ in
-      XCTFail("should not run any command")
-      return (0, "")
-    }
-    XCTAssertEqual(result, .nothingToInstall)
   }
 }

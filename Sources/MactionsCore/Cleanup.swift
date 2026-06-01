@@ -62,27 +62,34 @@ public enum HostCleanup {
   /// Best-effort: delete leftover ephemeral Windows VM clones from a crashed
   /// session. The Windows provider names its throwaway clones `mactions-…`, the
   /// same prefix we scope teardown to, so we never touch a non-Mactions VM.
-  /// No-op if neither `prlctl` (Parallels) nor `utmctl` (UTM) is present.
+  /// VMware Fusion is the sole backend: clones are on-disk per-clone subdirs
+  /// under `~/.mactions/fusion/mactions-*` (not in any registry vmrun can list),
+  /// so we drive the `mactions-fusion-vm` helper's `list`/`delete` verbs (delete
+  /// = `vmrun stop hard` + `deleteVM` + `rm -rf` the clone dir), then an on-disk
+  /// fallback sweep. No-op if the helper isn't present.
   ///
-  /// Honors the ephemerality bar across crashes: if the app died mid-job the
-  /// hypervisor can leave a powered-down clone (with its `_work` checkout)
+  /// Honors the ephemerality bar across crashes: if the app died mid-job, a
+  /// powered-down clone (with its `_work` checkout + linked disk) can be left
   /// behind; this reaps it on the next go-online.
   public static func purgeStrayWindowsClones() {
-    // Parallels: `prlctl list --all -o name` prints one VM name per line.
-    if let prlctl = Shell.which("prlctl"),
-      let list = try? Shell.run(prlctl, ["list", "--all", "-o", "name"]), list.ok {
+    // Drive the helper's own list/delete (it self-prepends the Fusion + Homebrew
+    // bins to PATH, so this works even from a Finder/launchd-launched app).
+    if let fusion = WindowsVMProviderFactory.fusionHelperPath,
+      let list = try? Shell.run(fusion, ["list"]), list.ok {
       for name in windowsCloneNames(in: list.stdout) {
-        _ = try? Shell.run(prlctl, ["stop", name, "--kill"])
-        _ = try? Shell.run(prlctl, ["delete", name])
+        _ = try? Shell.run(fusion, ["delete", name])
       }
     }
-    // UTM: `utmctl list` prints a table whose rows include the VM name.
-    let utmctl = "/Applications/UTM.app/Contents/MacOS/utmctl"
-    if FileManager.default.isExecutableFile(atPath: utmctl),
-      let list = try? Shell.run(utmctl, ["list"]), list.ok {
-      for name in windowsCloneNames(in: list.stdout) {
-        _ = try? Shell.run(utmctl, ["stop", name])
-        _ = try? Shell.run(utmctl, ["delete", name])
+    // Belt-and-suspenders: even if the helper is gone (tools uninstalled) or its
+    // setup died, reap any leftover throwaway clone dirs by hand. The `mactions-`
+    // prefix scopes this to our own clones (the base's flat `win11-runner-base.*`
+    // files aren't matched). Fusion clones are powered off by `delete`/crash and
+    // hold no detached host process, so a plain removeItem suffices.
+    let fm = FileManager.default
+    let clonesDir = NSString(string: "~/.mactions/fusion").expandingTildeInPath
+    if let entries = try? fm.contentsOfDirectory(atPath: clonesDir) {
+      for entry in entries where entry.hasPrefix("mactions-") {
+        try? fm.removeItem(atPath: clonesDir + "/" + entry)
       }
     }
   }

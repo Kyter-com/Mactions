@@ -147,6 +147,23 @@
   </settings>
 
   <settings pass="oobeSystem">
+    <!--
+      Region/keyboard locale for the oobeSystem pass. windowsPE declares
+      International-Core too, but on 24H2/25H2 (build 26100/26200) the OOBE
+      region + keyboard-layout screens are driven by the oobeSystem locale
+      settings — without this component the unattended install can still stop on
+      the interactive "Is this the right country or region?" / keyboard screen
+      even with a provisioned LocalAccount. Microsoft's automate-OOBE guidance
+      lists these as required for full automation.
+    -->
+    <component name="Microsoft-Windows-International-Core"
+               processorArchitecture="arm64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
     <component name="Microsoft-Windows-Shell-Setup"
                processorArchitecture="arm64"
                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
@@ -170,6 +187,9 @@
       <OOBE>
         <HideEULAPage>true</HideEULAPage>
         <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <!-- The provisioned LocalAccount means no interactive account screen is
+             needed; hide it so 24H2/25H2 can't drop into it. -->
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
         <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
         <ProtectYourPC>3</ProtectYourPC>
         <SkipMachineOOBE>true</SkipMachineOOBE>
