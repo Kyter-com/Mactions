@@ -199,7 +199,7 @@ struct MenuContentView: View {
         .toggleStyle(.switch)
         .controlSize(.mini)
         .disabled(app.state != .offline)
-        Button("Rebuild / update Windows image") { app.setUpWindowsRunner() }
+        Button("Rebuild / update Windows image") { app.setUpWindowsRunner(force: true) }
           .buttonStyle(.bordered).controlSize(.small)
           .disabled(app.state != .offline || app.windowsSetupBusy)
       } else {
