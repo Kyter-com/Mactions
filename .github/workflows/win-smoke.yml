@@ -1,0 +1,22 @@
+name: Windows smoke (Mactions runner)
+
+# Manual-only: a tiny job that runs on a Windows-ARM runner provided by Mactions
+# itself (runs-on matches the app's Windows fleet labels). Proves the ephemeral
+# Windows loop end to end. Dispatch with:
+#   gh workflow run "Windows smoke (Mactions runner)"
+on:
+  workflow_dispatch:
+
+jobs:
+  win-smoke:
+    runs-on: [self-hosted, Windows, mactions]
+    timeout-minutes: 20
+    steps:
+      - name: Identity + OS
+        run: |
+          echo "host=$env:COMPUTERNAME user=$env:USERNAME arch=$env:PROCESSOR_ARCHITECTURE"
+          [System.Environment]::OSVersion.VersionString
+      - name: Runner context
+        run: echo "RUNNER_OS=$env:RUNNER_OS RUNNER_ARCH=$env:RUNNER_ARCH RUNNER_NAME=$env:RUNNER_NAME"
+      - name: Git available (actions/checkout dependency)
+        run: git --version
