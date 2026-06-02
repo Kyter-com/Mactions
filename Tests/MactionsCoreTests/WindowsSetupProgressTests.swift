@@ -103,6 +103,24 @@ final class WindowsSetupProgressTests: XCTestCase {
     XCTAssertTrue(WindowsSetupStep.prerequisites < WindowsSetupStep.finalize)
     XCTAssertEqual(Swift.max(WindowsSetupStep.downloadISO, WindowsSetupStep.buildMedia), .buildMedia)
   }
+
+  /// The transient/external classifier (drives the "not your setup — safe to
+  /// retry" hint): a network/upstream failure reads transient; a genuine LOCAL
+  /// failure must NOT, or we'd wrongly tell the user it isn't their problem.
+  func testTransientFailureClassifier() {
+    // The actual field failure: git.uupdump.net returned 522 on a converter file.
+    XCTAssertTrue(WindowsSetupProgress.isLikelyTransientFailure(
+      "ERROR CUID#8 - Download aborted. URI=https://git.uupdump.net/x/convert_ve_plugin\nstatus=522\nerror: ISO conversion failed"))
+    XCTAssertTrue(WindowsSetupProgress.isLikelyTransientFailure(
+      "error: ISO conversion failed after 3 attempts (see output above)."))
+    XCTAssertTrue(WindowsSetupProgress.isLikelyTransientFailure("couldn't reach the UUP dump API after retries"))
+    XCTAssertTrue(WindowsSetupProgress.isLikelyTransientFailure("curl: (6) Could not resolve host: api.uupdump.net"))
+    // Genuine LOCAL failures: must read as NOT transient.
+    XCTAssertFalse(WindowsSetupProgress.isLikelyTransientFailure(
+      "VMware Fusion isn't installed. Get it free from the Broadcom portal, then try again."))
+    XCTAssertFalse(WindowsSetupProgress.isLikelyTransientFailure("auto-download needs these tools first: aria2"))
+    XCTAssertFalse(WindowsSetupProgress.isLikelyTransientFailure("converter finished but produced no ISO in /tmp"))
+  }
 }
 
 /// Pins `Shell.runStreaming`: lines are emitted as they arrive (incl. an

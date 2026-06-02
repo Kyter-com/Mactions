@@ -46,6 +46,14 @@ final class AppState: ObservableObject {
   /// A short sub-status under the active step (install ticks, milestones, resume
   /// notice). `nil` clears it.
   @Published var windowsSetupDetail: String?
+  /// After a FAILED base build: a user-facing explanation that persists until the
+  /// next build, so the Windows pane shows what went wrong instead of silently
+  /// reverting to the maintenance nudge. `nil` when the last build succeeded / none
+  /// ran / one is in progress. `windowsSetupFailureIsExternal` flags an upstream/
+  /// network cause (UUP dump down, a 522) — "not your setup, safe to retry" — vs a
+  /// local one, so the UI can frame + tint it accordingly.
+  @Published var windowsSetupFailure: String?
+  @Published var windowsSetupFailureIsExternal = false
   /// Latest prerequisite scan (Homebrew, hypervisor, converter tools). Drives the
   /// preflight checklist; refreshed when the Windows section appears + after an
   /// install. `nil` until the first scan.
@@ -522,6 +530,7 @@ final class AppState: ObservableObject {
     windowsSetupBusy = true
     windowsSetupStep = .prerequisites
     windowsSetupDetail = nil
+    windowsSetupFailure = nil  // a fresh attempt clears the last failure banner
     statusMessage = "Checking Windows prerequisites…"
     Task {
       // 1) Install missing FREE deps (off the main actor — it may shell out).
@@ -614,8 +623,22 @@ final class AppState: ObservableObject {
         let detail =
           errorLine.map { String($0.dropFirst("error: ".count)).trimmingCharacters(in: .whitespaces) }
           ?? "the prep script failed"
+        // Classify: an upstream/network cause (UUP dump down, a 522) isn't the
+        // user's setup and is safe to retry (the ~8 GB download resumes); a local
+        // cause (missing tool, Fusion absent) is theirs to fix. Drives a tinted
+        // banner in the Windows pane so a failed rebuild doesn't just silently
+        // revert to the maintenance nudge.
+        let transient = WindowsSetupProgress.isLikelyTransientFailure(result?.stderr ?? "")
+        windowsSetupFailureIsExternal = transient
+        windowsSetupFailure =
+          transient
+          ? "The last rebuild couldn't reach an external service (UUP dump / network) — not a problem with your Mac or setup. It's safe to retry; the download resumes where it left off. (\(detail))"
+          : "The last rebuild failed: \(detail)."
         statusMessage =
-          "Windows setup failed: \(detail)" + (buildLog.map { " (log: \($0))" } ?? "")
+          (transient
+            ? "Windows rebuild hit a network/upstream issue — safe to retry."
+            : "Windows setup failed: \(detail)")
+          + (buildLog.map { " Log: \($0)" } ?? "")
       }
     }
   }
@@ -698,6 +721,10 @@ final class AppState: ObservableObject {
     windowsUpdateNotice = nil
     lastWindowsUpdateCheck = nil
     lastKnownLatestBuild = nil
+    // A verified-ready base also clears any lingering failure banner (called from
+    // both the fast-path + post-build success).
+    windowsSetupFailure = nil
+    windowsSetupFailureIsExternal = false
   }
 
   /// Recompute whether the base image needs a rebuild, and why. Two dimensions:

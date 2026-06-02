@@ -109,6 +109,25 @@ public enum WindowsSetupProgress {
     return nil
   }
 
+  /// Heuristic: did a FAILED base build die from an EXTERNAL/transient cause — an
+  /// upstream host being down (UUP dump returning 5xx/522) or a network blip —
+  /// rather than anything wrong with the user's Mac or configuration? Drives a
+  /// "not your setup — safe to retry" hint after a failed build. Pure → testable.
+  /// Conservative: matches only clear network/upstream markers, so a genuine
+  /// LOCAL failure (a missing tool, VMware Fusion absent) is NOT mislabeled.
+  public static func isLikelyTransientFailure(_ output: String) -> Bool {
+    let s = output.lowercased()
+    let markers = [
+      "522", "status=5", "http 5",          // 5xx / Cloudflare origin-timeout
+      "uupdump", "git.uupdump",             // the UUP-dump hosts
+      "after retries", "after 3 attempts",  // our own retry-exhausted messages
+      "download aborted", "couldn't reach", "couldn't download the uup",
+      "rate-limited", "could not resolve host", "network is unreachable",
+      "connection refused", "connection reset", "operation timed out",
+    ]
+    return markers.contains { s.contains($0) }
+  }
+
   /// Pull the integer seconds out of a leading `[ 742s]` tick, if present.
   static func firstBracketedSeconds(in line: String) -> Int? {
     guard let open = line.firstIndex(of: "["), let close = line[open...].firstIndex(of: "]")

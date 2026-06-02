@@ -36,8 +36,6 @@ struct DashboardView: View {
     VStack(spacing: 0) {
       DashboardHeader()
       Divider()
-      CapacityStrip()
-      Divider()
       // Rune-style left sidebar: pick a pane on the left, it fills the detail.
       NavigationSplitView {
         List(Tab.allCases, selection: $tab) { item in
@@ -71,13 +69,12 @@ private struct DashboardHeader: View {
   @EnvironmentObject private var app: AppState
 
   var body: some View {
-    HStack(spacing: 10) {
+    HStack(spacing: 12) {
       Circle().fill(statusColor).frame(width: 10, height: 10)
-      VStack(alignment: .leading, spacing: 1) {
-        Text("Mactions").font(.headline)
-        Text(stateSubtitle).font(.caption).foregroundStyle(.secondary)
-      }
-      Spacer()
+      Text(stateSubtitle).font(.callout.weight(.medium)).fixedSize()
+      Divider().frame(height: 20)
+      capacityChips
+      Spacer(minLength: 8)
       if let message = app.statusMessage {
         Text(message)
           .font(.caption).foregroundStyle(.secondary)
@@ -122,18 +119,13 @@ private struct DashboardHeader: View {
       return "Online · \(n) runner\(n == 1 ? "" : "s")"
     }
   }
-}
 
-// MARK: - Capacity strip
-
-private struct CapacityStrip: View {
-  @EnvironmentObject private var app: AppState
-
-  var body: some View {
+  /// The capacity chips (Host RAM / live runners / Windows budget), folded into
+  /// the header bar to save vertical space — a row of glass pills in the control
+  /// layer, grouped so they batch-render + blend (Apple's guidance).
+  private var capacityChips: some View {
     let cap = app.capacity
-    // The chips are a row of glass pills in the header's control layer — grouped
-    // in a container so they batch-render and blend (Apple's guidance).
-    GlassGroup(spacing: 8) {
+    return GlassGroup(spacing: 8) {
       HStack(spacing: 8) {
         chip("Host RAM", formatBytes(cap.hostRAMBytes), systemImage: "memorychip",
           help: "Total physical memory on this Mac.")
@@ -145,10 +137,8 @@ private struct CapacityStrip: View {
           help: cap.windowsMaxConcurrentVMs > 0
             ? "Max concurrent Win11-ARM VMs this Mac's RAM allows (each ~\(cap.windowsPerVMGB) GB). The cap go-online enforces — not live usage (see the Memory tab)."
             : "No Windows base image yet, or not enough RAM to run one VM.")
-        Spacer(minLength: 0)
       }
     }
-    .padding(.horizontal, 16).padding(.vertical, 10)
   }
 
   private func chip(_ label: String, _ value: String, systemImage: String, help: String) -> some View {
@@ -201,12 +191,48 @@ private struct RunnersPane: View {
   }
 }
 
+/// A status dot with an optional GitHub-style spinning ring — the ring rotates
+/// while the runner is live (online / provisioning / recycling), echoing the GH
+/// Actions in-progress spinner. NOTE: keyed on the runner *phase*, so an idle
+/// online runner spins too; making it strictly "executing a job" needs the
+/// per-runner `busy` flag from GitHub's runner API threaded onto ManagedRunner.
+private struct RunnerActivityDot: View {
+  let phase: ManagedRunner.Phase
+  @State private var spin = false
+
+  private var active: Bool { phase == .online || phase == .provisioning || phase == .recycling }
+  private var color: Color {
+    switch phase {
+    case .online: return .green
+    case .failed: return .red
+    case .stopped: return .secondary
+    default: return .orange
+    }
+  }
+
+  var body: some View {
+    ZStack {
+      if active {
+        Circle()
+          .trim(from: 0, to: 0.7)
+          .stroke(color, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+          .frame(width: 14, height: 14)
+          .rotationEffect(.degrees(spin ? 360 : 0))
+          .animation(.linear(duration: 1).repeatForever(autoreverses: false), value: spin)
+          .onAppear { spin = true }
+      }
+      Circle().fill(color).frame(width: 7, height: 7)
+    }
+    .frame(width: 16, height: 16)
+  }
+}
+
 private struct RunnerRow: View {
   let row: FleetRunnerRow
   var body: some View {
     HStack(spacing: 9) {
       OSLogo(os: row.os, size: 14).frame(width: 16)
-      Circle().fill(row.runner.phase == .online ? Color.green : Color.orange).frame(width: 7, height: 7)
+      RunnerActivityDot(phase: row.runner.phase)
       VStack(alignment: .leading, spacing: 1) {
         Text(row.repoFullName).font(.callout).lineLimit(1).truncationMode(.middle)
         Text(row.runner.id).font(.system(size: 10).monospaced()).foregroundStyle(.secondary)

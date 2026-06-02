@@ -307,8 +307,23 @@ PY
   [[ -f "$conv" ]] || die "UUP package didn't contain a macOS convert script — convert manually, then re-run with --iso."
   chmod +x "$conv"
   # aria2 -c (in the convert script) resumes the partial download in UUPs/; the
-  # convert (CPU-bound) re-runs from the now-complete packages.
-  ( cd "$workdir" && "./$(basename "$conv")" ) || die "ISO conversion failed (see output above)."
+  # convert (CPU-bound) re-runs from the now-complete packages. So a transient
+  # upstream blip is RETRYABLE — re-running continues from the partial download
+  # rather than restarting the ~8 GB. Seen in the field: git.uupdump.net returned
+  # HTTP 522 (Cloudflare origin timeout) on one converter plugin file, which
+  # aborted the whole ~30-40 min build. Retry a few times with backoff before
+  # giving up; a persistent failure still surfaces via `die`.
+  local conv_name; conv_name="$(basename "$conv")"
+  local conv_ok=0 attempt delay
+  for attempt in 1 2 3; do
+    if ( cd "$workdir" && "./$conv_name" ); then conv_ok=1; break; fi
+    if [[ "$attempt" -lt 3 ]]; then
+      delay=$((attempt * 20))
+      echo "    ISO conversion failed (attempt $attempt/3) — likely a transient UUP-dump/network blip; retrying in ${delay}s (aria2 -c resumes the partial download)…" >&2
+      sleep "$delay"
+    fi
+  done
+  [[ "$conv_ok" -eq 1 ]] || die "ISO conversion failed after 3 attempts (see output above). If git.uupdump.net is down (HTTP 5xx), wait and rebuild later — the partial download is cached and resumes."
   # -iname folds .iso/.ISO into ONE branch (the duplicated -maxdepth on each side
   # of -o was fragile, since -maxdepth is a global option, not a per-branch test),
   # and `sort` makes the pick deterministic if the converter ever leaves more than

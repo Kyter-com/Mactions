@@ -264,6 +264,20 @@ struct SetupPane: View {
   /// rebuild once it's ready.
   @ViewBuilder
   private var windowsArea: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      // A failed build's explanation, shown until the next attempt — so a failure
+      // doesn't silently revert to the maintenance nudge. Tinted by cause:
+      // orange/Wi-Fi for an external (network/UUP-dump) blip ("not your setup —
+      // retry"), red for a genuine local failure.
+      if !app.windowsSetupBusy, let failure = app.windowsSetupFailure {
+        windowsFailureBanner(failure, external: app.windowsSetupFailureIsExternal)
+      }
+      windowsAreaContent
+    }
+  }
+
+  @ViewBuilder
+  private var windowsAreaContent: some View {
     if app.windowsSetupBusy {
       windowsSetupStepper
     } else if !app.windowsImageReady, app.selectedOSes.contains(.windows) || windowsPrereqsIncomplete {
@@ -277,7 +291,7 @@ struct SetupPane: View {
         .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
       }
     } else if app.windowsImageReady {
-      VStack(alignment: .leading, spacing: 4) {
+      VStack(alignment: .leading, spacing: 6) {
         if app.windowsMaintenance.needsRebuild, let notice = app.windowsUpdateNotice {
           Label {
             Text(notice).fixedSize(horizontal: false, vertical: true)
@@ -286,11 +300,7 @@ struct SetupPane: View {
           }
           .font(.caption2).foregroundStyle(.orange)
         }
-        Button(app.windowsMaintenance.needsRebuild ? "Rebuild Windows image now" : "Rebuild / update Windows image") {
-          confirmRebuild = true
-        }
-        .buttonStyle(.borderless).controlSize(.small).font(.caption2)
-        .disabled(app.state != .offline || !app.windowsBackendAvailable)
+        rebuildButton
         // Explain a disabled button rather than leaving it a dead control.
         if !app.windowsBackendAvailable {
           Text("Install VMware Fusion to rebuild.")
@@ -309,6 +319,40 @@ struct SetupPane: View {
         Text(rebuildDialogMessage)
       }
     }
+  }
+
+  /// A real (Liquid Glass) Rebuild button — prominent when a rebuild is actually
+  /// needed, plain otherwise. Offline + Fusion gated (the sub-text explains why).
+  @ViewBuilder
+  private var rebuildButton: some View {
+    if app.windowsMaintenance.needsRebuild {
+      Button { confirmRebuild = true } label: {
+        Label("Rebuild Windows image", systemImage: "arrow.clockwise")
+      }
+      .glassProminentButton()
+      .controlSize(.regular)
+      .disabled(app.state != .offline || !app.windowsBackendAvailable)
+    } else {
+      Button { confirmRebuild = true } label: {
+        Label("Rebuild / update image", systemImage: "arrow.clockwise")
+      }
+      .glassButton()
+      .controlSize(.regular)
+      .disabled(app.state != .offline || !app.windowsBackendAvailable)
+    }
+  }
+
+  private func windowsFailureBanner(_ message: String, external: Bool) -> some View {
+    HStack(alignment: .top, spacing: 6) {
+      Image(systemName: external ? "wifi.exclamationmark" : "exclamationmark.octagon.fill")
+        .font(.caption)
+      Text(message).fixedSize(horizontal: false, vertical: true)
+    }
+    .font(.caption2)
+    .foregroundStyle(external ? Color.orange : Color.red)
+    .padding(8)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(RoundedRectangle(cornerRadius: 8).fill((external ? Color.orange : Color.red).opacity(0.12)))
   }
 
   /// SF Symbol for the current maintenance reason — distinguishes a newer OS
