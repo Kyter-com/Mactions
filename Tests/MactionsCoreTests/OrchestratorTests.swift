@@ -113,6 +113,20 @@ final class OrchestratorTests: XCTestCase {
     XCTAssertEqual(Set(cp.deleted), [10, 12])
   }
 
+  /// The go-online orphan reaper deletes only runners under THIS machine's
+  /// prefix (regardless of status), leaving strangers and other Macs alone.
+  func testDeregisterOrphanRunnersScopesToPrefix() async {
+    let cp = FakeControlPlane()
+    cp.remote = [
+      RemoteRunner(id: 1, name: "mactions-testmac-aaa", status: "offline", busy: false),
+      RemoteRunner(id: 2, name: "mactions-testmac-bbb", status: "online", busy: false),
+      RemoteRunner(id: 3, name: "mactions-othermac-ccc", status: "offline", busy: false),
+      RemoteRunner(id: 4, name: "someone-else", status: "offline", busy: false),
+    ]
+    await deregisterOrphanRunners(cp, prefix: "mactions-testmac")
+    XCTAssertEqual(Set(cp.deleted), [1, 2])
+  }
+
   // MARK: Run history
 
   func testCleanExitWhileOnlineRecordsCompleted() async {
