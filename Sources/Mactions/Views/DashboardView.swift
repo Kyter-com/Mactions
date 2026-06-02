@@ -92,11 +92,14 @@ private struct DashboardHeader: View {
       .disabled(
         app.selectedRepos.isEmpty
           || !app.selectedOSes.contains(where: { $0.isImplemented })
+          || app.windowsSetupBusy  // can't clone the base while it's being (re)built
           || app.state == .starting || app.state == .stopping)
       .help(
-        app.selectedRepos.isEmpty
-          ? "Pick at least one repository in Setup first."
-          : "Bring the configured runner fleet online / offline.")
+        app.windowsSetupBusy
+          ? "Wait for the Windows base image to finish building before going online."
+          : app.selectedRepos.isEmpty
+            ? "Pick at least one repository in Setup first."
+            : "Bring the configured runner fleet online / offline.")
     }
     .padding(.horizontal, 16).padding(.vertical, 12)
   }

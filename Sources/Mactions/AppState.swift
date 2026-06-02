@@ -269,6 +269,12 @@ final class AppState: ObservableObject {
       statusMessage = "Pick at least one runner OS."
       return
     }
+    // The Windows base image is mid-(re)build — going online would clone a base
+    // that's being wiped/rebuilt. Make the UI disable a hard guard too.
+    guard !windowsSetupBusy else {
+      statusMessage = "Finish building the Windows base image before going online."
+      return
+    }
     saveConfig()
     fleetEpoch += 1
     let myEpoch = fleetEpoch
