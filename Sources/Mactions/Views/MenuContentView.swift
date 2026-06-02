@@ -305,24 +305,64 @@ struct MenuContentView: View {
       }
     } else if app.windowsImageReady {
       VStack(alignment: .leading, spacing: 4) {
-        if let notice = app.windowsUpdateNotice {
-          Label(notice, systemImage: "arrow.up.circle")
-            .font(.caption2).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+        if app.windowsMaintenance.needsRebuild, let notice = app.windowsUpdateNotice {
+          Label {
+            Text(notice).fixedSize(horizontal: false, vertical: true)
+          } icon: {
+            Image(systemName: windowsMaintenanceIcon)
+          }
+          .font(.caption2).foregroundStyle(.orange)
         }
-        Button("Rebuild / update Windows image") { confirmRebuild = true }
-          .buttonStyle(.borderless).controlSize(.small).font(.caption2)
-          .disabled(app.state != .offline)
+        Button(app.windowsMaintenance.needsRebuild ? "Rebuild Windows image now" : "Rebuild / update Windows image") {
+          confirmRebuild = true
+        }
+        .buttonStyle(.borderless).controlSize(.small).font(.caption2)
+        .disabled(app.state != .offline || !app.windowsBackendAvailable)
+        // Explain a disabled button rather than leaving it a dead control.
+        if !app.windowsBackendAvailable {
+          Text("Install VMware Fusion to rebuild.")
+            .font(.system(size: 9)).foregroundStyle(.tertiary)
+        } else if app.state != .offline {
+          Text("Go offline to rebuild.")
+            .font(.system(size: 9)).foregroundStyle(.tertiary)
+        }
       }
       .confirmationDialog(
         "Rebuild the Windows base image?", isPresented: $confirmRebuild, titleVisibility: .visible
       ) {
-        Button("Rebuild (re-downloads ~8 GB)", role: .destructive) { app.setUpWindowsRunner(force: true) }
+        Button(rebuildConfirmLabel, role: .destructive) { app.setUpWindowsRunner(force: true) }
         Button("Cancel", role: .cancel) {}
       } message: {
-        Text(
-          "Re-downloads the latest Win11 ARM64 ISO (~8 GB) and rebuilds the base VM headless — about 30–40 minutes. This replaces the existing base image.")
+        Text(rebuildDialogMessage)
       }
     }
+  }
+
+  /// SF Symbol for the current maintenance reason — distinguishes a newer OS
+  /// build (up-arrow) from an updated provisioning recipe (wrench) at a glance.
+  /// Only shown while `needsRebuild`, so the up-to-date cases are placeholders.
+  private var windowsMaintenanceIcon: String {
+    switch app.windowsMaintenance {
+    case .osBuildAvailable: return "arrow.up.circle"
+    case .provisioningOutdated: return "wrench.and.screwdriver"
+    case .both: return "exclamationmark.triangle"
+    case .upToDate, .notBuilt: return "arrow.clockwise.circle"
+    }
+  }
+
+  /// A recipe-only rebuild reuses the cached Win11 ISO (the OS build is
+  /// unchanged), so it skips the ~8 GB download; an OS-build update re-downloads.
+  /// The confirm label/message reflect that so the step is honest about its cost.
+  private var rebuildConfirmLabel: String {
+    if case .provisioningOutdated = app.windowsMaintenance { return "Rebuild (reuses cached ISO)" }
+    return "Rebuild (re-downloads ~8 GB)"
+  }
+
+  private var rebuildDialogMessage: String {
+    if case .provisioningOutdated = app.windowsMaintenance {
+      return "Rebuilds the base VM headless with the updated runner setup recipe — about 30–40 minutes. Reuses the cached Win11 ARM64 ISO (the Windows build is unchanged), so no large re-download. Replaces the existing base image."
+    }
+    return "Re-downloads the latest Win11 ARM64 ISO (~8 GB) and rebuilds the base VM headless — about 30–40 minutes. This replaces the existing base image."
   }
 
   /// True when a prereq the Windows path needs is still missing (so the setup

@@ -137,6 +137,15 @@ UUP_API="https://api.uupdump.net"   # JSON list endpoints (listid.php / listedit
 UUP_WWW="https://uupdump.net"        # autodl=2 convert ZIP is front-end-only; the api host 400s UNSUPPORTED_COMBINATION
 RECORDED_BUILD=""
 
+# Provisioning-recipe version baked into the base by bootstrap.ps1. BUMP this
+# whenever a bootstrap.ps1 change makes an ALREADY-BUILT base functionally stale
+# (e.g. the MinGit->PortableGit switch that added bash). Do NOT bump for
+# comment/whitespace-only edits. This is the AUTHORITY: it's stamped into
+# ~/.mactions/windows-base.recipe on a successful build, and MUST stay equal to
+# WindowsImage.currentProvisioningRecipeVersion (a unit test enforces that), which
+# the app reads to decide whether a built base needs a rebuild.
+PROVISIONING_RECIPE_VERSION=2
+
 # Fetch a UUP dump URL with backoff, writing the body to OUTFILE. Retries on
 # network errors, HTTP 429 (UUP dump's ~20-25s per-IP throttle), and 5xx; fails
 # fast on other 4xx (e.g. a permanent 400). Progress goes to stderr so callers
@@ -481,6 +490,13 @@ case "$TOOL" in
       mkdir -p "$MACTIONS_ROOT"
       printf '%s\n' "$RECORDED_BUILD" > "$MACTIONS_ROOT/windows-base.build"
     fi
+    # Provisioning-recipe version — written UNCONDITIONALLY (unlike the OS build
+    # id, the recipe is always known and always relevant: even a user --iso with
+    # no parseable build still baked in the CURRENT bootstrap recipe). The app
+    # compares this to WindowsImage.currentProvisioningRecipeVersion to flag a base
+    # that predates a rebuild-worthy bootstrap change (e.g. the bash/PortableGit fix).
+    mkdir -p "$MACTIONS_ROOT"
+    printf '%s\n' "$PROVISIONING_RECIPE_VERSION" > "$MACTIONS_ROOT/windows-base.recipe"
     rm -rf "$CACHE_ROOT" 2>/dev/null || true
     echo
     echo "==> Fusion base build done. Base lives at ~/.mactions/fusion/$NAME.vmx"

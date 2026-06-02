@@ -58,9 +58,18 @@ final class AppState: ObservableObject {
   /// check fires on every popover `onAppear`, and writing the status line there
   /// clobbered the live "Online: N runners…" line just because the menu reopened.
   @Published var windowsUpdateNotice: String?
+  /// The structured reason the base image needs a rebuild (or `.upToDate`). Drives
+  /// the reason-aware banner + "rebuild needed" badge in the UI; distinct from
+  /// `windowsUpdateNotice` (the rendered string) so the View can branch on the
+  /// KIND of staleness — a newer OS build vs an updated provisioning recipe.
+  @Published var windowsMaintenance: WindowsImage.MaintenanceReason = .upToDate
   /// Throttle the update check's network request so reopening the popover doesn't
   /// hit UUP dump every time. `nil` until the first check.
   private var lastWindowsUpdateCheck: Date?
+  /// The last latest-GA build the network check learned, cached so a recipe-only
+  /// recompute on a later `onAppear` can still weigh the OS dimension without
+  /// re-hitting the network (the recipe check itself is local + unthrottled).
+  private var lastKnownLatestBuild: String?
 
   // Repo discovery (for the searchable picker).
   @Published var availableRepos: [RepoRef] = []
@@ -687,34 +696,58 @@ final class AppState: ObservableObject {
 
   func isOSSelected(_ os: RunnerOS) -> Bool { selectedOSes.contains(os) }
 
-  /// Check whether a newer Win11 ARM64 build is available than the one the base
-  /// image was built from, and surface it as the dedicated `windowsUpdateNotice`
-  /// (NOT `statusMessage` — see that property). Pure compare logic lives in
-  /// `WindowsImage`. Throttled so reopening the popover doesn't re-hit the
-  /// network; the nudge is informational and a stale-by-hours result is fine.
-  /// Drop any "newer build available" nudge and reset the throttle. Called right
-  /// after a (re)build succeeds — the base now IS the latest, so a leftover nudge
-  /// would be stale, and clearing the throttle lets the next check recompute
-  /// immediately instead of waiting out the 6h window.
+  /// Drop any "needs rebuild" nudge and reset the throttle. Called right after a
+  /// (re)build succeeds — the base now IS the latest build AND carries the current
+  /// provisioning recipe, so a leftover nudge would be stale; clearing the
+  /// throttle lets the next check recompute immediately instead of waiting out
+  /// the 6h window.
   private func clearWindowsUpdateNudge() {
+    windowsMaintenance = .upToDate
     windowsUpdateNotice = nil
     lastWindowsUpdateCheck = nil
+    lastKnownLatestBuild = nil
   }
 
+  /// Recompute whether the base image needs a rebuild, and why. Two dimensions:
+  ///   - PROVISIONING RECIPE staleness — a purely LOCAL file compare (recorded
+  ///     recipe vs `WindowsImage.currentProvisioningRecipeVersion`). Surfaced
+  ///     IMMEDIATELY on every `onAppear`, unthrottled, even offline — it's how a
+  ///     bootstrap change (e.g. the MinGit→PortableGit/bash fix) reaches an
+  ///     already-built base.
+  ///   - OS BUILD staleness — needs a UUP-dump network call, so it stays
+  ///     THROTTLED to 6h. A nil result (offline / not yet checked) never asserts
+  ///     an OS update; it just leaves the recipe verdict standing.
+  /// Pure compare + reason/notice logic lives in `WindowsImage`; this only wires
+  /// it to the throttle + published state. Surfaced as the dedicated
+  /// `windowsMaintenance`/`windowsUpdateNotice` (NOT `statusMessage` — see that
+  /// property: this fires on every popover `onAppear`).
   func checkForWindowsImageUpdate() {
-    guard windowsImageReady else { windowsUpdateNotice = nil; return }
-    if let last = lastWindowsUpdateCheck, Date().timeIntervalSince(last) < 6 * 3600 {
-      return  // checked recently — keep any existing notice, skip the request
-    }
+    guard windowsImageReady else { clearWindowsUpdateNudge(); return }
+    // Recipe dimension first — local, instant, every onAppear.
+    applyMaintenance(
+      WindowsImage.maintenanceReason(
+        recordedBuild: WindowsImage.recordedBaseImageBuild(),
+        recordedRecipe: WindowsImage.recordedRecipeVersion(),
+        latestBuild: lastKnownLatestBuild))
+    // OS dimension — networked, throttled.
+    if let last = lastWindowsUpdateCheck, Date().timeIntervalSince(last) < 6 * 3600 { return }
     lastWindowsUpdateCheck = Date()
     Task {
       guard let latest = try? await WindowsImage.latestBuild() else { return }
-      let installed = WindowsImage.recordedBaseImageBuild()
-      windowsUpdateNotice =
-        WindowsImage.updateAvailable(installed: installed, latest: latest.build)
-        ? "A newer Windows 11 ARM64 build (\(latest.build)) is available — click \"Rebuild / update Windows image\" to rebuild the base."
-        : nil
+      lastKnownLatestBuild = latest.build
+      applyMaintenance(
+        WindowsImage.maintenanceReason(
+          recordedBuild: WindowsImage.recordedBaseImageBuild(),
+          recordedRecipe: WindowsImage.recordedRecipeVersion(),
+          latestBuild: latest.build))
     }
+  }
+
+  /// Apply a computed maintenance reason to published state: the structured
+  /// reason (for UI branching) + the derived one-line notice (the banner text).
+  private func applyMaintenance(_ reason: WindowsImage.MaintenanceReason) {
+    windowsMaintenance = reason
+    windowsUpdateNotice = WindowsImage.maintenanceNotice(for: reason)
   }
 
   /// Per-VM RAM footprint (GB) for the Windows budget: the base VMX's real
