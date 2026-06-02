@@ -41,6 +41,50 @@ final class GitHubRequestTests: XCTestCase {
     XCTAssertEqual(del.value(forHTTPHeaderField: "Authorization"), "Bearer tok_123")
   }
 
+  func testActionsLogRequestShapes() {
+    let runs = client.listWorkflowRunsRequest(perPage: 40)
+    XCTAssertEqual(runs.httpMethod, "GET")
+    XCTAssertEqual(
+      runs.url?.absoluteString,
+      "https://api.github.com/repos/Kyter-com/sweep-collector/actions/runs?per_page=40")
+
+    let jobs = client.listJobsRequest(runId: 99)
+    XCTAssertEqual(jobs.httpMethod, "GET")
+    XCTAssertEqual(
+      jobs.url?.absoluteString,
+      "https://api.github.com/repos/Kyter-com/sweep-collector/actions/runs/99/jobs?per_page=100&filter=all"
+    )
+
+    let logs = client.jobLogsRequest(jobId: 7)
+    XCTAssertEqual(logs.httpMethod, "GET")
+    XCTAssertEqual(
+      logs.url?.absoluteString,
+      "https://api.github.com/repos/Kyter-com/sweep-collector/actions/jobs/7/logs")
+    XCTAssertEqual(logs.value(forHTTPHeaderField: "Authorization"), "Bearer tok_123")
+  }
+
+  func testWorkflowJobDecoding() throws {
+    let json = """
+      {"id":123,"run_id":456,"name":"build (windows)","status":"completed","conclusion":"success",
+       "runner_name":"mactions-host-ab12cd","runner_id":77,
+       "html_url":"https://github.com/x/y/actions/runs/456/job/123",
+       "started_at":"2024-06-01T12:00:00Z","completed_at":"2024-06-01T12:03:20Z",
+       "steps":[{"name":"Set up job","status":"completed","conclusion":"success","number":1},
+                {"name":"Run tests","status":"in_progress","conclusion":null,"number":2}]}
+      """.data(using: .utf8)!
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let job = try decoder.decode(WorkflowJob.self, from: json)
+    XCTAssertEqual(job.id, 123)
+    XCTAssertEqual(job.runId, 456)
+    XCTAssertEqual(job.runnerName, "mactions-host-ab12cd")
+    XCTAssertEqual(job.runnerId, 77)
+    XCTAssertEqual(job.conclusion, "success")
+    XCTAssertEqual(job.steps?.count, 2)
+    XCTAssertEqual(job.steps?.first?.name, "Set up job")
+    XCTAssertNil(job.steps?.last?.conclusion)
+  }
+
   func testDeviceFlowRequestShapes() {
     let codeReq = GitHubAuth.deviceCodeRequest(clientId: "Iv1.abc", scope: "repo")
     XCTAssertEqual(codeReq.httpMethod, "POST")

@@ -47,6 +47,13 @@ struct MenuContentView: View {
       Circle().fill(statusColor).frame(width: 9, height: 9)
       Text("Mactions").font(.headline)
       Spacer()
+      Button {
+        DashboardWindowController.shared.show()
+      } label: {
+        Image(systemName: "macwindow")
+      }
+      .buttonStyle(.borderless)
+      .help("Open the dashboard window (runners, history, capacity)")
       Text(app.state.rawValue.capitalized)
         .font(.caption.weight(.medium))
         .foregroundStyle(.secondary)

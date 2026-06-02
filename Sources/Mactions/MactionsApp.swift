@@ -33,8 +33,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationDidFinishLaunching(_ notification: Notification) {
-    // Accessory = menubar-only, no dock icon, no app-switcher entry.
+    // Accessory = menubar-only, no dock icon, no app-switcher entry. The optional
+    // dashboard window flips this to .regular while it's open (see
+    // DashboardWindowController) and back to .accessory on close.
     NSApp.setActivationPolicy(.accessory)
+  }
+
+  /// Closing the dashboard window must NOT quit the app — Mactions lives in the
+  /// menu bar and quitting is what takes runners offline. Only the menu's Quit /
+  /// ⌘Q (NSApp.terminate) ends the app, via applicationShouldTerminate below.
+  func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+    false
   }
 
   /// Bring runners offline before we actually quit. Reply `terminateLater` and

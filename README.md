@@ -17,6 +17,8 @@ swift run Mactions      # launches the menubar app (look in the menubar)
 3. **Go online.** Mactions downloads the runner agent on first use and brings ephemeral runners online. Reference them in a workflow with `runs-on: [self-hosted, macOS, mactions]` (match your labels).
 4. **Quit the app** to take them offline (it deregisters them first).
 
+Optional: click the **window button** (⊞) in the popover header to open the **dashboard** — a Pulse-style console with **Runners / History / Memory** tabs. Select a past run to see its **GitHub Actions job log inline** (fetched from GitHub, so it works for macOS *and* Windows runs); watch a running runner's **step checklist**; and see **live memory** (a gauge + sparkline + per-VM/runner breakdown). It's purely a viewer: it gives the app a dock icon while open and hides it again on close, and closing the window never takes runners offline (only quitting does). Built with Liquid Glass on macOS 26.
+
 ## Develop
 
 ```bash
