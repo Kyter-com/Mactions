@@ -256,25 +256,47 @@ public struct GitHubClient: RunnerControlPlane {
     return String(data: data, encoding: .utf8) ?? ""
   }
 
-  /// Find the single job our ephemeral runner ran, by matching the unique runner
-  /// name across recent workflow runs. Bounded: scans up to `maxRuns` of the most
-  /// recent runs created at/after `since` (minus a margin for clock skew / queue
-  /// time), newest first, and early-exits on the first match. Returns nil if not
-  /// found (job not yet visible, run too old to be in the recent window, etc.).
-  /// Best-effort: network errors are swallowed (returns nil / what it found).
-  public func findJob(runnerName: String, since: Date, maxRuns: Int = 15) async -> WorkflowJob? {
+  /// Every job across recent workflow runs created at/after `since` (minus a
+  /// margin for clock skew + queue time), newest run first, bounded to `maxRuns`.
+  /// The shared sweep behind `findJob` (single runner) and the History pane's
+  /// batch back-fill (many runners, one sweep). Best-effort: a failed page is
+  /// skipped, a total failure returns nil.
+  ///
+  /// The window is deliberately generous (30 min / 30 runs): a *re-run* of a
+  /// failed job starts well after the original agent came up, and other runs may
+  /// have been triggered in between — a tight window would push the run out of the
+  /// scanned set and the lookup would miss (the "No matching job found" bug).
+  public func recentJobs(since: Date, maxRuns: Int = 30) async -> [WorkflowJob]? {
     guard let runs = try? await listRecentWorkflowRuns(perPage: 40) else { return nil }
-    let earliest = since.addingTimeInterval(-300)  // 5 min slack before the runner came up
+    let earliest = since.addingTimeInterval(-1800)  // 30 min slack: covers re-run attempts + skew
     let candidates =
       runs
       .filter { ($0.createdAt ?? .distantPast) >= earliest }
       .sorted { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
       .prefix(maxRuns)
+    var all: [WorkflowJob] = []
     for run in candidates {
-      guard let jobs = try? await listJobs(runId: run.id) else { continue }
-      if let job = jobs.first(where: { $0.runnerName == runnerName }) { return job }
+      if let jobs = try? await listJobs(runId: run.id) { all.append(contentsOf: jobs) }
     }
-    return nil
+    return all
+  }
+
+  /// Pick the job our ephemeral runner ran from a set of jobs. The `mactions-…`
+  /// runner name is unique per registration, so a name match is definitive; when a
+  /// run has multiple attempts indexed under it (a re-run reuses the run id and
+  /// bumps `run_attempt`, and `filter=all` returns every attempt), prefer the
+  /// newest by `startedAt` so a re-run resolves to attempt 2, not attempt 1.
+  public static func pickJob(_ jobs: [WorkflowJob], runnerName: String) -> WorkflowJob? {
+    jobs
+      .filter { $0.runnerName == runnerName }
+      .max { ($0.startedAt ?? .distantPast) < ($1.startedAt ?? .distantPast) }
+  }
+
+  /// Find the single job our ephemeral runner ran, by matching the unique runner
+  /// name across recent workflow runs. Returns nil if not found (job not yet
+  /// visible, run too old to be in the recent window, etc.).
+  public func findJob(runnerName: String, since: Date, maxRuns: Int = 30) async -> WorkflowJob? {
+    Self.pickJob(await recentJobs(since: since, maxRuns: maxRuns) ?? [], runnerName: runnerName)
   }
 
   @discardableResult

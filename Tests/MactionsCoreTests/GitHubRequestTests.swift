@@ -85,6 +85,35 @@ final class GitHubRequestTests: XCTestCase {
     XCTAssertNil(job.steps?.last?.conclusion)
   }
 
+  /// The re-run-attempt fix: when a run has two jobs sharing our (unique) runner
+  /// name — attempt 1 and a later attempt 2 — `pickJob` must return the NEWEST by
+  /// `startedAt`, so a re-run resolves to its real (latest) result, not attempt 1.
+  func testPickJobPrefersLatestAttempt() throws {
+    func job(id: Int, runner: String, startedAt: String?, conclusion: String?) -> WorkflowJob {
+      let started = startedAt.map { "\"\($0)\"" } ?? "null"
+      let json = """
+        {"id":\(id),"run_id":456,"name":"build (windows)","status":"completed",
+         "conclusion":\(conclusion.map { "\"\($0)\"" } ?? "null"),
+         "runner_name":"\(runner)","runner_id":77,
+         "html_url":"https://github.com/x/y/actions/runs/456/job/\(id)",
+         "started_at":\(started),"completed_at":null}
+        """.data(using: .utf8)!
+      let decoder = JSONDecoder()
+      decoder.dateDecodingStrategy = .iso8601
+      return try! decoder.decode(WorkflowJob.self, from: json)
+    }
+    let attempt1 = job(id: 1, runner: "mactions-host-ab12cd", startedAt: "2024-06-01T12:00:00Z", conclusion: "failure")
+    let attempt2 = job(id: 2, runner: "mactions-host-ab12cd", startedAt: "2024-06-01T12:30:00Z", conclusion: "success")
+    let other = job(id: 3, runner: "mactions-host-zzzz", startedAt: "2024-06-01T12:45:00Z", conclusion: "failure")
+
+    // Order shouldn't matter — newest attempt wins regardless of array position.
+    XCTAssertEqual(GitHubClient.pickJob([attempt1, attempt2, other], runnerName: "mactions-host-ab12cd")?.id, 2)
+    XCTAssertEqual(GitHubClient.pickJob([attempt2, attempt1], runnerName: "mactions-host-ab12cd")?.id, 2)
+    // No matching runner → nil (the honest "no matching job" path).
+    XCTAssertNil(GitHubClient.pickJob([attempt1, attempt2, other], runnerName: "mactions-host-nope"))
+    XCTAssertNil(GitHubClient.pickJob([], runnerName: "mactions-host-ab12cd"))
+  }
+
   func testDeviceFlowRequestShapes() {
     let codeReq = GitHubAuth.deviceCodeRequest(clientId: "Iv1.abc", scope: "repo")
     XCTAssertEqual(codeReq.httpMethod, "POST")

@@ -983,10 +983,50 @@ final class AppState: ObservableObject {
     guard let job = await client.findJob(runnerName: record.id, since: record.startedAt) else {
       jobLogs[record.id] = .unavailable(
         "No matching job found on GitHub — it may have expired, or GitHub hasn't indexed it yet.")
+      // Leave `jobConclusion` untouched: a transient indexing miss must not get
+      // stamped as a permanent state — the row keeps its honest provisional status
+      // and self-heals on the next fetch.
       return
     }
     let text = (try? await client.fetchJobLog(jobId: job.id)) ?? ""
     jobLogs[record.id] = .loaded(job: job, lines: await splitLines(text))
+    // Back-fill the TRUE result so History stops trusting the agent exit code.
+    updateRunConclusion(
+      record.id,
+      to: .resolve(status: job.status, conclusion: job.conclusion, exitStatus: record.exitStatus))
+  }
+
+  /// Patch the resolved GitHub conclusion onto a recorded run (in memory + disk).
+  /// No-ops when unchanged so it never churns the history file. Re-persists through
+  /// the existing serialized `persistHistory()` chain (no new queue).
+  private func updateRunConclusion(_ id: String, to conclusion: RunRecord.JobConclusion) {
+    guard let i = runHistory.firstIndex(where: { $0.id == id }),
+      runHistory[i].jobConclusion != conclusion
+    else { return }
+    runHistory[i].jobConclusion = conclusion
+    persistHistory()
+  }
+
+  /// Back-fill conclusions for the most recent unresolved runs so History rows
+  /// show the true status without opening each one. Bounded + on-demand (driven by
+  /// the History pane's `.task`), never a poller. Batched per repo: one recent-runs
+  /// sweep resolves every pending runner from that repo, so it costs ~one sweep per
+  /// repo rather than one per row.
+  func resolveRecentConclusions(limit: Int = 12) async {
+    let unresolved = runHistory.prefix(limit).filter { $0.jobConclusion == nil }
+    guard !unresolved.isEmpty else { return }
+    for (repo, records) in Dictionary(grouping: unresolved, by: { $0.repo }) {
+      if Task.isCancelled { return }
+      guard let client = client(forRepo: repo),
+        let jobs = await client.recentJobs(since: records.map(\.startedAt).min() ?? Date())
+      else { continue }
+      for record in records {
+        guard let job = GitHubClient.pickJob(jobs, runnerName: record.id) else { continue }
+        updateRunConclusion(
+          record.id,
+          to: .resolve(status: job.status, conclusion: job.conclusion, exitStatus: record.exitStatus))
+      }
+    }
   }
 
   /// Split text into lines off the main actor (nonisolated async) so a large log

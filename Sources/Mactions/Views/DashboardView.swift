@@ -335,16 +335,22 @@ private struct HistoryPane: View {
   @State private var filter: OutcomeFilter = .all
 
   enum OutcomeFilter: String, CaseIterable, Identifiable {
-    case all = "All", completed = "Completed", failed = "Failed"
+    case all = "All", passed = "Passed", failed = "Failed"
     var id: String { rawValue }
   }
 
   private var filtered: [RunRecord] {
     let q = search.trimmingCharacters(in: .whitespaces).lowercased()
     return app.runHistory.filter { rec in
-      let matchesFilter =
-        filter == .all || (filter == .completed && rec.outcome == .completed)
-        || (filter == .failed && rec.outcome == .failed)
+      // Filter on the RESOLVED status (true GitHub conclusion), not the agent exit
+      // — a failed job must land under "Failed", not "Passed". Unresolved rows show
+      // only under "All", since we can't honestly bucket them yet.
+      let matchesFilter: Bool
+      switch filter {
+      case .all: matchesFilter = true
+      case .passed: matchesFilter = rec.resolvedStatus == .passed
+      case .failed: matchesFilter = rec.resolvedStatus == .failed
+      }
       let matchesSearch =
         q.isEmpty || rec.repo.lowercased().contains(q) || rec.id.lowercased().contains(q)
       return matchesFilter && matchesSearch
@@ -395,6 +401,9 @@ private struct HistoryPane: View {
           message: "Pick a run to view its GitHub Actions job log inline.")
       }
     }
+    // Back-fill the true GitHub conclusion for recent rows so their status is
+    // correct without opening each one. Bounded + on-appear only (not a poller).
+    .task { await app.resolveRecentConclusions() }
   }
 }
 
@@ -403,7 +412,7 @@ private struct HistoryRow: View {
   var body: some View {
     HStack(spacing: 9) {
       OSLogo(os: record.os, size: 13).frame(width: 16)
-      Circle().fill(record.outcome == .completed ? Color.green : Color.red).frame(width: 7, height: 7)
+      Circle().fill(statusColor(record.resolvedStatus)).frame(width: 7, height: 7)
       VStack(alignment: .leading, spacing: 1) {
         Text(record.repo).font(.callout).lineLimit(1).truncationMode(.middle)
         Text(record.startedAt.formatted(date: .abbreviated, time: .shortened))
@@ -425,7 +434,7 @@ private struct RunDetailView: View {
     VStack(alignment: .leading, spacing: 0) {
       DetailHeader(
         os: record.os, title: record.repo, subtitle: record.id,
-        trailing: AnyView(OutcomeBadge(outcome: record.outcome)))
+        trailing: AnyView(OutcomeBadge(record: record)))
       meta
       Divider()
       content
@@ -436,8 +445,24 @@ private struct RunDetailView: View {
   private var meta: some View {
     HStack(spacing: 14) {
       metaItem("Started", record.startedAt.formatted(date: .abbreviated, time: .shortened))
-      metaItem("Duration", durationString(record.duration))
-      if let code = record.exitStatus { metaItem("Exit", "\(code)") }
+      // Runner lifetime (launch → exit), NOT the job's runtime — labeled so the two
+      // aren't conflated (an idle-then-recycled runner's uptime includes its wait).
+      metaItem("Agent uptime", durationString(record.duration))
+        .help("How long the runner process was alive (launch → exit) — not the job's runtime.")
+      // The job's actual runtime, from the fetched job (no extra call). Shown only
+      // when it's meaningfully shorter than agent uptime, so it doesn't just echo it.
+      if case .loaded(let job?, _) = app.jobLogs[record.id],
+        let s = job.startedAt, let e = job.completedAt,
+        record.duration - e.timeIntervalSince(s) > 5
+      {
+        metaItem("Job time", durationString(e.timeIntervalSince(s)))
+      }
+      // The AGENT process exit, not the job result. Misleading once we know the job
+      // conclusion (it's ~always 0), so show it only when it's diagnostic: a crash
+      // (non-zero) or while the conclusion is still unresolved.
+      if let code = record.exitStatus, code != 0 || record.jobConclusion == nil {
+        metaItem("Agent exit", "\(code)")
+      }
       Spacer()
       if case .loaded(let job, _) = app.jobLogs[record.id], let url = job?.htmlURL.flatMap(URL.init) {
         Link(destination: url) { Label("GitHub", systemImage: "arrow.up.forward.square") }.font(.caption)
@@ -468,17 +493,43 @@ private struct RunDetailView: View {
       .frame(maxWidth: .infinity, maxHeight: .infinity)
     case .loaded(let job, let lines):
       if lines.isEmpty {
-        DashboardEmptyState(
-          systemImage: "doc.plaintext",
-          title: "No log available",
-          message: job == nil
-            ? "Found no matching job on GitHub."
-            : "The job was found, but its log isn't downloadable (still running, or past GitHub's retention).")
+        emptyLogState(job: job)
       } else {
         LogConsole(lines: lines, search: $logSearch)
       }
     case .unavailable(let message):
       DashboardEmptyState(systemImage: "exclamationmark.triangle", title: "Log unavailable", message: message)
+    }
+  }
+
+  /// The job was found but its log came back empty (deleted, still running, or past
+  /// retention). Read the resolved conclusion so the message is honest about WHY,
+  /// instead of a flat "No log available" for a job we know failed.
+  @ViewBuilder
+  private func emptyLogState(job: WorkflowJob?) -> some View {
+    switch record.jobConclusion {
+    case .failure, .timedOut:
+      let timedOut = record.jobConclusion == .timedOut
+      DashboardEmptyState(
+        systemImage: "xmark.octagon",
+        title: timedOut ? "Job timed out" : "Job failed",
+        message:
+          "GitHub confirms the job \(timedOut ? "timed out" : "failed"), but its log isn't "
+          + "downloadable (deleted, or past GitHub's retention).")
+    case .cancelled:
+      DashboardEmptyState(
+        systemImage: "minus.circle", title: "Job cancelled",
+        message: "The run was cancelled or deleted, so there's no log to show.")
+    case .inProgress:
+      DashboardEmptyState(
+        systemImage: "clock", title: "Job still running",
+        message: "The job is still executing or GitHub is indexing it — re-fetch in a moment.")
+    default:
+      DashboardEmptyState(
+        systemImage: "doc.plaintext", title: "No log available",
+        message: job == nil
+          ? "Found no matching job on GitHub."
+          : "The job was found, but its log isn't downloadable (still running, or past GitHub's retention).")
     }
   }
 }
@@ -709,10 +760,22 @@ private struct DetailHeader: View {
 }
 
 private struct OutcomeBadge: View {
-  let outcome: RunRecord.Outcome
+  let record: RunRecord
   var body: some View {
-    Badge(label: outcome == .completed ? "Completed" : "Failed",
-      color: outcome == .completed ? .green : .red)
+    Badge(label: record.statusLabel, color: statusColor(record.resolvedStatus))
+  }
+}
+
+/// Color for a resolved run status — shared by the History badge and the row
+/// circle. `unknownCompleted` is amber (NOT green): the agent exited cleanly but
+/// we haven't confirmed the result against GitHub yet.
+private func statusColor(_ status: RunRecord.ResolvedStatus) -> Color {
+  switch status {
+  case .passed: return .green
+  case .failed: return .red
+  case .neutral: return .secondary
+  case .running: return .blue
+  case .unknownCompleted: return .orange
   }
 }
 
