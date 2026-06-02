@@ -47,11 +47,23 @@ public enum HostCleanup {
     try? FileManager.default.removeItem(at: runsRoot())
   }
 
+  /// The persistent UUP download cache (`~/.mactions/cache`). An interrupted
+  /// Windows base build leaves a multi-GB `cache/uup-<build>/` here ON PURPOSE so
+  /// a retry resumes (`prepare-windows-image` reaps it only on a fully-successful
+  /// build). It must NOT be swept per go-online (that would defeat resume) — only
+  /// a full uninstall (`purgeAll`) reclaims it.
+  public static func cacheRoot() -> URL {
+    mactionsRoot().appendingPathComponent("cache", isDirectory: true)
+  }
+
   /// Remove the cached agent + all run dirs (the big/transient stuff). Leaves
   /// the auth token in place — signing out clears that via `TokenStore.clear()`.
   public static func purgeAll() {
     try? FileManager.default.removeItem(at: agentTemplateDirectory())
     try? FileManager.default.removeItem(at: logsRoot())
+    // Reclaim an aborted base build's multi-GB resume cache (NOT touched by
+    // purgeRuns/sweepOrphans, which run per go-online and must preserve resume).
+    try? FileManager.default.removeItem(at: cacheRoot())
     purgeRuns()
   }
 

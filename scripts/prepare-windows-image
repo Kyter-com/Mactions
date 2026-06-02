@@ -76,13 +76,16 @@ done
 die() { echo "error: $*" >&2; exit 1; }
 
 # --- Temp cleanup (success OR failure) ---------------------------------------
-# The multi-GB UUP download/convert workdir, the unattend staging dir, and the
-# no-prompt-ISO mountpoint all used to leak on early exit / interrupt (only the
-# success paths cleaned up), accumulating GBs in $TMPDIR across rebuilds. Track
-# them in globals and reap on EXIT so every path — die(), set -e abort, SIGINT —
-# cleans up. The canonical artifacts (~/.mactions/win11-base.iso etc.) are copied
-# out before exit, so reaping these scratch dirs is always safe.
-WORKDIR=""           # auto_download_iso: UUP zip + unpacked payload + source ISO
+# The small scratch that should ALWAYS be reaped on exit (incl. die / set -e /
+# SIGINT): the unattend staging dir and the no-prompt-ISO mountpoint. Tracked in
+# globals so the EXIT trap can reap them regardless of how we leave.
+#
+# NOTE: the multi-GB UUP download is DELIBERATELY NOT reaped here — it lives in a
+# persistent per-build cache ($CACHE_ROOT/uup-<build>) so an interrupted run
+# RESUMES it (aria2 -c) instead of re-downloading ~8 GB. That cache is reclaimed
+# only after a fully-successful build (see the fusion arm). The canonical
+# artifacts (~/.mactions/win11-base.iso etc.) are written before exit, so reaping
+# the staging/mount scratch is always safe.
 UNATTEND_STAGING=""  # build_unattend_iso: autounattend.xml + bootstrap.ps1 stage
 NOPROMPT_MNT=""      # make_noprompt_iso: read-only DMG mountpoint of the Win11 ISO
 cleanup_temp() {
@@ -90,7 +93,6 @@ cleanup_temp() {
     hdiutil detach "$NOPROMPT_MNT" >/dev/null 2>&1 || true
     rmdir "$NOPROMPT_MNT" 2>/dev/null || true
   }
-  [[ -n "$WORKDIR"          ]] && rm -rf "$WORKDIR" 2>/dev/null || true
   [[ -n "$UNATTEND_STAGING" ]] && rm -rf "$UNATTEND_STAGING" 2>/dev/null || true
 }
 trap cleanup_temp EXIT
@@ -257,9 +259,28 @@ PY
   RECORDED_BUILD="$build"
   echo "    build $build  (uuid $uuid)" >&2
 
-  local workdir
-  workdir="$(mktemp -d)"; WORKDIR="$workdir"   # reaped by the EXIT trap
-  echo "==> Fetching the UUP download package + converting to ISO (this is the slow, multi-GB step)" >&2
+  # RESUME: if a no-prompt boot ISO for THIS build is already cached, skip the
+  # whole ~8 GB download + convert + remaster. A retry after an interrupted
+  # install then jumps straight to the VM build (the "continue on the latest
+  # step" win). The cache + its build tag are written only on a successful
+  # remaster below, so a stale/partial ISO can't be mistaken for a finished one.
+  if [[ -f "$ISO_CACHE" && "$(cat "$ISO_BUILD_MARKER" 2>/dev/null)" == "$build" ]]; then
+    echo "==> Reusing cached Win11 ISO for build $build (resumed — skipping the ~8 GB download/convert)" >&2
+    ISO="$ISO_CACHE"
+    NEED_REMASTER=0
+    return
+  fi
+
+  # Persistent per-build download dir (NOT the EXIT-trap temp): the converter runs
+  # aria2 with -c (continue), so an interrupted download resumes from the partial
+  # UUPs/ here across runs / network drops instead of restarting. Drop any OTHER
+  # build's stale cache so only one ever sits on disk; this whole dir is reaped on
+  # a fully-successful build (see the fusion arm).
+  local workdir="$CACHE_ROOT/uup-$build"
+  mkdir -p "$CACHE_ROOT"
+  find "$CACHE_ROOT" -maxdepth 1 -type d -name 'uup-*' ! -name "uup-$build" -exec rm -rf {} + 2>/dev/null || true
+  mkdir -p "$workdir"
+  echo "==> Fetching the UUP download package + converting to ISO (multi-GB; resumes if interrupted)" >&2
   # The autodl=2 convert package (the ZIP holding uup_download_macos.sh + the
   # aria2 download list) is served ONLY by the front-end host uupdump.net — the
   # api host returns 400 UNSUPPORTED_COMBINATION for this query. edition stays
@@ -276,6 +297,8 @@ PY
   [[ -f "$conv" ]] || conv="$workdir/convert.sh"
   [[ -f "$conv" ]] || die "UUP package didn't contain a macOS convert script — convert manually, then re-run with --iso."
   chmod +x "$conv"
+  # aria2 -c (in the convert script) resumes the partial download in UUPs/; the
+  # convert (CPU-bound) re-runs from the now-complete packages.
   ( cd "$workdir" && "./$(basename "$conv")" ) || die "ISO conversion failed (see output above)."
   # -iname folds .iso/.ISO into ONE branch (the duplicated -maxdepth on each side
   # of -o was fragile, since -maxdepth is a global option, not a per-branch test),
@@ -283,8 +306,21 @@ PY
   # one ISO (filesystem order is otherwise unspecified).
   ISO="$(find "$workdir" -maxdepth 1 -iname '*.iso' | sort | head -n1)"
   [[ -n "$ISO" && -f "$ISO" ]] || die "converter finished but produced no ISO in $workdir."
+  NEED_REMASTER=1
   echo "==> Built ISO: $ISO" >&2
 }
+
+# --- Resumable-build paths ---------------------------------------------------
+# The no-prompt boot ISO is cached at $ISO_CACHE, tagged with the build id in
+# $ISO_BUILD_MARKER. The multi-GB UUP download lives under $CACHE_ROOT and
+# PERSISTS across a failed run, so a retry resumes (aria2 -c) instead of
+# re-downloading ~8 GB. All of this is reaped only after a FULLY successful build
+# (see the fusion arm), so "continue on the latest step" is the default on retry.
+MACTIONS_ROOT="${HOME}/.mactions"
+ISO_CACHE="$MACTIONS_ROOT/win11-base.iso"
+ISO_BUILD_MARKER="$MACTIONS_ROOT/win11-base.iso.build"
+CACHE_ROOT="$MACTIONS_ROOT/cache"
+NEED_REMASTER=1   # 1 = (re)build the no-prompt ISO; 0 = reuse the cached one (resumed)
 
 if [[ -z "$ISO" ]]; then
   auto_download_iso
@@ -376,7 +412,6 @@ make_noprompt_iso() {
   fi
 }
 
-MACTIONS_ROOT="${HOME}/.mactions"
 echo "==> Building unattended-install ISO (autounattend.xml + bootstrap.ps1)"
 # Create the staging dir in the PARENT (not inside the $(...) subshell) so the
 # top-level EXIT trap reaps it even if interrupted mid-build.
@@ -409,30 +444,44 @@ case "$TOOL" in
     # then snapshots "base-provisioned").
     echo "==> Stashing unattend ISO at the canonical path for the Fusion base build"
     cp -f "$UNATTEND_ISO" "$MACTIONS_ROOT/mactions-unattend.iso"
-    echo "==> Preparing the Win11 boot ISO (no-prompt remaster so there's no boot keypress)"
-    # Create the mountpoint in the PARENT (not inside the $(...) subshell) so the
-    # top-level EXIT trap detaches+reaps it even if interrupted mid-remaster.
-    NOPROMPT_MNT="$(mktemp -d)"
-    NOPROMPT_ISO="$(make_noprompt_iso "$ISO" "$NOPROMPT_MNT")"
-    if [[ "$NOPROMPT_ISO" != "$MACTIONS_ROOT/win11-base.iso" ]]; then
-      # Fallback returned the original (prompting) ISO — stash it at the canonical path.
-      cp -f "$NOPROMPT_ISO" "$MACTIONS_ROOT/win11-base.iso"
+    if [[ "$NEED_REMASTER" == 1 ]]; then
+      echo "==> Preparing the Win11 boot ISO (no-prompt remaster so there's no boot keypress)"
+      # Create the mountpoint in the PARENT (not inside the $(...) subshell) so the
+      # top-level EXIT trap detaches+reaps it even if interrupted mid-remaster.
+      NOPROMPT_MNT="$(mktemp -d)"
+      NOPROMPT_ISO="$(make_noprompt_iso "$ISO" "$NOPROMPT_MNT")"
+      if [[ "$NOPROMPT_ISO" != "$ISO_CACHE" ]]; then
+        # Fallback returned the original (prompting) ISO — stash it at the canonical path.
+        cp -f "$NOPROMPT_ISO" "$ISO_CACHE"
+      fi
+      # Tag the cached ISO with its build — written ONLY now that the ISO is in
+      # place, so a retry's resume check can never reuse a stale/partial ISO.
+      # Guarded like windows-base.build below: a user --iso with no version in its
+      # filename leaves RECORDED_BUILD empty, and an empty tag would be a pointless
+      # file (the resume check only runs on the auto path, where it's never empty).
+      if [[ -n "$RECORDED_BUILD" ]]; then
+        printf '%s\n' "$RECORDED_BUILD" > "$ISO_BUILD_MARKER"
+      fi
+    else
+      echo "==> Reusing the cached no-prompt Win11 ISO for build ${RECORDED_BUILD:-?} (resumed)"
     fi
     echo "==> Running VMware Fusion headless base build (autounattend -> bootstrap -> snapshot)"
     NAME="$NAME" DISK_GB="$DISK_GB" RAM_MB="$RAM_MB" CPUS="$CPUS" \
-      WIN11_ISO="$MACTIONS_ROOT/win11-base.iso" \
+      WIN11_ISO="$ISO_CACHE" \
       UNATTEND_ISO="$MACTIONS_ROOT/mactions-unattend.iso" \
       "$HERE/fusion-windows-base"
-    # Record the build id ONLY now that fusion-windows-base returned success (it
-    # verifies the provisioning sentinel + snapshot before exiting 0; under set -e
-    # a failed build would have aborted the script before reaching here). So the
-    # app's auto-update check (WindowsImage.recordedBaseImageBuild) never trusts a
-    # build id for a base that wasn't actually produced. Lives at the mactions root
-    # (NOT under runs/, which is swept every go-online).
+    # Build SUCCEEDED (set -e: a failed fusion-windows-base would have aborted the
+    # script before here — it verifies the provisioning sentinel + snapshot before
+    # exiting 0). Record the build id the app's auto-update check trusts, then
+    # reclaim the multi-GB UUP download cache — the base VM + snapshot are the
+    # durable artifacts now, so the raw UUP packages aren't needed. (win11-base.iso
+    # + its build tag are KEPT so a future same-build rebuild still skips the
+    # download.)
     if [[ -n "${RECORDED_BUILD:-}" ]]; then
       mkdir -p "$MACTIONS_ROOT"
       printf '%s\n' "$RECORDED_BUILD" > "$MACTIONS_ROOT/windows-base.build"
     fi
+    rm -rf "$CACHE_ROOT" 2>/dev/null || true
     echo
     echo "==> Fusion base build done. Base lives at ~/.mactions/fusion/$NAME.vmx"
     echo "    (snapshot 'base-provisioned'). Per job, mactions-fusion-vm linked-clones"

@@ -2,8 +2,9 @@ import AppKit
 import MactionsCore
 import SwiftUI
 
-/// One row in the live runner list: which repo a runner belongs to + its state.
+/// One row in the live runner list: which OS + repo a runner belongs to + state.
 struct FleetRunnerRow: Identifiable {
+  let os: RunnerOS
   let repoFullName: String
   let runner: ManagedRunner
   var id: String { "\(repoFullName)#\(runner.id)" }
@@ -25,17 +26,26 @@ final class AppState: ObservableObject {
 
   // Windows runner (OPT-IN — nothing heavy happens until the user clicks the
   // "Set up Windows runner" button). All persisted to UserDefaults.
-  /// Set once the one-time base-image build has succeeded. Gates the Windows
-  /// toggle: no Windows fleet is offerable until an image exists.
+  /// Set once the one-time base-image build has succeeded. Gates the Windows OS
+  /// tile: Windows isn't selectable until an image exists.
   @Published var windowsImageReady = false
-  /// When on (and an image is ready), go-online also brings up a Windows fleet
-  /// labeled `[self-hosted, Windows, mactions]` for each selected repo.
-  @Published var windowsEnabled = false
+  /// Which OSes the user picked to run fleets for (the OS tiles). macOS is the
+  /// default; Windows is selectable only once `windowsImageReady`; Linux is not
+  /// implemented yet. On go-online each SELECTED + implemented OS gets a fleet per
+  /// repo (macOS via the local provider, Windows via the VM provider).
+  @Published var selectedOSes: Set<RunnerOS> = [.macOS]
   /// Name of the base VM `prepare-windows-image` built (what we clone per job).
   @Published var windowsBaseImage = "win11-runner-base"
   /// True while the (long, multi-GB) image-prep flow is running. Disables the
   /// button so it can't be double-fired.
   @Published var windowsSetupBusy = false
+  /// The current phase of the running base-image build, driven by streaming the
+  /// prep scripts' output (`WindowsSetupProgress`). `nil` when no build is
+  /// running. Powers the live stepper in the popover.
+  @Published var windowsSetupStep: WindowsSetupStep?
+  /// A short sub-status under the active step (install ticks, milestones, resume
+  /// notice). `nil` clears it.
+  @Published var windowsSetupDetail: String?
   /// Latest prerequisite scan (Homebrew, hypervisor, converter tools). Drives the
   /// preflight checklist; refreshed when the Windows section appears + after an
   /// install. `nil` until the first scan.
@@ -66,8 +76,12 @@ final class AppState: ObservableObject {
   @Published var runners: [FleetRunnerRow] = []
   @Published var statusMessage: String?
 
-  /// One orchestrator per repo, keyed by `owner/name`.
+  /// One orchestrator per repo×OS, keyed by `owner/name` (macOS) or
+  /// `owner/name (Windows)`.
   private var orchestrators: [String: RunnerOrchestrator] = [:]
+  /// The OS each orchestrator key belongs to, so the live runner list can show
+  /// the right logo. Same keys as `orchestrators`; cleared together.
+  private var fleetOS: [String: RunnerOS] = [:]
   /// Bumped on every goOnline/goOffline so a slow goOnline Task (e.g. blocked
   /// on the agent download) can detect that the user went offline meanwhile and
   /// abort instead of reviving a dead fleet.
@@ -80,8 +94,14 @@ final class AppState: ObservableObject {
     runnersPerRepo = max(1, defaults.integer(forKey: "runnersPerRepo"))
     clientId = defaults.string(forKey: "clientId") ?? ""
     windowsImageReady = defaults.bool(forKey: "windowsImageReady")
-    windowsEnabled = defaults.bool(forKey: "windowsEnabled")
     windowsBaseImage = defaults.string(forKey: "windowsBaseImage") ?? windowsBaseImage
+    // Restore the OS selection (pure logic in RunnerOS.restoreSelection, tested).
+    // Back-compat: migrates a pre-OS-selection install from the legacy
+    // `windowsEnabled` flag, seeding Windows only when its image is actually ready.
+    selectedOSes = RunnerOS.restoreSelection(
+      savedRawValues: defaults.stringArray(forKey: "selectedOSes"),
+      legacyWindowsEnabled: defaults.bool(forKey: "windowsEnabled"),
+      windowsImageReady: windowsImageReady)
     isSignedIn = TokenStore.load() != nil
     // Reap anything a previous crash / force-quit left behind (orphaned runner
     // processes, leaked Windows VM clones) BEFORE the user does anything — not
@@ -105,7 +125,7 @@ final class AppState: ObservableObject {
     defaults.set(runnersPerRepo, forKey: "runnersPerRepo")
     defaults.set(clientId, forKey: "clientId")
     defaults.set(windowsImageReady, forKey: "windowsImageReady")
-    defaults.set(windowsEnabled, forKey: "windowsEnabled")
+    defaults.set(selectedOSes.map(\.rawValue), forKey: "selectedOSes")
     defaults.set(windowsBaseImage, forKey: "windowsBaseImage")
   }
 
@@ -226,6 +246,10 @@ final class AppState: ObservableObject {
   func goOnline() {
     guard let token = TokenStore.load() else { statusMessage = "Sign in first."; return }
     guard !selectedRepos.isEmpty else { statusMessage = "Pick at least one repository."; return }
+    guard selectedOSes.contains(where: { $0.isImplemented }) else {
+      statusMessage = "Pick at least one runner OS."
+      return
+    }
     saveConfig()
     fleetEpoch += 1
     let myEpoch = fleetEpoch
@@ -242,15 +266,23 @@ final class AppState: ObservableObject {
       guard fleetEpoch == myEpoch else { return }  // went offline during the sweep
       var created: [RunnerOrchestrator] = []
       do {
-        let template = try await RunnerInstaller.ensureInstalled(token: token)
-        guard fleetEpoch == myEpoch else { return } // went offline during download
-        let factory = LocalProcessProviderFactory(
-          templateDirectory: template, runsRoot: HostCleanup.runsRoot())
-        // Windows fleet (opt-in): only when the user enabled it AND a base image
+        let wantsMac = selectedOSes.contains(.macOS)
+        // Only fetch the macOS agent template when a macOS fleet is actually
+        // wanted — a Windows-only selection needs no local agent.
+        let factory: LocalProcessProviderFactory?
+        if wantsMac {
+          let template = try await RunnerInstaller.ensureInstalled(token: token)
+          guard fleetEpoch == myEpoch else { return }  // went offline during download
+          factory = LocalProcessProviderFactory(
+            templateDirectory: template, runsRoot: HostCleanup.runsRoot())
+        } else {
+          factory = nil
+        }
+        // Windows fleet: only when the Windows OS tile is selected AND a base image
         // exists AND VMware Fusion is installed. Never spun up automatically.
         // Fusion is the sole backend (the proven Win11-ARM path).
         let windowsFactory: WindowsVMProviderFactory? =
-          (windowsEnabled && windowsImageReady)
+          (selectedOSes.contains(.windows) && windowsImageReady)
           ? WindowsVMProviderFactory.detectInstalledCLI().map {
             WindowsVMProviderFactory(baseImage: windowsBaseImage, cli: $0)
           }
@@ -271,14 +303,17 @@ final class AppState: ObservableObject {
         var windowsVMsStamped = 0
         for repo in repos {
           guard fleetEpoch == myEpoch else { break }
-          let client = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
-          let fleet = FleetConfig(
-            owner: repo.owner, repo: repo.name, labels: labels, desiredCount: runnersPerRepo)
-          let orch = RunnerOrchestrator(controlPlane: client, factory: factory, config: fleet)
-          orch.onChange = { [weak self] in self?.sync() }
-          orchestrators[repo.fullName] = orch
-          created.append(orch)
-          await orch.start()
+          if wantsMac, let factory {
+            let client = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
+            let fleet = FleetConfig(
+              owner: repo.owner, repo: repo.name, labels: labels, desiredCount: runnersPerRepo)
+            let orch = RunnerOrchestrator(controlPlane: client, factory: factory, config: fleet)
+            orch.onChange = { [weak self] in self?.sync() }
+            orchestrators[repo.fullName] = orch
+            fleetOS[repo.fullName] = .macOS
+            created.append(orch)
+            await orch.start()
+          }
 
           if let windowsFactory, windowsVMsStamped < maxWindowsVMs {
             let winClient = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
@@ -287,7 +322,9 @@ final class AppState: ObservableObject {
             let winOrch = RunnerOrchestrator(
               controlPlane: winClient, factory: windowsFactory, config: winFleet)
             winOrch.onChange = { [weak self] in self?.sync() }
-            orchestrators["\(repo.fullName) (Windows)"] = winOrch
+            let winKey = "\(repo.fullName) (Windows)"
+            orchestrators[winKey] = winOrch
+            fleetOS[winKey] = .windows
             created.append(winOrch)
             windowsVMsStamped += 1
             await winOrch.start()
@@ -334,6 +371,7 @@ final class AppState: ObservableObject {
     sync()
     for orch in orchestrators.values { await orch.stop() }
     orchestrators.removeAll()
+    fleetOS.removeAll()
     // Each run wipes its own working copy; sweep again defensively.
     HostCleanup.purgeRuns()
     runners = []
@@ -408,9 +446,9 @@ final class AppState: ObservableObject {
     await Task.detached { WindowsPreflight.runInstall(for: report) }.value
   }
 
-  /// Labels a Windows fleet registers with. Mirrors the macOS arm of a CI
-  /// matrix: `runs-on: [self-hosted, Windows, mactions]`.
-  private let windowsLabels = ["self-hosted", "Windows", "mactions"]
+  /// Labels a Windows fleet registers with: `[self-hosted, Windows, mactions]`.
+  /// Sourced from the model (not a duplicated literal) so it can't drift.
+  private let windowsLabels = RunnerOS.windows.defaultLabels
 
   /// The ONLY trigger for any Windows ISO download / base-image build. Nothing
   /// heavy ever happens automatically — this runs `scripts/prepare-windows-image`
@@ -456,6 +494,8 @@ final class AppState: ObservableObject {
     let report = WindowsPreflight.detect()
     windowsPreflight = report
     windowsSetupBusy = true
+    windowsSetupStep = .prerequisites
+    windowsSetupDetail = nil
     statusMessage = "Checking Windows prerequisites…"
     Task {
       // 1) Install missing FREE deps (off the main actor — it may shell out).
@@ -468,17 +508,17 @@ final class AppState: ObservableObject {
           break  // proceed to the build
         case let .homebrewMissing(message):
           statusMessage = message
-          windowsSetupBusy = false
+          endWindowsSetup()
           return
         case let .failed(command, stderr):
           statusMessage =
             "Couldn't install prerequisites (`\(command)`): \(stderr.isEmpty ? "see Homebrew output" : stderr)"
-          windowsSetupBusy = false
+          endWindowsSetup()
           return
         }
       } else if case let .homebrewMissing(message) = WindowsPreflight.installPlan(for: report) {
         statusMessage = message
-        windowsSetupBusy = false
+        endWindowsSetup()
         return
       }
 
@@ -486,7 +526,7 @@ final class AppState: ObservableObject {
       guard WindowsVMProviderFactory.detectInstalledCLI() != nil else {
         statusMessage =
           "VMware Fusion isn't installed. Get it free from the Broadcom portal (it's the proven Win11-ARM backend, and not brew-installable), then try again."
-        windowsSetupBusy = false
+        endWindowsSetup()
         return
       }
 
@@ -494,7 +534,16 @@ final class AppState: ObservableObject {
       // the latest Win11 ARM64 ISO (UUP dump) when no --iso is passed, then
       // drives the base-VM build. The blocking shell-out runs off the main actor.
       statusMessage = "Setting up the Windows runner (downloading + building the base image — this takes a while)…"
-      let result = await Self.runPrepScript(script, name: image)
+      // Stream the prep scripts' phase markers into the live stepper as the build
+      // runs. The continuation is Sendable (safe to yield from the script's drain
+      // threads); we consume on the MainActor and advance the stepper forward-only.
+      let (lines, continuation) = AsyncStream<String>.makeStream()
+      let progress = Task { @MainActor in
+        for await line in lines { self.applySetupProgress(line) }
+      }
+      let result = await Self.runPrepScript(script, name: image) { continuation.yield($0) }
+      continuation.finish()
+      _ = await progress.value
       // Persist the FULL build transcript to ~/.mactions/logs so a failure is
       // diagnosable from disk (survives the ephemeral clone; no Console.app
       // spelunking). Both success + failure, so a "succeeded but didn't verify"
@@ -504,7 +553,7 @@ final class AppState: ObservableObject {
         contents:
           "exit=\(result.map { String($0.status) } ?? "nil (could not launch)")\n\n"
           + "=== stdout ===\n\(result?.stdout ?? "")\n\n=== stderr ===\n\(result?.stderr ?? "")\n")
-      windowsSetupBusy = false
+      endWindowsSetup()
       if let result, result.ok {
         // Exit 0 means the prep RAN, not that a bootable base VM exists — the
         // unattended OS install + bootstrap happen on the first headless boot.
@@ -555,9 +604,9 @@ final class AppState: ObservableObject {
     return f.string(from: Date())
   }
 
-  private nonisolated static func runPrepScript(_ script: String, name: String) async
-    -> Shell.Result?
-  {
+  private nonisolated static func runPrepScript(
+    _ script: String, name: String, onLine: @escaping @Sendable (String) -> Void
+  ) async -> Shell.Result? {
     await Task.detached {
       // A Finder/login-item launched .app inherits a launchd PATH WITHOUT
       // /opt/homebrew/bin, so the script's own `command -v` checks for python3 +
@@ -571,15 +620,47 @@ final class AppState: ObservableObject {
       let prepend = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"]
         .filter { !have.contains($0) }
       env["PATH"] = (prepend + [existing]).joined(separator: ":")
-      return try? Shell.run(script, ["--name", name], environment: env)
+      // Stream the output (for the live stepper) while still capturing the full
+      // transcript for the durable log.
+      return try? Shell.runStreaming(script, ["--name", name], environment: env, onLine: onLine)
     }.value
   }
 
-  func setWindowsEnabled(_ on: Bool) {
-    guard state == .offline else { return }
-    windowsEnabled = on
+  /// Advance the live setup stepper from a line of build output (FORWARD-ONLY, so
+  /// a duplicate/late marker can't regress it) and refresh the sub-status. Called
+  /// on the MainActor as the prep scripts stream.
+  private func applySetupProgress(_ line: String) {
+    if let step = WindowsSetupProgress.step(for: line) {
+      windowsSetupStep = max(windowsSetupStep ?? step, step)
+    }
+    if let detail = WindowsSetupProgress.detail(for: line) {
+      windowsSetupDetail = detail
+    }
+  }
+
+  /// Tear down the live setup indicator (the build finished or aborted). Paired
+  /// with every exit from `setUpWindowsRunner` so the stepper never lingers.
+  private func endWindowsSetup() {
+    windowsSetupBusy = false
+    windowsSetupStep = nil
+    windowsSetupDetail = nil
+  }
+
+  /// Toggle an OS tile on/off. No-op while online, for an unimplemented OS
+  /// (Linux), or for Windows before its base image is ready (the UI routes that
+  /// tap to `setUpWindowsRunner` instead).
+  func toggleOS(_ os: RunnerOS) {
+    guard state == .offline, os.isImplemented else { return }
+    if os == .windows && !windowsImageReady { return }
+    if selectedOSes.contains(os) {
+      selectedOSes.remove(os)
+    } else {
+      selectedOSes.insert(os)
+    }
     saveConfig()
   }
+
+  func isOSSelected(_ os: RunnerOS) -> Bool { selectedOSes.contains(os) }
 
   /// Check whether a newer Win11 ARM64 build is available than the one the base
   /// image was built from, and surface it as the dedicated `windowsUpdateNotice`
@@ -643,9 +724,14 @@ final class AppState: ObservableObject {
     // orch.lastError onto statusMessage on every change — that clobbered the
     // status line and made a single transient error look permanent.
     var rows: [FleetRunnerRow] = []
-    for (fullName, orch) in orchestrators {
+    for (key, orch) in orchestrators {
+      let os = fleetOS[key] ?? .macOS
+      // The Windows fleet is keyed "<repo> (Windows)"; show just the repo (the OS
+      // is conveyed by the row's logo now).
+      let suffix = " (Windows)"
+      let repoName = key.hasSuffix(suffix) ? String(key.dropLast(suffix.count)) : key
       for runner in orch.runners {
-        rows.append(FleetRunnerRow(repoFullName: fullName, runner: runner))
+        rows.append(FleetRunnerRow(os: os, repoFullName: repoName, runner: runner))
       }
     }
     runners = rows.sorted { $0.id < $1.id }
