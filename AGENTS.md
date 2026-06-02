@@ -208,6 +208,24 @@ The JIT config must carry labels `[self-hosted, Windows, mactions]` for these jo
 - The win-arm64 runner is still officially "beta"/limited-support; the multi-edition ISO is unactivated (cosmetic nags) — acceptable for a throwaway CI guest, not for production.
 - A fresh Win11 clone boots much slower than a Tart Linux guest, so jobs pay a multi-minute clone+boot+SSH tax per run. JIT tokens expire ~60 min after generation; the orchestrator already mints them right before `start()`, so don't pre-warm clones with a stale jitconfig.
 
+### Windows code signing (Azure Trusted Signing) on ARM64 — OPEN (as of 2026-06-02)
+
+sweep-collector signs its Windows installer with `azure/trusted-signing-action@v2`. The **entire toolchain now runs on a Mactions Win11-ARM runner** — the only thing that fails is the final signing call, and it is **not** a config/auth regression. What we proved:
+
+- **Everything up to the actual sign works on the self-hosted runner**: `npm ci --ignore-scripts` ✓, electron-vite build ✓, Sentry sourcemaps ✓, electron-builder package ✓, **Install Azure CLI** ✓, `azure/login` **OIDC** ✓, **`setup-dotnet` (.NET 10)** ✓, and `signtool.exe` + `Azure.CodeSigning.Dlib.dll` are invoked. It then dies with a bare **`SignTool failed with exit code 3`** — a Trusted Signing **data-plane rejection** (≈HTTP 403) whose real error the action **swallows** (only the exit code surfaces; see `azure/artifact-signing-action#138`).
+- **The signing config + auth are byte-identical to when it worked.** Same OIDC service principal (`azure/login`, client-id/tenant-id/subscription-id, **no client secret**), same `endpoint` (`https://eus.codesigning.azure.net/`), `trusted-signing-account-name` (`kyter-signing`), `certificate-profile-name` (`sweep-collector-public-trust`). **Last real signing success: run `26322358618` (2026-05-23) on GitHub-hosted `windows-latest` (x64).** (Most "success" release runs since then merely **skipped** the build — version already tagged — so the self-hosted path has *never actually signed*. The current config is the first that reaches the sign step.)
+- **The only thing that changed is the runner.** Hosted `windows-latest` (x64, native signtool/dlib) → self-hosted `[self-hosted, Windows, mactions]` (Win11-on-**ARM64**, so the **x64** signtool + **x64** `Azure.CodeSigning.Dlib.dll` run under **Prism emulation**). Failure onset coincides exactly with the runner switch (sweep-collector commit `e844f80b2`), not with any auth/config change. (Auth even worked on the older `@v0` action, so the `@v0→@v2` bump isn't it either.)
+
+**Why this matters for Mactions:** this is the first workload the "x64-under-emulation" caveat above has actually bitten. The open question is whether a Win11-ARM Mactions runner can do Azure Trusted Signing under emulation at all, or whether it needs the **native arm64 signtool + arm64 `Azure.CodeSigning.Dlib.dll`** (if Azure ships one).
+
+**To resume (tomorrow), in order:**
+1. **Free Azure-portal checks (no re-run).** On the `kyter-signing` Trusted Signing account: (a) IAM → confirm the `AZURE_CLIENT_ID` app/SP still holds **"Trusted Signing Certificate Profile Signer"** (the *data-plane* signer role, distinct from "Identity Verifier"/Owner); (b) account **region == East US** (matches the `eus` endpoint); (c) **Identity validation == Completed**. All three worked on 2026-05-23, so they only matter if something changed in Azure since — but they're 2-minute confirmations and the #1 documented cause of exit-3-after-auth.
+2. **Surface the real error.** The action swallows signtool's `/v /debug` output. Add a step that runs the exact `signtool.exe sign /v /debug … /dlib Azure.CodeSigning.Dlib.dll /dmdf metadata.json "<exe>"` **directly** (not via the action) so its HTTP status + CorrelationId print — or RDP the runner and run it by hand after `az login` as the SP. This disambiguates RBAC vs region vs emulation, which the logs currently can't.
+3. **If RBAC/region/validation are all clean → it's the ARM64 emulation.** Try the native **arm64** SDK BuildTools `signtool` + arm64 dlib.
+4. **Guaranteed-green stopgap (not the goal):** move *only* the Windows leg back to hosted `windows-latest` (keep macOS self-hosted) — proven to sign. Defeats the point of Mactions for Windows, so treat as a fallback while the above is sorted.
+
+**Cross-repo state (both pushed):** sweep-collector `release.yml` on `main` already carries the per-workflow fixes — `npm ci --ignore-scripts`, **Install Azure CLI** (x64 MSI via `aka.ms/installazurecliwindowsx64`), and **setup-dotnet** (.NET 10 + `DOTNET_ROLL_FORWARD=LatestMajor`, PR #95). Mactions' base image bakes in **pwsh** (provisioning recipe **v3** — built bases before that flag a rebuild). So only the final Trusted Signing call remains.
+
 ## Auth
 
 Friendly by design — no env vars, no hand-copied long tokens.
