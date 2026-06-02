@@ -91,6 +91,10 @@ final class AppState: ObservableObject {
   // Fleet runtime.
   @Published var state: FleetState = .offline
   @Published var runners: [FleetRunnerRow] = []
+  /// Names of OUR runners GitHub reports as `busy` (executing a job right now).
+  /// Polled by the Runners pane so the activity ring spins only during a real job,
+  /// not for an idle-but-online runner. Empty when offline.
+  @Published var busyRunnerNames: Set<String> = []
   @Published var statusMessage: String?
   /// Finished runs (newest first), surfaced in the dashboard window's history.
   /// Loaded from disk on launch and appended to as runners exit; persisted off
@@ -415,6 +419,7 @@ final class AppState: ObservableObject {
     // Each run wipes its own working copy; sweep again defensively.
     HostCleanup.purgeRuns()
     runners = []
+    busyRunnerNames = []
     state = .offline
     statusMessage = "Offline."
   }
@@ -992,6 +997,25 @@ final class AppState: ObservableObject {
 
   /// Look up the job a currently-online runner is executing (for the live step
   /// checklist). Re-callable on a poll; updates the cached entry in place.
+  /// Poll GitHub for which of our runners are BUSY (executing a job) so the
+  /// dashboard's activity ring spins only during a real job — not for an idle but
+  /// online runner. Cheap: one `listRunners` per selected repo. Driven by the
+  /// Runners pane's `.task` while it's visible; clears itself when offline.
+  func refreshRunnerBusy() async {
+    guard state == .online, let token = TokenStore.load() else {
+      if !busyRunnerNames.isEmpty { busyRunnerNames = [] }
+      return
+    }
+    var busy: Set<String> = []
+    for repo in selectedRepos {
+      let client = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
+      if let remote = try? await client.listRunners() {
+        for runner in remote where runner.busy { busy.insert(runner.name) }
+      }
+    }
+    busyRunnerNames = busy
+  }
+
   func loadRunnerJob(for runnerName: String, repo: String) async {
     guard let client = client(forRepo: repo) else {
       runnerJobs[runnerName] = .notFound

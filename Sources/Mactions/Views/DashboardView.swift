@@ -148,10 +148,11 @@ private struct DashboardHeader: View {
     HStack(spacing: 6) {
       Image(systemName: systemImage).font(.caption).foregroundStyle(.secondary)
       VStack(alignment: .leading, spacing: 0) {
-        Text(label).font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary).tracking(0.4)
-        Text(value).font(.caption.weight(.medium)).monospacedDigit()
+        Text(label).font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary).tracking(0.4).lineLimit(1)
+        Text(value).font(.caption.weight(.medium)).monospacedDigit().lineLimit(1)
       }
     }
+    .fixedSize()  // keep each chip one line → uniform height (no "1 macOS · 1 Win" wrap)
     .padding(.horizontal, 10).padding(.vertical, 6)
     .liquidGlass(in: RoundedRectangle(cornerRadius: 8))
     .help(help)
@@ -165,6 +166,17 @@ private struct RunnersPane: View {
   @State private var selected: String?
 
   var body: some View {
+    content.task {
+      // Poll which of our runners GitHub reports as executing a job (`busy`) so
+      // the activity ring spins only during a real job. Runs while this pane shows.
+      while !Task.isCancelled {
+        await app.refreshRunnerBusy()
+        try? await Task.sleep(nanoseconds: 6_000_000_000)
+      }
+    }
+  }
+
+  @ViewBuilder private var content: some View {
     if app.runners.isEmpty {
       DashboardEmptyState(
         systemImage: "bolt.slash",
@@ -176,7 +188,7 @@ private struct RunnersPane: View {
       HStack(spacing: 0) {
         List(selection: $selected) {
           ForEach(app.runners) { row in
-            RunnerRow(row: row).tag(row.id)
+            RunnerRow(row: row, busy: app.busyRunnerNames.contains(row.runner.id)).tag(row.id)
           }
         }
         .listStyle(.inset)
@@ -194,16 +206,15 @@ private struct RunnersPane: View {
   }
 }
 
-/// A status dot with an optional GitHub-style spinning ring — the ring rotates
-/// while the runner is live (online / provisioning / recycling), echoing the GH
-/// Actions in-progress spinner. NOTE: keyed on the runner *phase*, so an idle
-/// online runner spins too; making it strictly "executing a job" needs the
-/// per-runner `busy` flag from GitHub's runner API threaded onto ManagedRunner.
+/// A status dot with a GitHub-style spinning ring around it WHILE the runner is
+/// executing a job (`busy`, from GitHub's runner API), echoing the GH Actions
+/// in-progress spinner. Idle/online runners show a plain centered dot; the color
+/// reflects the runner's phase. Ring + dot share the ZStack center (concentric).
 private struct RunnerActivityDot: View {
   let phase: ManagedRunner.Phase
+  let busy: Bool
   @State private var spin = false
 
-  private var active: Bool { phase == .online || phase == .provisioning || phase == .recycling }
   private var color: Color {
     switch phase {
     case .online: return .green
@@ -215,11 +226,11 @@ private struct RunnerActivityDot: View {
 
   var body: some View {
     ZStack {
-      if active {
+      if busy {
         Circle()
           .trim(from: 0, to: 0.7)
           .stroke(color, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
-          .frame(width: 14, height: 14)
+          .frame(width: 13, height: 13)
           .rotationEffect(.degrees(spin ? 360 : 0))
           .animation(.linear(duration: 1).repeatForever(autoreverses: false), value: spin)
           .onAppear { spin = true }
@@ -232,10 +243,11 @@ private struct RunnerActivityDot: View {
 
 private struct RunnerRow: View {
   let row: FleetRunnerRow
+  let busy: Bool
   var body: some View {
     HStack(spacing: 9) {
       OSLogo(os: row.os, size: 14).frame(width: 16)
-      RunnerActivityDot(phase: row.runner.phase)
+      RunnerActivityDot(phase: row.runner.phase, busy: busy)
       VStack(alignment: .leading, spacing: 1) {
         Text(row.repoFullName).font(.callout).lineLimit(1).truncationMode(.middle)
         Text(row.runner.id).font(.system(size: 10).monospaced()).foregroundStyle(.secondary)
