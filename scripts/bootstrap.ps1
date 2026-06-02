@@ -128,12 +128,15 @@ if (-not (Test-Outbound)) {
 #     download when `git` isn't on PATH. With git installed, checkout uses a
 #     real clone and respects fetch-depth, submodules, LFS, etc.
 #   - 7-Zip: common need for archive actions; also a fast unzip path.
+#   - PowerShell 7 (pwsh): the default Windows-runner shell since 2019; many
+#     actions hard-require `shell: pwsh` (e.g. azure/trusted-signing-action).
+#     Windows ships only PS 5.1, so we bake pwsh in — the same reasoning that
+#     put bash (via PortableGit) in the base: shells belong in the image.
 #
 # Tools the runner agent itself bootstraps on demand (so we DON'T install):
 #   - Node.js (actions/setup-node downloads the right version per .nvmrc)
 #   - .NET (actions/setup-dotnet)
 #   - Python (actions/setup-python)
-#   - PowerShell 7 (Windows ships PS 5.1; actions request PS 7 via the action)
 function Install-Msi {
   param([Parameter(Mandatory)][string]$Url,
         [Parameter(Mandatory)][string]$LocalName)
@@ -231,6 +234,58 @@ try {
   # 7-Zip ships a newer ARM64 build — say so explicitly so it's obvious the base
   # is missing 7-Zip (and which URL to bump) rather than a silent omission.
   Write-Warning "7-Zip install skipped (continuing without it): $SevenZipUrl failed - $_. If this is a 404, bump the pinned version in bootstrap.ps1."
+}
+
+# PowerShell 7 (ARM64) - the official win-arm64 .msi. GitHub Actions' `shell: pwsh`
+# (and actions like azure/trusted-signing-action) need PowerShell 7; Windows ships
+# only PS 5.1. The MSI is the supported UNATTENDED install: `/quiet` is fully silent
+# (no GUI to stall the headless FirstLogonCommands session) and `ADD_PATH=1` puts
+# %ProgramFiles%\PowerShell\7 on the MACHINE PATH, so the runner service resolves
+# `pwsh` on every clone boot - no manual PATH edit (which the zip would require).
+# Resolve the latest release at build time (no pin), same as PortableGit / the
+# runner agent. Inline headers because $ghHeaders isn't defined until the agent
+# section below. Non-fatal: the runner still comes up without it.
+Write-Host 'Installing PowerShell 7 (ARM64, official MSI)...'
+try {
+  $pwshRel = Invoke-WithRetry -What 'PowerShell release lookup' {
+    Invoke-RestMethod 'https://api.github.com/repos/PowerShell/PowerShell/releases/latest' `
+      -Headers @{ 'User-Agent' = 'mactions'; 'Accept' = 'application/vnd.github+json' }
+  }
+  $pwshAsset = $pwshRel.assets |
+    Where-Object { $_.name -match '^PowerShell-.*-win-arm64\.msi$' } |
+    Select-Object -First 1
+  if (-not $pwshAsset) {
+    Write-Warning "No win-arm64 .msi in PowerShell release $($pwshRel.tag_name); skipping pwsh install."
+  } else {
+    $pwshMsi = Join-Path $env:TEMP 'powershell-arm64.msi'
+    if (Test-Path $pwshMsi) { Remove-Item $pwshMsi -Force }
+    Invoke-WebRequest -Uri $pwshAsset.browser_download_url -OutFile $pwshMsi -UseBasicParsing
+    # /quiet = no UI (safe headless); ADD_PATH=1 = add %ProgramFiles%\PowerShell\7
+    # to the MACHINE PATH; /norestart = never reboot mid-build.
+    $proc = Start-Process msiexec.exe -Wait -PassThru -ArgumentList `
+      '/i', $pwshMsi, '/quiet', '/norestart', 'ADD_PATH=1'
+    Remove-Item $pwshMsi -Force
+    if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+      throw "PowerShell 7 MSI failed with exit code $($proc.ExitCode)"
+    }
+    $pwshDir = Join-Path $env:ProgramFiles 'PowerShell\7'
+    $pwshExe = Join-Path $pwshDir 'pwsh.exe'
+    if (-not (Test-Path $pwshExe)) {
+      throw "pwsh.exe not found under $pwshDir after MSI install"
+    }
+    # ADD_PATH=1 already wrote the MACHINE PATH; belt-and-suspenders (idempotent),
+    # exactly like the PortableGit cmd/bin dirs above, so per-clone runner sessions
+    # resolve `pwsh`.
+    $machPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    if ($machPath -notlike "*$pwshDir*") {
+      $machPath = $machPath.TrimEnd(';') + ';' + $pwshDir
+      [Environment]::SetEnvironmentVariable('Path', $machPath, 'Machine')
+    }
+    $env:Path = $env:Path + ';' + $pwshDir
+    & $pwshExe -NoProfile -Command '$PSVersionTable.PSVersion.ToString()' | Write-Host
+  }
+} catch {
+  Write-Warning "PowerShell 7 install failed (continuing): $_"
 }
 
 # --- 1. win-arm64 actions-runner agent --------------------------------------

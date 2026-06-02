@@ -228,11 +228,12 @@ public enum WindowsImage {
   /// Provisioning-recipe version the CURRENT build scripts produce. It tracks
   /// `bootstrap.ps1` (what gets baked into the base): bump it whenever a
   /// bootstrap change makes an ALREADY-BUILT base functionally stale — e.g. the
-  /// MinGit→PortableGit switch that added `bash` (PR #19). Do NOT bump for
-  /// comment/whitespace-only edits. This MUST equal `PROVISIONING_RECIPE_VERSION`
-  /// in `scripts/prepare-windows-image` — the authority that gets stamped into
-  /// `windows-base.recipe` at build time — and a unit test asserts they match.
-  public static let currentProvisioningRecipeVersion = 2
+  /// MinGit→PortableGit switch that added `bash` (PR #19), or adding PowerShell 7
+  /// (`pwsh`) to the base. Do NOT bump for comment/whitespace-only edits. This
+  /// MUST equal `PROVISIONING_RECIPE_VERSION` in `scripts/prepare-windows-image` —
+  /// the authority that gets stamped into `windows-base.recipe` at build time —
+  /// and a unit test asserts they match.
+  public static let currentProvisioningRecipeVersion = 3
 
   /// Where `prepare-windows-image` records the provisioning-recipe version the
   /// base was built with. A sibling of `windows-base.build`; must survive run
