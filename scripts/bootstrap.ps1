@@ -152,46 +152,60 @@ function Install-Exe {
   if ($proc.ExitCode -ne 0) { throw "$LocalName installer failed with exit code $($proc.ExitCode)" }
 }
 
-# Git for Windows (ARM64) - use MinGit, a PLAIN .zip, NOT the Inno installer.
-# The `Git-*-arm64.exe` Inno installer still pops a GUI under an unattended
-# FirstLogonCommands session on ARM64 (its /VERYSILENT is honored on x64 but the
-# ARM64 build surfaces a window with no desktop to click), which STALLS the base
-# build. MinGit is Git-for-Windows' minimal redistributable (exactly what
-# automation needs: git.exe under \cmd) and extracts with the same ZipFile path
-# as the runner agent - zero installer UI possible. We add \cmd to the MACHINE
-# PATH so actions/checkout (and the runner service) resolve `git`.
-Write-Host 'Installing Git for Windows (ARM64, MinGit)...'
+# Git for Windows (ARM64) - use the PortableGit 7-Zip self-extractor. NOT the
+# Inno installer and NOT MinGit. Three-way rationale:
+#   - `Git-*-arm64.exe` (Inno) pops a GUI under an unattended FirstLogonCommands
+#     session on ARM64 (its /VERYSILENT is honored on x64 but the ARM64 build
+#     surfaces a window with no desktop to click) -> STALLS the base build.
+#   - MinGit (the minimal redistributable) extracts silently and gives git.exe,
+#     but ships NO `bash`. GitHub Actions' `shell: bash` (the default shell for
+#     cross-platform `run:` scripts) then fails on the runner with
+#     "bash: command not found" -> any workflow with a bash step is dead on
+#     Windows. (This bit a real release: every `shell: bash` step failed.)
+#   - PortableGit IS the full Git for Windows (git.exe + a working bash/MSYS),
+#     shipped as a 7-Zip SFX. With `-y` it auto-confirms and exits on its own
+#     (unlike the Inno GUI it never waits for a click), so it's safe unattended.
+# We add BOTH \cmd (git.exe, for actions/checkout) and \bin (bash.exe, for
+# `shell: bash`) to the MACHINE PATH so the runner service resolves both.
+Write-Host 'Installing Git for Windows (ARM64, PortableGit + bash)...'
 try {
   $gitRel = Invoke-WithRetry -What 'Git-for-Windows release lookup' {
     Invoke-RestMethod 'https://api.github.com/repos/git-for-windows/git/releases/latest' `
       -Headers @{ 'User-Agent' = 'mactions'; 'Accept' = 'application/vnd.github+json' }
   }
-  # Prefer the standard MinGit (skip the busybox variant for fewer surprises).
   $gitAsset = $gitRel.assets |
-    Where-Object { $_.name -match '^MinGit-.*-arm64\.zip$' -and $_.name -notmatch 'busybox' } |
+    Where-Object { $_.name -match '^PortableGit-.*-arm64\.7z\.exe$' } |
     Select-Object -First 1
   if (-not $gitAsset) {
-    Write-Warning "No MinGit ARM64 asset in release $($gitRel.tag_name); skipping Git install."
+    Write-Warning "No PortableGit ARM64 asset in release $($gitRel.tag_name); skipping Git install."
   } else {
     $gitDir = 'C:\Git'
-    $gitZip = Join-Path $env:TEMP 'mingit-arm64.zip'
-    if (Test-Path $gitZip) { Remove-Item $gitZip -Force }
-    Invoke-WebRequest -Uri $gitAsset.browser_download_url -OutFile $gitZip -UseBasicParsing
+    $gitSfx = Join-Path $env:TEMP 'portablegit-arm64.7z.exe'
+    if (Test-Path $gitSfx) { Remove-Item $gitSfx -Force }
+    Invoke-WebRequest -Uri $gitAsset.browser_download_url -OutFile $gitSfx -UseBasicParsing
     if (Test-Path $gitDir) { Remove-Item $gitDir -Recurse -Force }
-    New-Item -ItemType Directory -Force -Path $gitDir | Out-Null
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    [System.IO.Compression.ZipFile]::ExtractToDirectory($gitZip, $gitDir)
-    Remove-Item $gitZip -Force
+    # 7-Zip SFX flags: -y auto-confirms (no prompt, no wait), -o<dir> sets the
+    # extraction target (no space after -o). PortableGit then runs its own
+    # non-interactive post-install to wire up the MSYS environment bash needs.
+    $proc = Start-Process $gitSfx -ArgumentList '-y', "-o$gitDir" -Wait -PassThru
+    Remove-Item $gitSfx -Force
+    if ($proc.ExitCode -ne 0) { throw "PortableGit SFX failed with exit code $($proc.ExitCode)" }
     $gitCmd = Join-Path $gitDir 'cmd'
+    $gitBin = Join-Path $gitDir 'bin'
     if (-not (Test-Path (Join-Path $gitCmd 'git.exe'))) {
-      throw "git.exe not found under $gitCmd after MinGit extract"
+      throw "git.exe not found under $gitCmd after PortableGit extract"
+    }
+    if (-not (Test-Path (Join-Path $gitBin 'bash.exe'))) {
+      throw "bash.exe not found under $gitBin after PortableGit extract (shell: bash would break)"
     }
     $machPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-    if ($machPath -notlike "*$gitCmd*") {
-      [Environment]::SetEnvironmentVariable('Path', ($machPath.TrimEnd(';') + ';' + $gitCmd), 'Machine')
+    foreach ($p in @($gitCmd, $gitBin)) {
+      if ($machPath -notlike "*$p*") { $machPath = $machPath.TrimEnd(';') + ';' + $p }
     }
-    $env:Path = $env:Path + ';' + $gitCmd
+    [Environment]::SetEnvironmentVariable('Path', $machPath, 'Machine')
+    $env:Path = $env:Path + ';' + $gitCmd + ';' + $gitBin
     & "$gitCmd\git.exe" --version | Write-Host
+    & "$gitBin\bash.exe" -c 'echo "bash OK: $BASH_VERSION"' | Write-Host
   }
 } catch {
   Write-Warning "Git install failed (continuing): $_"

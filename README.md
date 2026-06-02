@@ -32,4 +32,6 @@ No external dependencies. The orchestration logic lives in the `MactionsCore` li
 
 The default **local-process** runner has no isolation — only point it at **trusted / private** repos. VM-isolated runners (Tart for macOS/Linux, `WindowsVMProvider` for Windows) are the path for untrusted code and are still experimental. The GitHub token is stored in a `0600` file under `~/.mactions` (not the keychain — an unsigned dev build re-prompts on every keychain access; a signed build could use the keychain).
 
+> **macOS code signing on a self-hosted runner:** the runner Mac must be able to *validate* your Developer ID cert. A locked-down / **MDM-managed corporate Mac** can reject an otherwise-valid cert (notably newer **G2**-issued ones) — `security find-identity -v -p codesigning` returns 0 even though the cert is fine — so builds silently fall back to an unsigned **ad-hoc** signature and fail notarization. Run signed/notarized release builds on an **unmanaged** Mac (or a hosted macOS runner). See [AGENTS.md](AGENTS.md) → Host hygiene → *Signing on the macOS runner*.
+
 See **[AGENTS.md](AGENTS.md)** for architecture, the per-OS reality (the macOS 2-VM cap, Linux containers, why Windows is hard), and the roadmap.
