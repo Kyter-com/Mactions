@@ -66,7 +66,18 @@ public final class LocalProcessProvider: RunnerProvider, @unchecked Sendable {
     // the whole point of "separate PC every time".)
     let jobHome = runDirectory.appendingPathComponent("_home", isDirectory: true)
     let jobTmp = runDirectory.appendingPathComponent("_tmp", isDirectory: true)
-    for dir in [jobHome, jobTmp] {
+    // macOS `security` persists the per-user keychain search list to
+    // $HOME/Library/Preferences/com.apple.security.plist. With HOME redirected
+    // into the throwaway clone that directory doesn't exist, so
+    // `security list-keychains -s` silently no-ops (rc=0 but nothing persists)
+    // and the search list collapses to empty inside the job. That breaks macOS
+    // code signing: electron-builder (and any tool that imports a cert into a
+    // temp keychain) registers it via list-keychains, then finds no identity
+    // and falls back to an ad-hoc signature that fails notarization — even
+    // though the same CSC_LINK secret signs cleanly on a normal HOME (e.g. a
+    // GitHub-hosted runner). Seeding the dir restores search-list persistence.
+    let jobKeychainPrefs = jobHome.appendingPathComponent("Library/Preferences", isDirectory: true)
+    for dir in [jobHome, jobTmp, jobKeychainPrefs] {
       try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }
     var env = ProcessInfo.processInfo.environment
