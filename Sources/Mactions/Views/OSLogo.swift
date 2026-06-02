@@ -1,89 +1,97 @@
 import MactionsCore
 import SwiftUI
 
-/// Brand marks for each `RunnerOS`, drawn as scalable vectors (no bundled image
-/// assets, so they stay crisp at any size and adapt to light/dark + tinting):
-///   - macOS  → `apple.logo` SF Symbol (Apple's own mark; follows `.primary`).
-///   - Windows → the 4-pane logo, in Windows blue.
-///   - Linux  → a simplified flat Tux.
+/// Brand marks for each `RunnerOS`, drawn as scalable MONOCHROME vectors that read
+/// as a uniform set. CRITICAL for uniformity: all three are styled through the
+/// SAME `.foregroundStyle(tint)` path (the Apple SF Symbol + the Windows/Tux
+/// `Shape`s). A `Shape.fill(Color)` instead renders grayer than symbol/text
+/// content inside the popover's vibrancy material — which is why the Windows
+/// squares previously looked gray next to the white Apple logo. `.primary` adapts
+/// (white on a dark popover, dark on a light one), so they're never invisible.
+///   - macOS  → `apple.logo` SF Symbol.
+///   - Windows → the 4-pane logo (a 2×2 grid).
+///   - Linux  → a simple Tux silhouette.
 ///
 /// To swap in a real bundled image later, replace a branch with
-/// `Image("logo-name")` after adding an asset catalog to the target — the call
-/// sites (`OSLogo(os:size:)`) don't change.
+/// `Image("logo-name").renderingMode(.template)` — the call sites don't change.
 struct OSLogo: View {
   let os: RunnerOS
   var size: CGFloat = 22
+  var tint: Color = .primary
 
   var body: some View {
-    switch os {
-    case .macOS:
-      Image(systemName: "apple.logo")
-        .font(.system(size: size * 0.95))
-        .foregroundStyle(.primary)
-        .frame(width: size, height: size)
-    case .windows:
-      WindowsLogo().frame(width: size, height: size)
-    case .linux:
-      TuxLogo().frame(width: size, height: size)
+    Group {
+      switch os {
+      case .macOS:
+        // The Apple glyph reads optically smaller than a filled square, so size it
+        // to the full box; the 4-pane / penguin get a slight inset to match.
+        Image(systemName: "apple.logo")
+          .font(.system(size: size, weight: .regular))
+      case .windows:
+        WindowsPanes().frame(width: size * 0.86, height: size * 0.86)
+      case .linux:
+        TuxShape().frame(width: size * 0.92, height: size * 0.92)
+      }
     }
+    .foregroundStyle(tint)
+    .frame(width: size, height: size)
+    // Rasterize off the popover's vibrancy material (NSVisualEffectView): without
+    // this, a Shape FILL gets blended with the background (a muted/greenish cast)
+    // while an SF Symbol renders as bright "vibrant content" — so the Windows
+    // squares looked grayer than the white Apple glyph despite the same tint.
+    // drawingGroup composites all three to opaque pixels at the resolved color, so
+    // they come out identical.
+    .drawingGroup()
   }
 }
 
-/// The modern Windows mark: a 2×2 grid of squares in Windows blue.
-private struct WindowsLogo: View {
-  private let blue = Color(red: 0 / 255, green: 120 / 255, blue: 212 / 255)
-  var body: some View {
-    GeometryReader { geo in
-      let s = min(geo.size.width, geo.size.height)
-      let gap = s * 0.11
-      let cell = (s - gap) / 2
-      ZStack(alignment: .topLeading) {
-        ForEach(0..<2, id: \.self) { row in
-          ForEach(0..<2, id: \.self) { col in
-            RoundedRectangle(cornerRadius: s * 0.05)
-              .fill(blue)
-              .frame(width: cell, height: cell)
-              .offset(x: CGFloat(col) * (cell + gap), y: CGFloat(row) * (cell + gap))
-          }
-        }
+/// The Windows mark: a 2×2 grid of rounded squares (filled by the inherited
+/// foreground style, NOT `.fill(Color)`, so it matches the symbol's white).
+private struct WindowsPanes: Shape {
+  func path(in rect: CGRect) -> Path {
+    let s = min(rect.width, rect.height)
+    let ox = (rect.width - s) / 2
+    let oy = (rect.height - s) / 2
+    let gap = s * 0.12
+    let cell = (s - gap) / 2
+    let r = s * 0.06
+    var p = Path()
+    for row in 0..<2 {
+      for col in 0..<2 {
+        let x = ox + CGFloat(col) * (cell + gap)
+        let y = oy + CGFloat(row) * (cell + gap)
+        p.addRoundedRect(
+          in: CGRect(x: x, y: y, width: cell, height: cell),
+          cornerSize: CGSize(width: r, height: r))
       }
-      .frame(width: s, height: s, alignment: .topLeading)
     }
+    return p
   }
 }
 
-/// A simplified flat Tux (the Linux mascot): black body, white belly + face,
-/// orange beak + feet. Coordinates are normalized to the frame so it scales. (On
-/// the Linux tile it's shown dimmed/"soon", so the black body on a dark popover is
-/// acceptable; swap in a bundled asset if you want a polished mark.)
-private struct TuxLogo: View {
-  var body: some View {
-    Canvas { ctx, size in
-      let s = min(size.width, size.height)
-      func rect(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat) -> CGRect {
-        CGRect(x: x * s, y: y * s, width: w * s, height: h * s)
-      }
-      func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: x * s, y: y * s) }
-
-      // Feet (orange) — drawn first so the body overlaps their tops.
-      ctx.fill(Path(ellipseIn: rect(0.28, 0.82, 0.20, 0.12)), with: .color(.orange))
-      ctx.fill(Path(ellipseIn: rect(0.52, 0.82, 0.20, 0.12)), with: .color(.orange))
-      // Body (black).
-      ctx.fill(Path(ellipseIn: rect(0.18, 0.14, 0.64, 0.76)), with: .color(.black))
-      // Belly (white).
-      ctx.fill(Path(ellipseIn: rect(0.30, 0.40, 0.40, 0.48)), with: .color(.white))
-      // Face patch (white) behind the eyes.
-      ctx.fill(Path(ellipseIn: rect(0.35, 0.20, 0.30, 0.24)), with: .color(.white))
-      // Eyes (black).
-      ctx.fill(Path(ellipseIn: rect(0.43, 0.25, 0.05, 0.08)), with: .color(.black))
-      ctx.fill(Path(ellipseIn: rect(0.52, 0.25, 0.05, 0.08)), with: .color(.black))
-      // Beak (orange triangle).
-      var beak = Path()
-      beak.move(to: pt(0.44, 0.37))
-      beak.addLine(to: pt(0.56, 0.37))
-      beak.addLine(to: pt(0.50, 0.45))
-      beak.closeSubpath()
-      ctx.fill(beak, with: .color(.orange))
+/// A simple flat Tux silhouette (body + head, little flippers + feet, a beak) as a
+/// single `Shape`, filled by the inherited foreground style so it's the SAME white
+/// as the other marks. A solid silhouette (no punched eyes) keeps it on the single
+/// `.foregroundStyle` path; it still reads as a penguin at tile size.
+private struct TuxShape: Shape {
+  func path(in rect: CGRect) -> Path {
+    let s = min(rect.width, rect.height)
+    let ox = (rect.width - s) / 2
+    let oy = (rect.height - s) / 2
+    func box(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat) -> CGRect {
+      CGRect(x: ox + x * s, y: oy + y * s, width: w * s, height: h * s)
     }
+    func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: ox + x * s, y: oy + y * s) }
+    var p = Path()
+    p.addEllipse(in: box(0.30, 0.82, 0.16, 0.12))  // left foot
+    p.addEllipse(in: box(0.54, 0.82, 0.16, 0.12))  // right foot
+    p.addEllipse(in: box(0.14, 0.40, 0.16, 0.34))  // left flipper
+    p.addEllipse(in: box(0.70, 0.40, 0.16, 0.34))  // right flipper
+    p.addEllipse(in: box(0.26, 0.10, 0.48, 0.80))  // body + head
+    p.move(to: pt(0.45, 0.30))  // beak
+    p.addLine(to: pt(0.55, 0.30))
+    p.addLine(to: pt(0.50, 0.37))
+    p.closeSubpath()
+    return p
   }
 }

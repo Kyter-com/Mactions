@@ -216,28 +216,35 @@ struct MenuContentView: View {
     return Button {
       handleOSTap(os)
     } label: {
-      VStack(spacing: 4) {
+      VStack(spacing: 5) {
         ZStack {
-          OSLogo(os: os, size: 26)
-            .opacity(disabled ? 0.4 : (needsSetup ? 0.6 : 1))
-          if building {
-            ProgressView().controlSize(.small)
-          } else if needsSetup {
+          // SAME white (adaptive .primary) for ALL three marks — disabled (Linux)
+          // and needs-setup (unbuilt Windows) dim via OPACITY only, never a
+          // different gray hue, so the set always looks uniform.
+          OSLogo(os: os, size: 24, tint: .primary)
+            .opacity(building ? 0 : (disabled ? 0.45 : (needsSetup ? 0.5 : 1)))
+          if building { ProgressView().controlSize(.small) }
+        }
+        .frame(width: 50, height: 46)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.10)))
+        .overlay(
+          RoundedRectangle(cornerRadius: 10)
+            .strokeBorder(
+              selected ? Color.accentColor : Color.secondary.opacity(0.18),
+              lineWidth: selected ? 2 : 1)
+        )
+        // Download badge sits OUTSIDE the box (top-trailing), so it never crowds
+        // the logo inside the square.
+        .overlay(alignment: .topTrailing) {
+          if needsSetup {
             Image(systemName: "arrow.down.circle.fill")
-              .font(.system(size: 12))
-              .foregroundStyle(.blue)
-              .background(Circle().fill(Color(NSColor.windowBackgroundColor)).padding(1))
-              .offset(x: 15, y: 13)
+              .font(.system(size: 13))
+              .foregroundStyle(Color.accentColor, Color(NSColor.windowBackgroundColor))
+              .offset(x: 5, y: -5)
           }
         }
-        .frame(width: 48, height: 42)
-        .background(RoundedRectangle(cornerRadius: 9).fill(Color.secondary.opacity(0.08)))
-        .overlay(
-          RoundedRectangle(cornerRadius: 9)
-            .strokeBorder(selected ? Color.accentColor : Color.secondary.opacity(0.18), lineWidth: selected ? 2 : 1)
-        )
         Text(os.displayName)
-          .font(.system(size: 9))
+          .font(.system(size: 9, weight: selected ? .semibold : .regular))
           .foregroundStyle(disabled ? .tertiary : (selected ? .primary : .secondary))
         Text(os == .linux ? "soon" : " ")
           .font(.system(size: 8)).foregroundStyle(.tertiary)
