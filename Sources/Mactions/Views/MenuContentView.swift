@@ -10,6 +10,9 @@ struct MenuContentView: View {
   @State private var pat = ""
   @State private var repoFilter = ""
   @State private var confirmRebuild = false
+  /// The repo picker is collapsed to a one-line summary; expanded only while the
+  /// user is actively choosing (auto-expands when nothing is selected yet).
+  @State private var showRepoPicker = false
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
@@ -150,14 +153,11 @@ struct MenuContentView: View {
   }
 
   private var fleetSection: some View {
-    VStack(alignment: .leading, spacing: 10) {
-      repoPicker
-      LabeledField("Labels", text: $app.labelsText, prompt: "self-hosted,macOS")
-        .disabled(app.state != .offline)
-      Stepper("Runners per repo: \(app.runnersPerRepo)", value: $app.runnersPerRepo, in: 1...5)
-        .disabled(app.state != .offline)
-
-      windowsSection
+    VStack(alignment: .leading, spacing: 12) {
+      osSelector
+      windowsArea
+      repoSelector
+      controlsRow
 
       Button {
         app.toggleOnline()
@@ -170,82 +170,207 @@ struct MenuContentView: View {
       }
       .buttonStyle(.borderedProminent)
       .controlSize(.large)
-      .disabled(app.selectedRepos.isEmpty || app.state == .starting || app.state == .stopping)
+      .disabled(
+        app.selectedRepos.isEmpty
+          || !app.selectedOSes.contains(where: { $0.isImplemented })
+          || app.state == .starting || app.state == .stopping)
 
       if !app.runners.isEmpty { runnerList }
-    }
-  }
-
-  // MARK: Windows (opt-in)
-
-  /// Windows support is OFF by default. The "Set up Windows runner" button is the
-  /// ONLY trigger for any ISO download / base-image build — nothing heavy ever
-  /// happens automatically. Once an image is built, a toggle adds a Windows fleet
-  /// (labels `[self-hosted, Windows, mactions]`) alongside the macOS one.
-  private var windowsSection: some View {
-    VStack(alignment: .leading, spacing: 6) {
-      Divider()
-      Text("Windows runner (experimental)")
-        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-
-      WindowsPreflightChecklist(app: app)
-
-      windowsSetupStepper
-
-      if app.windowsImageReady {
-        Toggle(isOn: Binding(
-          get: { app.windowsEnabled },
-          set: { app.setWindowsEnabled($0) }
-        )) {
-          Text("Add a Windows fleet ([self-hosted, Windows, mactions])").font(.caption)
-        }
-        .toggleStyle(.switch)
-        .controlSize(.mini)
-        .disabled(app.state != .offline)
-        Button("Rebuild / update Windows image") { confirmRebuild = true }
-          .buttonStyle(.bordered).controlSize(.small)
-          .disabled(app.state != .offline || app.windowsSetupBusy)
-          .confirmationDialog(
-            "Rebuild the Windows base image?", isPresented: $confirmRebuild,
-            titleVisibility: .visible
-          ) {
-            Button("Rebuild (re-downloads ~8 GB)", role: .destructive) {
-              app.setUpWindowsRunner(force: true)
-            }
-            Button("Cancel", role: .cancel) {}
-          } message: {
-            Text(
-              "Re-downloads the latest Win11 ARM64 ISO (~8 GB) and rebuilds the base VM headless — about 30–40 minutes. This replaces the existing base image."
-            )
-          }
-        if let notice = app.windowsUpdateNotice {
-          Label(notice, systemImage: "arrow.up.circle")
-            .font(.caption2).foregroundStyle(.orange)
-            .fixedSize(horizontal: false, vertical: true)
-        }
-      } else {
-        Button {
-          app.setUpWindowsRunner()
-        } label: {
-          HStack(spacing: 6) {
-            if app.windowsSetupBusy { ProgressView().controlSize(.small) }
-            Label("Set up Windows runner", systemImage: "pc")
-          }
-        }
-        .buttonStyle(.bordered).controlSize(.small)
-        .disabled(app.state != .offline || app.windowsSetupBusy)
-        Text(
-          app.windowsBackendAvailable
-            ? "Clones a throwaway Win11 ARM64 base VM per job and destroys it after (multi-GB base build, one time). Proven end to end on VMware Fusion."
-            : "Install VMware Fusion (free, from the Broadcom portal) — the proven Win11-ARM backend — then this downloads the latest Win11 ARM64 ISO + builds the one-time base VM."
-        )
-        .font(.caption2).foregroundStyle(.secondary)
-        .fixedSize(horizontal: false, vertical: true)
-      }
     }
     .onAppear {
       app.refreshWindowsPreflight()
       app.checkForWindowsImageUpdate()
+      if app.selectedRepos.isEmpty { showRepoPicker = true }
+    }
+  }
+
+  // MARK: OS selector (logo tiles)
+
+  private var osSelector: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      sectionLabel("RUNNER OS")
+      HStack(spacing: 10) {
+        osTile(.macOS)
+        osTile(.windows)
+        osTile(.linux)
+        Spacer(minLength: 0)
+      }
+    }
+  }
+
+  /// One OS tile: the brand logo in a box whose border highlights (accent) when
+  /// selected. Windows shows a download badge until its base image is built
+  /// (tapping then starts setup) and a spinner while building; Linux is dimmed
+  /// "soon". macOS/Windows toggle selection; the border IS the checkbox.
+  private func osTile(_ os: RunnerOS) -> some View {
+    // Windows reads as "selected" (accent border) ONLY once its image is built;
+    // until then the tile shows just the download badge. A persisted-but-unready
+    // .windows is harmless — goOnline also gates the Windows fleet on
+    // windowsImageReady — and this avoids a contradictory border+badge state for a
+    // migrated user.
+    let selected =
+      app.isOSSelected(os) && os.isImplemented && (os != .windows || app.windowsImageReady)
+    let building = (os == .windows && app.windowsSetupBusy)
+    let needsSetup = (os == .windows && !app.windowsImageReady && !building)
+    let disabled = !os.isImplemented
+    return Button {
+      handleOSTap(os)
+    } label: {
+      VStack(spacing: 4) {
+        ZStack {
+          OSLogo(os: os, size: 26)
+            .opacity(disabled ? 0.4 : (needsSetup ? 0.6 : 1))
+          if building {
+            ProgressView().controlSize(.small)
+          } else if needsSetup {
+            Image(systemName: "arrow.down.circle.fill")
+              .font(.system(size: 12))
+              .foregroundStyle(.blue)
+              .background(Circle().fill(Color(NSColor.windowBackgroundColor)).padding(1))
+              .offset(x: 15, y: 13)
+          }
+        }
+        .frame(width: 48, height: 42)
+        .background(RoundedRectangle(cornerRadius: 9).fill(Color.secondary.opacity(0.08)))
+        .overlay(
+          RoundedRectangle(cornerRadius: 9)
+            .strokeBorder(selected ? Color.accentColor : Color.secondary.opacity(0.18), lineWidth: selected ? 2 : 1)
+        )
+        Text(os.displayName)
+          .font(.system(size: 9))
+          .foregroundStyle(disabled ? .tertiary : (selected ? .primary : .secondary))
+        Text(os == .linux ? "soon" : " ")
+          .font(.system(size: 8)).foregroundStyle(.tertiary)
+      }
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .disabled(disabled || building || app.state != .offline)
+    .help(osTileHelp(os))
+  }
+
+  private func handleOSTap(_ os: RunnerOS) {
+    switch os {
+    case .macOS:
+      app.toggleOS(.macOS)
+    case .windows:
+      if app.windowsImageReady { app.toggleOS(.windows) } else { app.setUpWindowsRunner() }
+    case .linux:
+      break
+    }
+  }
+
+  private func osTileHelp(_ os: RunnerOS) -> String {
+    switch os {
+    case .macOS: return "Run a macOS runner fleet (local process per job)."
+    case .windows:
+      return app.windowsImageReady
+        ? "Run a Windows runner fleet (throwaway Win11-ARM VM per job)."
+        : "Tap to build the one-time Win11-ARM base image, then Windows fleets become available."
+    case .linux: return "Linux runners are coming soon."
+    }
+  }
+
+  /// Windows setup/management, shown contextually below the OS tiles: the live
+  /// stepper while building; setup guidance + what's-missing while not built (so
+  /// the prereq checks vanish once it's ready); the update nudge + a low-key
+  /// rebuild once it's ready.
+  @ViewBuilder
+  private var windowsArea: some View {
+    if app.windowsSetupBusy {
+      windowsSetupStepper
+    } else if !app.windowsImageReady, app.selectedOSes.contains(.windows) || windowsPrereqsIncomplete {
+      VStack(alignment: .leading, spacing: 4) {
+        WindowsPreflightChecklist(app: app)
+        Text(
+          app.windowsBackendAvailable
+            ? "Tap the Windows tile to build the one-time base image (~30–40 min, resumable)."
+            : "Install VMware Fusion (free, Broadcom portal), then tap Windows to build the base image."
+        )
+        .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+      }
+    } else if app.windowsImageReady {
+      VStack(alignment: .leading, spacing: 4) {
+        if let notice = app.windowsUpdateNotice {
+          Label(notice, systemImage: "arrow.up.circle")
+            .font(.caption2).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+        }
+        Button("Rebuild / update Windows image") { confirmRebuild = true }
+          .buttonStyle(.borderless).controlSize(.small).font(.caption2)
+          .disabled(app.state != .offline)
+      }
+      .confirmationDialog(
+        "Rebuild the Windows base image?", isPresented: $confirmRebuild, titleVisibility: .visible
+      ) {
+        Button("Rebuild (re-downloads ~8 GB)", role: .destructive) { app.setUpWindowsRunner(force: true) }
+        Button("Cancel", role: .cancel) {}
+      } message: {
+        Text(
+          "Re-downloads the latest Win11 ARM64 ISO (~8 GB) and rebuilds the base VM headless — about 30–40 minutes. This replaces the existing base image.")
+      }
+    }
+  }
+
+  /// True when a prereq the Windows path needs is still missing (so the setup
+  /// guidance is worth surfacing even before the Windows tile is selected).
+  private var windowsPrereqsIncomplete: Bool {
+    guard let r = app.windowsPreflight else { return false }
+    return !(r.ready)
+  }
+
+  private func sectionLabel(_ text: String) -> some View {
+    Text(text).font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary).tracking(0.6)
+  }
+
+  // MARK: Repos (collapsed) + controls
+
+  private var repoSelector: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      Button {
+        withAnimation(.easeInOut(duration: 0.15)) { showRepoPicker.toggle() }
+      } label: {
+        HStack(spacing: 6) {
+          sectionLabel("REPOS")
+          Text("· \(app.selectedRepos.count) selected").font(.caption2).foregroundStyle(.secondary)
+          Spacer()
+          Text(showRepoPicker ? "Done" : "Edit").font(.caption2)
+          Image(systemName: showRepoPicker ? "chevron.up" : "chevron.right").font(.system(size: 9))
+        }
+        .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+
+      if showRepoPicker {
+        repoPicker
+      } else {
+        Text(
+          app.selectedRepos.isEmpty
+            ? "No repositories selected — tap Edit to choose."
+            : app.selectedRepos.map(\.name).joined(separator: ", ")
+        )
+        .font(.caption2)
+        .foregroundStyle(app.selectedRepos.isEmpty ? Color.orange : Color.secondary)
+        .lineLimit(2).truncationMode(.tail)
+        .fixedSize(horizontal: false, vertical: true)
+      }
+    }
+  }
+
+  /// Runners-per-repo (common) + an Advanced disclosure holding the editable
+  /// macOS label set (kept, but tucked away to declutter).
+  private var controlsRow: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      Stepper("Runners per repo: \(app.runnersPerRepo)", value: $app.runnersPerRepo, in: 1...5)
+        .font(.caption)
+        .disabled(app.state != .offline)
+      DisclosureGroup {
+        LabeledField("macOS labels", text: $app.labelsText, prompt: "self-hosted,macOS,mactions")
+          .disabled(app.state != .offline)
+        Text("Windows fleets always register [self-hosted, Windows, mactions].")
+          .font(.system(size: 9)).foregroundStyle(.tertiary)
+      } label: {
+        Text("Advanced").font(.caption2).foregroundStyle(.secondary)
+      }
     }
   }
 
@@ -299,10 +424,9 @@ struct MenuContentView: View {
 
   private var repoPicker: some View {
     VStack(alignment: .leading, spacing: 6) {
-      HStack {
-        Text("Repositories (\(app.selectedRepos.count) selected)")
-          .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-        Spacer()
+      HStack(spacing: 6) {
+        TextField("Filter repositories…", text: $repoFilter)
+          .textFieldStyle(.roundedBorder)
         if app.reposLoading {
           ProgressView().controlSize(.small)
         } else {
@@ -315,8 +439,6 @@ struct MenuContentView: View {
           .help("Refresh repositories")
         }
       }
-      TextField("Filter repositories…", text: $repoFilter)
-        .textFieldStyle(.roundedBorder)
       ScrollView {
         LazyVStack(alignment: .leading, spacing: 2) {
           ForEach(filteredRepos) { repo in repoRow(repo) }
@@ -355,12 +477,15 @@ struct MenuContentView: View {
 
   private var runnerList: some View {
     VStack(alignment: .leading, spacing: 4) {
-      Text("Runners").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+      sectionLabel("LIVE RUNNERS")
       ForEach(app.runners) { row in
         HStack(spacing: 6) {
-          Image(systemName: "circle.fill")
-            .font(.system(size: 6))
-            .foregroundStyle(row.runner.phase == .online ? Color.green : Color.orange)
+          OSLogo(os: row.os, size: 13)
+            .frame(width: 14)
+            .help(row.os.displayName)
+          Circle()
+            .fill(row.runner.phase == .online ? Color.green : Color.orange)
+            .frame(width: 6, height: 6)
           Text(row.repoFullName).font(.caption2).foregroundStyle(.secondary)
           Text(row.runner.id).font(.caption2.monospaced()).lineLimit(1).truncationMode(.middle)
           Spacer()
@@ -371,27 +496,38 @@ struct MenuContentView: View {
   }
 }
 
-/// The prerequisite checklist + auto-install button. Split into its own subview
-/// so the SwiftUI type-checker stays fast and `windowsSection` doesn't balloon.
-/// Shows ✓/✗ for Homebrew, VMware Fusion, and the UUP-dump converter tools, plus
-/// a one-click installer for the MISSING FREE brew deps (converter tools +
-/// xorriso). It never installs a hypervisor (Fusion is a manual Broadcom-portal
-/// download) and never installs Homebrew (points at brew.sh).
+/// Shows what's STILL MISSING for the Windows path (not a full ✓/✗ list — done
+/// items are simply omitted, so the section empties out as prerequisites land and
+/// disappears entirely once the base image is built). Plus a one-click installer
+/// for the missing FREE brew deps (converter tools + xorriso). It never installs a
+/// hypervisor (Fusion is a manual Broadcom-portal download) and never installs
+/// Homebrew (points at brew.sh).
 private struct WindowsPreflightChecklist: View {
   @ObservedObject var app: AppState
 
   var body: some View {
-    let report = app.windowsPreflight
-    VStack(alignment: .leading, spacing: 3) {
-      checkRow("Homebrew", ok: report?.homebrewInstalled ?? false)
-      checkRow(
-        hypervisorLabel(report),
-        ok: report?.hasHypervisor ?? false)
-      checkRow(
-        converterLabel(report),
-        ok: (report?.missingConverterFormulae.isEmpty ?? false))
+    // Until the first preflight scan publishes a report, render nothing rather
+    // than treating everything as missing (which flashed "Homebrew/Fusion missing"
+    // on machines that have them).
+    if let report = app.windowsPreflight {
+      checklist(report)
+    }
+  }
 
-      if let report, !(WindowsPreflight.installPlan(for: report) == .nothingToInstall) {
+  @ViewBuilder
+  private func checklist(_ report: WindowsPreflight.Report) -> some View {
+    let missingConverters = report.missingConverterFormulae
+    VStack(alignment: .leading, spacing: 3) {
+      if !report.homebrewInstalled { missingRow("Homebrew — install from brew.sh") }
+      if !report.hasHypervisor { missingRow("VMware Fusion — free, from the Broadcom portal") }
+      if !missingConverters.isEmpty {
+        missingRow("ISO converter tools — \(missingConverters.joined(separator: ", "))")
+      }
+
+      // Only show the installer when it can actually DO something (the `.install`
+      // case). On `.homebrewMissing` it'd be a silent no-op — the "Homebrew —
+      // install from brew.sh" missing row above already tells the user what to do.
+      if case .install = WindowsPreflight.installPlan(for: report) {
         Button {
           app.installWindowsFreePrerequisites()
         } label: {
@@ -402,40 +538,19 @@ private struct WindowsPreflightChecklist: View {
         }
         .buttonStyle(.bordered).controlSize(.small)
         .disabled(app.state != .offline || app.windowsPreflightBusy)
-        Text(
-          (report.homebrewInstalled)
-            ? "Installs only the missing FREE tools (ISO converter tools + xorriso) via Homebrew. VMware Fusion is a separate, free manual download (Broadcom portal)."
-            : "Install Homebrew first: https://brew.sh — then this installs the free tools."
-        )
-        .font(.caption2).foregroundStyle(.secondary)
-        .fixedSize(horizontal: false, vertical: true)
       }
     }
   }
 
-  private func checkRow(_ label: String, ok: Bool) -> some View {
+  /// A single "still needed" row (only ever shown for things that ARE missing).
+  private func missingRow(_ label: String) -> some View {
     HStack(spacing: 5) {
-      Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle")
-        .font(.system(size: 9))
-        .foregroundStyle(ok ? Color.green : Color.secondary)
+      Image(systemName: "exclamationmark.circle")
+        .font(.system(size: 9)).foregroundStyle(.orange)
       Text(label).font(.caption2).foregroundStyle(.secondary)
-      Spacer()
+        .fixedSize(horizontal: false, vertical: true)
+      Spacer(minLength: 0)
     }
-  }
-
-  /// Name the installed hypervisor (free-first recommended) so the user sees
-  /// which backend is in play; otherwise prompt for the free default.
-  private func hypervisorLabel(_ report: WindowsPreflight.Report?) -> String {
-    if let backend = report?.recommendedBackend {
-      return "Hypervisor: \(backend.displayName)"
-    }
-    return "Hypervisor (VMware Fusion recommended — free, proven Win11-ARM)"
-  }
-
-  private func converterLabel(_ report: WindowsPreflight.Report?) -> String {
-    let missing = report?.missingConverterFormulae ?? []
-    if missing.isEmpty { return "ISO converter tools" }
-    return "ISO converter tools (missing: \(missing.joined(separator: ", ")))"
   }
 }
 
