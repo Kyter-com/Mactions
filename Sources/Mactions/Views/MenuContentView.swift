@@ -190,6 +190,8 @@ struct MenuContentView: View {
 
       WindowsPreflightChecklist(app: app)
 
+      windowsSetupStepper
+
       if app.windowsImageReady {
         Toggle(isOn: Binding(
           get: { app.windowsEnabled },
@@ -244,6 +246,54 @@ struct MenuContentView: View {
     .onAppear {
       app.refreshWindowsPreflight()
       app.checkForWindowsImageUpdate()
+    }
+  }
+
+  /// Live progress for the long base-image build: an ordered checklist of the
+  /// phases, with completed steps checked, the active step spinning + showing a
+  /// sub-status (download/convert, install ticks, etc.), and pending steps dimmed.
+  /// Driven by `AppState.windowsSetupStep` (streamed from the prep scripts).
+  @ViewBuilder
+  private var windowsSetupStepper: some View {
+    if app.windowsSetupBusy, let current = app.windowsSetupStep {
+      VStack(alignment: .leading, spacing: 5) {
+        ForEach(WindowsSetupStep.allCases, id: \.self) { step in
+          HStack(alignment: .top, spacing: 6) {
+            stepIcon(step, current: current)
+              .frame(width: 14, alignment: .center)
+            VStack(alignment: .leading, spacing: 1) {
+              Text(step.title)
+                .font(.caption2)
+                .fontWeight(step == current ? .semibold : .regular)
+                .foregroundStyle(step <= current ? Color.primary : Color.secondary)
+              if step == current {
+                Text(app.windowsSetupDetail ?? step.hint)
+                  .font(.system(size: 9))
+                  .foregroundStyle(.secondary)
+                  .fixedSize(horizontal: false, vertical: true)
+              }
+            }
+            Spacer(minLength: 0)
+          }
+        }
+        Text("Safe to leave running — it survives network blips and resumes from the last step if interrupted.")
+          .font(.system(size: 9))
+          .foregroundStyle(.tertiary)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+      .padding(8)
+      .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
+    }
+  }
+
+  @ViewBuilder
+  private func stepIcon(_ step: WindowsSetupStep, current: WindowsSetupStep) -> some View {
+    if step < current {
+      Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption2)
+    } else if step == current {
+      ProgressView().controlSize(.mini)
+    } else {
+      Image(systemName: "circle").foregroundStyle(.secondary).font(.caption2)
     }
   }
 

@@ -36,6 +36,13 @@ final class AppState: ObservableObject {
   /// True while the (long, multi-GB) image-prep flow is running. Disables the
   /// button so it can't be double-fired.
   @Published var windowsSetupBusy = false
+  /// The current phase of the running base-image build, driven by streaming the
+  /// prep scripts' output (`WindowsSetupProgress`). `nil` when no build is
+  /// running. Powers the live stepper in the popover.
+  @Published var windowsSetupStep: WindowsSetupStep?
+  /// A short sub-status under the active step (install ticks, milestones, resume
+  /// notice). `nil` clears it.
+  @Published var windowsSetupDetail: String?
   /// Latest prerequisite scan (Homebrew, hypervisor, converter tools). Drives the
   /// preflight checklist; refreshed when the Windows section appears + after an
   /// install. `nil` until the first scan.
@@ -456,6 +463,8 @@ final class AppState: ObservableObject {
     let report = WindowsPreflight.detect()
     windowsPreflight = report
     windowsSetupBusy = true
+    windowsSetupStep = .prerequisites
+    windowsSetupDetail = nil
     statusMessage = "Checking Windows prerequisites…"
     Task {
       // 1) Install missing FREE deps (off the main actor — it may shell out).
@@ -468,17 +477,17 @@ final class AppState: ObservableObject {
           break  // proceed to the build
         case let .homebrewMissing(message):
           statusMessage = message
-          windowsSetupBusy = false
+          endWindowsSetup()
           return
         case let .failed(command, stderr):
           statusMessage =
             "Couldn't install prerequisites (`\(command)`): \(stderr.isEmpty ? "see Homebrew output" : stderr)"
-          windowsSetupBusy = false
+          endWindowsSetup()
           return
         }
       } else if case let .homebrewMissing(message) = WindowsPreflight.installPlan(for: report) {
         statusMessage = message
-        windowsSetupBusy = false
+        endWindowsSetup()
         return
       }
 
@@ -486,7 +495,7 @@ final class AppState: ObservableObject {
       guard WindowsVMProviderFactory.detectInstalledCLI() != nil else {
         statusMessage =
           "VMware Fusion isn't installed. Get it free from the Broadcom portal (it's the proven Win11-ARM backend, and not brew-installable), then try again."
-        windowsSetupBusy = false
+        endWindowsSetup()
         return
       }
 
@@ -494,7 +503,16 @@ final class AppState: ObservableObject {
       // the latest Win11 ARM64 ISO (UUP dump) when no --iso is passed, then
       // drives the base-VM build. The blocking shell-out runs off the main actor.
       statusMessage = "Setting up the Windows runner (downloading + building the base image — this takes a while)…"
-      let result = await Self.runPrepScript(script, name: image)
+      // Stream the prep scripts' phase markers into the live stepper as the build
+      // runs. The continuation is Sendable (safe to yield from the script's drain
+      // threads); we consume on the MainActor and advance the stepper forward-only.
+      let (lines, continuation) = AsyncStream<String>.makeStream()
+      let progress = Task { @MainActor in
+        for await line in lines { self.applySetupProgress(line) }
+      }
+      let result = await Self.runPrepScript(script, name: image) { continuation.yield($0) }
+      continuation.finish()
+      _ = await progress.value
       // Persist the FULL build transcript to ~/.mactions/logs so a failure is
       // diagnosable from disk (survives the ephemeral clone; no Console.app
       // spelunking). Both success + failure, so a "succeeded but didn't verify"
@@ -504,7 +522,7 @@ final class AppState: ObservableObject {
         contents:
           "exit=\(result.map { String($0.status) } ?? "nil (could not launch)")\n\n"
           + "=== stdout ===\n\(result?.stdout ?? "")\n\n=== stderr ===\n\(result?.stderr ?? "")\n")
-      windowsSetupBusy = false
+      endWindowsSetup()
       if let result, result.ok {
         // Exit 0 means the prep RAN, not that a bootable base VM exists — the
         // unattended OS install + bootstrap happen on the first headless boot.
@@ -555,9 +573,9 @@ final class AppState: ObservableObject {
     return f.string(from: Date())
   }
 
-  private nonisolated static func runPrepScript(_ script: String, name: String) async
-    -> Shell.Result?
-  {
+  private nonisolated static func runPrepScript(
+    _ script: String, name: String, onLine: @escaping @Sendable (String) -> Void
+  ) async -> Shell.Result? {
     await Task.detached {
       // A Finder/login-item launched .app inherits a launchd PATH WITHOUT
       // /opt/homebrew/bin, so the script's own `command -v` checks for python3 +
@@ -571,8 +589,30 @@ final class AppState: ObservableObject {
       let prepend = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"]
         .filter { !have.contains($0) }
       env["PATH"] = (prepend + [existing]).joined(separator: ":")
-      return try? Shell.run(script, ["--name", name], environment: env)
+      // Stream the output (for the live stepper) while still capturing the full
+      // transcript for the durable log.
+      return try? Shell.runStreaming(script, ["--name", name], environment: env, onLine: onLine)
     }.value
+  }
+
+  /// Advance the live setup stepper from a line of build output (FORWARD-ONLY, so
+  /// a duplicate/late marker can't regress it) and refresh the sub-status. Called
+  /// on the MainActor as the prep scripts stream.
+  private func applySetupProgress(_ line: String) {
+    if let step = WindowsSetupProgress.step(for: line) {
+      windowsSetupStep = max(windowsSetupStep ?? step, step)
+    }
+    if let detail = WindowsSetupProgress.detail(for: line) {
+      windowsSetupDetail = detail
+    }
+  }
+
+  /// Tear down the live setup indicator (the build finished or aborted). Paired
+  /// with every exit from `setUpWindowsRunner` so the stepper never lingers.
+  private func endWindowsSetup() {
+    windowsSetupBusy = false
+    windowsSetupStep = nil
+    windowsSetupDetail = nil
   }
 
   func setWindowsEnabled(_ on: Bool) {

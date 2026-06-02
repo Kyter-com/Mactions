@@ -32,6 +32,28 @@ $ProgressPreference    = 'SilentlyContinue'   # PS 5.1 IWR progress bar throttle
 
 $RunnerRoot = 'C:\actions-runner'
 
+# Retry a network operation through transient blips (DNS / connection reset /
+# 5xx / a momentary drop) with linear backoff, so a brief network hiccup during
+# the (long) base build doesn't fail the whole image. Throws a clear message only
+# after exhausting all tries.
+function Invoke-WithRetry {
+  param(
+    [Parameter(Mandatory)][scriptblock]$Action,
+    [ValidateRange(1, [int]::MaxValue)][int]$Tries = 5,  # >=1 so the loop always runs (never silently returns $null)
+    [int]$DelaySeconds = 5,
+    [string]$What = 'network operation'
+  )
+  for ($i = 1; $i -le $Tries; $i++) {
+    try { return (& $Action) }
+    catch {
+      if ($i -ge $Tries) { throw "$What failed after $i attempts: $($_.Exception.Message)" }
+      Write-Host ("  {0} failed (attempt {1}/{2}): {3} - retrying in {4}s..." -f `
+        $What, $i, $Tries, $_.Exception.Message, ($DelaySeconds * $i))
+      Start-Sleep -Seconds ($DelaySeconds * $i)
+    }
+  }
+}
+
 # Durable build transcript: survives in the base disk, and fusion-windows-base
 # copies it out to ~/.mactions/logs if the build times out. Best-effort - never
 # fail the build over a logging hiccup.
@@ -78,10 +100,13 @@ if (-not (Test-Outbound)) {
     }
   }
   Write-Host 'Waiting for outbound network (vmxnet3 binds after the Tools PnP driver install)...'
-  $deadline = (Get-Date).AddSeconds(180)
+  # 300s (was 180): tolerate a slow Tools/PnP NIC bring-up + transient DNS before
+  # giving up. Test-Outbound swallows per-probe errors, so a momentary drop just
+  # keeps the loop waiting rather than aborting the build.
+  $deadline = (Get-Date).AddSeconds(300)
   while ((Get-Date) -lt $deadline -and -not (Test-Outbound)) { Start-Sleep -Seconds 5 }
   if (-not (Test-Outbound)) {
-    throw 'No outbound network after 180s. On VMware Fusion this means the vmxnet3 driver never bound (VMware Tools may need a reboot on this build); cannot download the runner agent.'
+    throw 'No outbound network after 300s. On VMware Fusion this means the vmxnet3 driver never bound (VMware Tools may need a reboot on this build); cannot download the runner agent.'
   }
   Write-Host 'Network is up.'
 }
@@ -137,8 +162,10 @@ function Install-Exe {
 # PATH so actions/checkout (and the runner service) resolve `git`.
 Write-Host 'Installing Git for Windows (ARM64, MinGit)...'
 try {
-  $gitRel = Invoke-RestMethod 'https://api.github.com/repos/git-for-windows/git/releases/latest' `
-    -Headers @{ 'User-Agent' = 'mactions'; 'Accept' = 'application/vnd.github+json' }
+  $gitRel = Invoke-WithRetry -What 'Git-for-Windows release lookup' {
+    Invoke-RestMethod 'https://api.github.com/repos/git-for-windows/git/releases/latest' `
+      -Headers @{ 'User-Agent' = 'mactions'; 'Accept' = 'application/vnd.github+json' }
+  }
   # Prefer the standard MinGit (skip the busybox variant for fewer surprises).
   $gitAsset = $gitRel.assets |
     Where-Object { $_.name -match '^MinGit-.*-arm64\.zip$' -and $_.name -notmatch 'busybox' } |
@@ -190,10 +217,10 @@ try {
 # Resolve the LATEST runner release at build time. The agent self-updates at job
 # time anyway, so pinning buys nothing and only risks a 404 on a yanked/aged tag.
 $ghHeaders = @{ 'User-Agent' = 'mactions'; 'Accept' = 'application/vnd.github+json' }
-try {
-  $rel = Invoke-RestMethod 'https://api.github.com/repos/actions/runner/releases/latest' -Headers $ghHeaders
-} catch {
-  throw "Could not reach the GitHub releases API to resolve the actions-runner version: $($_.Exception.Message)"
+# Retry through transient blips — this lookup is REQUIRED (no agent without it), so
+# a momentary drop here must not fail the build.
+$rel = Invoke-WithRetry -What 'actions-runner release lookup' {
+  Invoke-RestMethod 'https://api.github.com/repos/actions/runner/releases/latest' -Headers $ghHeaders
 }
 $RunnerVersion = $rel.tag_name -replace '^v', ''            # 'v2.334.0' -> '2.334.0'
 $assetName     = "actions-runner-win-arm64-$RunnerVersion.zip"
@@ -221,8 +248,8 @@ do {
     }
     break
   } catch {
-    if ($attempt -ge 3) { throw "failed to download runner.zip from $url after $attempt attempts: $_" }
-    Start-Sleep -Seconds (5 * $attempt)
+    if ($attempt -ge 5) { throw "failed to download runner.zip from $url after $attempt attempts: $_" }
+    Start-Sleep -Seconds (5 * $attempt)   # linear backoff: 5s, 10s, 15s, 20s
   }
 } while ($true)
 
