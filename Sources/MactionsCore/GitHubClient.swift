@@ -293,10 +293,26 @@ public struct GitHubClient: RunnerControlPlane {
   }
 
   /// Find the single job our ephemeral runner ran, by matching the unique runner
-  /// name across recent workflow runs. Returns nil if not found (job not yet
-  /// visible, run too old to be in the recent window, etc.).
+  /// name across recent workflow runs. Scans newest-first and EARLY-EXITS on the
+  /// first run that contains the runner: the runner name is unique per
+  /// registration, so it lives in exactly one run, and `pickJob` picks the newest
+  /// attempt within that run (a re-run reuses the run id). Early-exit keeps the
+  /// POLLED live-runner lookup cheap — it must not list jobs for every recent run
+  /// on each 4-second poll. Returns nil if not found (job not yet visible, run too
+  /// old to be in the recent window, etc.).
   public func findJob(runnerName: String, since: Date, maxRuns: Int = 30) async -> WorkflowJob? {
-    Self.pickJob(await recentJobs(since: since, maxRuns: maxRuns) ?? [], runnerName: runnerName)
+    guard let runs = try? await listRecentWorkflowRuns(perPage: 40) else { return nil }
+    let earliest = since.addingTimeInterval(-1800)  // 30 min slack: re-run attempts + skew
+    let candidates =
+      runs
+      .filter { ($0.createdAt ?? .distantPast) >= earliest }
+      .sorted { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
+      .prefix(maxRuns)
+    for run in candidates {
+      guard let jobs = try? await listJobs(runId: run.id) else { continue }
+      if let job = Self.pickJob(jobs, runnerName: runnerName) { return job }
+    }
+    return nil
   }
 
   @discardableResult
