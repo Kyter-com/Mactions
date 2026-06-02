@@ -1,11 +1,16 @@
 import MactionsCore
 import SwiftUI
 
-/// The entire UI: a single popover hung off the menubar item. Signed-out shows
-/// the GitHub connect flow; signed-in shows a searchable multi-repo picker, the
-/// online toggle, and live runners. Split into small subviews so the SwiftUI
-/// type-checker stays fast.
-struct MenuContentView: View {
+/// The Setup pane — everything the old menubar popover held: the GitHub connect /
+/// sign-in flow (signed out), and the fleet configuration (signed in) — OS
+/// selection, the Windows base-image setup/maintenance, the repo picker, runner
+/// controls, and sign-out / cleanup. Signed-out shows the connect flow; signed-in
+/// shows the fleet config. The actual "Go online / offline" toggle lives in the
+/// dashboard header (DashboardView), so it's reachable from every pane.
+///
+/// Laid out as vertically-scrolling glass cards — it's a full-width window pane
+/// now, not a 340pt popover — but functionally identical to the old popover.
+struct SetupPane: View {
   @EnvironmentObject private var app: AppState
   @State private var pat = ""
   @State private var repoFilter = ""
@@ -15,82 +20,67 @@ struct MenuContentView: View {
   @State private var showRepoPicker = false
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      header
+    ScrollView {
+      VStack(alignment: .leading, spacing: 14) {
+        if let message = app.statusMessage {
+          Text(message)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
 
-      if let message = app.statusMessage {
-        Text(message)
-          .font(.caption)
-          .foregroundStyle(.secondary)
-          .fixedSize(horizontal: false, vertical: true)
+        if app.isSignedIn {
+          fleetSection
+          accountSection
+        } else {
+          connectSection
+        }
       }
+      .padding(20)
+      .frame(maxWidth: 560, alignment: .leading)
+      .frame(maxWidth: .infinity, alignment: .leading)
+    }
+    .task(id: app.isSignedIn) { await app.loadReposIfNeeded() }
+    .onAppear {
+      app.refreshWindowsPreflight()
+      app.checkForWindowsImageUpdate()
+      if app.selectedRepos.isEmpty { showRepoPicker = true }
+    }
+  }
 
-      Divider()
+  // MARK: A card container (rounded rect + liquid glass, matching CapacityStrip)
 
-      if app.isSignedIn {
-        fleetSection
-      } else {
-        connectSection
-      }
-
-      Divider()
-      footer
+  private func card<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+    VStack(alignment: .leading, spacing: 10) {
+      content()
     }
     .padding(14)
-    .task(id: app.isSignedIn) { await app.loadReposIfNeeded() }
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .liquidGlass(in: RoundedRectangle(cornerRadius: 12))
   }
 
-  // MARK: Header
+  // MARK: Account (signed in)
 
-  private var header: some View {
-    HStack(spacing: 8) {
-      Circle().fill(statusColor).frame(width: 9, height: 9)
-      Text("Mactions").font(.headline)
-      Spacer()
-      Button {
-        DashboardWindowController.shared.show()
-      } label: {
-        Image(systemName: "macwindow")
-      }
-      .buttonStyle(.borderless)
-      .help("Open the dashboard window (runners, history, capacity)")
-      Text(app.state.rawValue.capitalized)
-        .font(.caption.weight(.medium))
-        .foregroundStyle(.secondary)
-    }
-  }
-
-  private var statusColor: Color {
-    switch app.state {
-    case .offline: return .secondary
-    case .starting, .stopping: return .orange
-    case .online: return .green
-    }
-  }
-
-  // MARK: Footer
-
-  private var footer: some View {
-    HStack(spacing: 8) {
-      if app.isSignedIn {
+  private var accountSection: some View {
+    card {
+      HStack(spacing: 8) {
         Button("Sign out", action: app.signOut)
         if app.state == .offline {
           Button("Remove cached agent", action: app.cleanUpHostFiles)
             .help(
               "Per-run files are wiped automatically after every job. This also removes the cached ~200 MB runner agent.")
         }
+        Spacer()
       }
-      Spacer()
-      Button("Quit") { NSApp.terminate(nil) }
+      .buttonStyle(.bordered)
+      .controlSize(.small)
     }
-    .buttonStyle(.bordered)
-    .controlSize(.small)
   }
 
   // MARK: Connect (signed out)
 
   private var connectSection: some View {
-    VStack(alignment: .leading, spacing: 10) {
+    card {
       Text("Connect GitHub").font(.subheadline.weight(.semibold))
 
       if app.gitHubCLIAvailable {
@@ -160,34 +150,17 @@ struct MenuContentView: View {
   }
 
   private var fleetSection: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      osSelector
-      windowsArea
-      repoSelector
-      controlsRow
-
-      Button {
-        app.toggleOnline()
-      } label: {
-        Label(
-          app.state == .offline ? "Go online" : "Go offline",
-          systemImage: app.state == .offline ? "play.fill" : "stop.fill"
-        )
-        .frame(maxWidth: .infinity)
+    Group {
+      card {
+        osSelector
+        windowsArea
       }
-      .buttonStyle(.borderedProminent)
-      .controlSize(.large)
-      .disabled(
-        app.selectedRepos.isEmpty
-          || !app.selectedOSes.contains(where: { $0.isImplemented })
-          || app.state == .starting || app.state == .stopping)
-
-      if !app.runners.isEmpty { runnerList }
-    }
-    .onAppear {
-      app.refreshWindowsPreflight()
-      app.checkForWindowsImageUpdate()
-      if app.selectedRepos.isEmpty { showRepoPicker = true }
+      card {
+        repoSelector
+      }
+      card {
+        controlsRow
+      }
     }
   }
 
@@ -372,10 +345,6 @@ struct MenuContentView: View {
     return !(r.ready)
   }
 
-  private func sectionLabel(_ text: String) -> some View {
-    Text(text).font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary).tracking(0.6)
-  }
-
   // MARK: Repos (collapsed) + controls
 
   private var repoSelector: some View {
@@ -499,7 +468,7 @@ struct MenuContentView: View {
         }
         .padding(4)
       }
-      .frame(height: 150)
+      .frame(height: 220)
       .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
       .overlay(alignment: .center) {
         if app.availableRepos.isEmpty && !app.reposLoading {
@@ -527,103 +496,5 @@ struct MenuContentView: View {
     }
     .buttonStyle(.plain)
     .disabled(app.state != .offline)
-  }
-
-  private var runnerList: some View {
-    VStack(alignment: .leading, spacing: 4) {
-      sectionLabel("LIVE RUNNERS")
-      ForEach(app.runners) { row in
-        HStack(spacing: 6) {
-          OSLogo(os: row.os, size: 13)
-            .frame(width: 14)
-            .help(row.os.displayName)
-          Circle()
-            .fill(row.runner.phase == .online ? Color.green : Color.orange)
-            .frame(width: 6, height: 6)
-          Text(row.repoFullName).font(.caption2).foregroundStyle(.secondary)
-          Text(row.runner.id).font(.caption2.monospaced()).lineLimit(1).truncationMode(.middle)
-          Spacer()
-          Text(row.runner.phase.rawValue).font(.caption2).foregroundStyle(.secondary)
-        }
-      }
-    }
-  }
-}
-
-/// Shows what's STILL MISSING for the Windows path (not a full ✓/✗ list — done
-/// items are simply omitted, so the section empties out as prerequisites land and
-/// disappears entirely once the base image is built). Plus a one-click installer
-/// for the missing FREE brew deps (converter tools + xorriso). It never installs a
-/// hypervisor (Fusion is a manual Broadcom-portal download) and never installs
-/// Homebrew (points at brew.sh).
-private struct WindowsPreflightChecklist: View {
-  @ObservedObject var app: AppState
-
-  var body: some View {
-    // Until the first preflight scan publishes a report, render nothing rather
-    // than treating everything as missing (which flashed "Homebrew/Fusion missing"
-    // on machines that have them).
-    if let report = app.windowsPreflight {
-      checklist(report)
-    }
-  }
-
-  @ViewBuilder
-  private func checklist(_ report: WindowsPreflight.Report) -> some View {
-    let missingConverters = report.missingConverterFormulae
-    VStack(alignment: .leading, spacing: 3) {
-      if !report.homebrewInstalled { missingRow("Homebrew — install from brew.sh") }
-      if !report.hasHypervisor { missingRow("VMware Fusion — free, from the Broadcom portal") }
-      if !missingConverters.isEmpty {
-        missingRow("ISO converter tools — \(missingConverters.joined(separator: ", "))")
-      }
-
-      // Only show the installer when it can actually DO something (the `.install`
-      // case). On `.homebrewMissing` it'd be a silent no-op — the "Homebrew —
-      // install from brew.sh" missing row above already tells the user what to do.
-      if case .install = WindowsPreflight.installPlan(for: report) {
-        Button {
-          app.installWindowsFreePrerequisites()
-        } label: {
-          HStack(spacing: 6) {
-            if app.windowsPreflightBusy { ProgressView().controlSize(.small) }
-            Label("Install free prerequisites", systemImage: "arrow.down.circle")
-          }
-        }
-        .buttonStyle(.bordered).controlSize(.small)
-        .disabled(app.state != .offline || app.windowsPreflightBusy)
-      }
-    }
-  }
-
-  /// A single "still needed" row (only ever shown for things that ARE missing).
-  private func missingRow(_ label: String) -> some View {
-    HStack(spacing: 5) {
-      Image(systemName: "exclamationmark.circle")
-        .font(.system(size: 9)).foregroundStyle(.orange)
-      Text(label).font(.caption2).foregroundStyle(.secondary)
-        .fixedSize(horizontal: false, vertical: true)
-      Spacer(minLength: 0)
-    }
-  }
-}
-
-/// A label-over-field pair sized for the narrow popover.
-private struct LabeledField: View {
-  let title: String
-  @Binding var text: String
-  var prompt: String = ""
-
-  init(_ title: String, text: Binding<String>, prompt: String = "") {
-    self.title = title
-    self._text = text
-    self.prompt = prompt
-  }
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 2) {
-      Text(title).font(.caption2).foregroundStyle(.secondary)
-      TextField(prompt, text: $text).textFieldStyle(.roundedBorder)
-    }
   }
 }

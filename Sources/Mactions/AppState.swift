@@ -130,14 +130,6 @@ final class AppState: ObservableObject {
     Task.detached { HostCleanup.sweepOrphans() }
   }
 
-  var menuBarSymbol: String {
-    switch state {
-    case .offline: return "bolt.slash"
-    case .starting, .stopping: return "bolt.badge.clock"
-    case .online: return "bolt.fill"
-    }
-  }
-
   func saveConfig() {
     defaults.set(selectedRepos.map(\.fullName), forKey: "selectedRepos")
     defaults.set(labelsText, forKey: "labels")

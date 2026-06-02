@@ -2,21 +2,21 @@ import AppKit
 import MactionsCore
 import SwiftUI
 
-/// Menubar entry point. The whole UI hangs off a single `MenuBarExtra`; there's
-/// no main window. Quitting the app is the "go offline" signal — the delegate
-/// deregisters runners before letting termination complete.
+/// App entry point. The real UI is an AppKit-owned window (`DashboardView`,
+/// managed by `DashboardWindowController`) that the delegate opens on launch —
+/// not a SwiftUI `WindowGroup`, which would create a second, duplicate window
+/// competing with the AppKit one. SwiftPM `@main App` still needs *a* Scene, so
+/// this declares an empty `Settings` scene as a placeholder. Quitting the app is
+/// the "go offline" signal — the delegate deregisters runners before letting
+/// termination complete.
 @main
 struct MactionsApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-  @ObservedObject private var app = AppState.shared
 
   var body: some Scene {
-    MenuBarExtra("Mactions", systemImage: app.menuBarSymbol) {
-      MenuContentView()
-        .environmentObject(app)
-        .frame(width: 340)
-    }
-    .menuBarExtraStyle(.window)
+    // Placeholder scene only; the primary window is AppKit-owned (see
+    // DashboardWindowController, shown from AppDelegate.applicationDidFinishLaunching).
+    Settings { EmptyView() }
   }
 }
 
@@ -33,17 +33,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationDidFinishLaunching(_ notification: Notification) {
-    // Accessory = menubar-only, no dock icon, no app-switcher entry. The optional
-    // dashboard window flips this to .regular while it's open (see
-    // DashboardWindowController) and back to .accessory on close.
-    NSApp.setActivationPolicy(.accessory)
+    // Regular windowed app: dock icon + app-switcher entry, and the dashboard
+    // window opens on launch. Closing the window keeps the app (+ fleet) running;
+    // clicking the dock icon reopens it (applicationShouldHandleReopen below).
+    NSApp.setActivationPolicy(.regular)
+    DashboardWindowController.shared.show()
   }
 
-  /// Closing the dashboard window must NOT quit the app — Mactions lives in the
-  /// menu bar and quitting is what takes runners offline. Only the menu's Quit /
-  /// ⌘Q (NSApp.terminate) ends the app, via applicationShouldTerminate below.
+  /// Closing the dashboard window must NOT quit the app — quitting is what takes
+  /// runners offline. Only the app's Quit / ⌘Q (NSApp.terminate) ends the app,
+  /// via applicationShouldTerminate below.
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
     false
+  }
+
+  /// Clicking the dock icon while the (only) window is closed reopens it — the
+  /// app stays running with no visible window after the user closes the dashboard.
+  func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+    DashboardWindowController.shared.show()
+    return true
   }
 
   /// Bring runners offline before we actually quit. Reply `terminateLater` and
