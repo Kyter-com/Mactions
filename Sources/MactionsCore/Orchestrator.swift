@@ -54,6 +54,10 @@ public final class RunnerOrchestrator {
   private let controlPlane: RunnerControlPlane
   private let factory: RunnerProviderFactory
   private let config: FleetConfig
+  /// Which OS this fleet runs (purely descriptive — used to stamp `RunRecord`s so
+  /// the history knows whether a run was macOS or Windows). The control loop is
+  /// OS-agnostic; the provider does the OS-specific work.
+  private let os: RunnerOS
   private let machinePrefix: String
   private let reconcileInterval: UInt64
 
@@ -61,6 +65,10 @@ public final class RunnerOrchestrator {
   public private(set) var lastError: String?
   /// Fired (on the main actor) whenever `state`/`runners` change.
   public var onChange: (() -> Void)?
+  /// Fired (on the main actor) once for each runner that finishes — a clean
+  /// ephemeral exit, a failure, or a teardown reap. The app records these into
+  /// its run history. See `handleExit` for the outcome classification.
+  public var onRunFinished: ((RunRecord) -> Void)?
 
   // @MainActor-isolated (like its enclosing orchestrator): only ever touched on
   // the main actor, which also makes it Sendable so it can be captured by the
@@ -70,8 +78,14 @@ public final class RunnerOrchestrator {
     var remoteId: Int?
     var phase: ManagedRunner.Phase
     let provider: RunnerProvider
-    init(name: String, remoteId: Int?, phase: ManagedRunner.Phase, provider: RunnerProvider) {
+    /// When the agent launched (used as the run's start time in history).
+    let startedAt: Date
+    init(
+      name: String, remoteId: Int?, phase: ManagedRunner.Phase, provider: RunnerProvider,
+      startedAt: Date
+    ) {
       self.name = name; self.remoteId = remoteId; self.phase = phase; self.provider = provider
+      self.startedAt = startedAt
     }
   }
   private var slots: [Slot] = []
@@ -85,12 +99,14 @@ public final class RunnerOrchestrator {
     controlPlane: RunnerControlPlane,
     factory: RunnerProviderFactory,
     config: FleetConfig,
+    os: RunnerOS = .macOS,
     machinePrefix: String = machineRunnerPrefix(),
     reconcileInterval: UInt64 = 30_000_000_000
   ) {
     self.controlPlane = controlPlane
     self.factory = factory
     self.config = config
+    self.os = os
     self.machinePrefix = machinePrefix
     self.reconcileInterval = reconcileInterval
   }
@@ -164,9 +180,11 @@ public final class RunnerOrchestrator {
         return false
       }
       let provider = factory.makeProvider(name: jit.runnerName)
-      let slot = Slot(name: jit.runnerName, remoteId: jit.runnerId, phase: .online, provider: provider)
-      try provider.start(jitConfig: jit.encodedConfig) { [weak self] _ in
-        Task { @MainActor in self?.handleExit(slot, epoch: myEpoch) }
+      let slot = Slot(
+        name: jit.runnerName, remoteId: jit.runnerId, phase: .online, provider: provider,
+        startedAt: Date())
+      try provider.start(jitConfig: jit.encodedConfig) { [weak self] status in
+        Task { @MainActor in self?.handleExit(slot, epoch: myEpoch, status: status) }
       }
       slots.append(slot)
       notify()
@@ -178,7 +196,29 @@ public final class RunnerOrchestrator {
     }
   }
 
-  private func handleExit(_ slot: Slot, epoch slotEpoch: Int) {
+  private func handleExit(_ slot: Slot, epoch slotEpoch: Int, status: Int32) {
+    // Record the run ONLY when it ended on its own while the fleet is online — a
+    // genuine end-of-life for an ephemeral runner (ran its one job, or the agent
+    // crashed). Status 0 → `.completed`, non-zero → `.failed`.
+    //
+    // We deliberately do NOT record teardown reaps (go-offline/quit) or stale-
+    // generation late exits. Two reasons: (1) they're noise — every idle runner
+    // gets reaped on each go-offline; and (2) on teardown AppState drops the
+    // orchestrator the instant `stop()` returns, while a provider's exit callback
+    // can still fire asynchronously afterward — by then this `[weak self]` hop
+    // no-ops, so a record emitted on that path would be lost unreliably anyway.
+    // Recording only the online path keeps history to "runs that actually ran"
+    // and is race-free (the orchestrator is always alive here). A runner cut off
+    // mid-job by go-offline isn't recorded — we can't tell idle from busy without
+    // parsing the agent log (a later phase).
+    if state == .online, epoch == slotEpoch {
+      onRunFinished?(
+        RunRecord(
+          id: slot.name, os: os, repo: "\(config.owner)/\(config.repo)",
+          remoteId: slot.remoteId, startedAt: slot.startedAt, endedAt: Date(),
+          exitStatus: status, outcome: status == 0 ? .completed : .failed))
+    }
+
     if let index = slots.firstIndex(where: { $0 === slot }) {
       slots.remove(at: index)
       notify()

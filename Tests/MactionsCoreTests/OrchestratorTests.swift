@@ -42,6 +42,13 @@ final class FakeFactory: RunnerProviderFactory {
   }
 }
 
+/// Collects the run records an orchestrator emits via `onRunFinished` (main-actor
+/// isolated, so the callback can append without Sendable gymnastics).
+@MainActor
+final class RecordCollector {
+  var records: [RunRecord] = []
+}
+
 // MARK: Tests
 
 @MainActor
@@ -104,5 +111,68 @@ final class OrchestratorTests: XCTestCase {
     // Only THIS machine's runners are deregistered; the stranger and the other
     // Mac's runner are untouched.
     XCTAssertEqual(Set(cp.deleted), [10, 12])
+  }
+
+  // MARK: Run history
+
+  func testCleanExitWhileOnlineRecordsCompleted() async {
+    let (orch, _, factory) = makeOrchestrator(count: 1)
+    let collector = RecordCollector()
+    orch.onRunFinished = { collector.records.append($0) }
+    await orch.start()
+    factory.made.first?.fireExit(0)  // ran its one job, exited cleanly
+    await settle()
+
+    XCTAssertEqual(collector.records.count, 1)
+    let rec = collector.records[0]
+    XCTAssertEqual(rec.outcome, .completed)
+    XCTAssertEqual(rec.repo, "o/r")
+    XCTAssertEqual(rec.exitStatus, 0)
+    XCTAssertEqual(rec.os, .macOS)  // default descriptor
+    XCTAssertFalse(rec.id.isEmpty)
+  }
+
+  func testNonZeroExitWhileOnlineRecordsFailed() async {
+    let (orch, _, factory) = makeOrchestrator(count: 1)
+    let collector = RecordCollector()
+    orch.onRunFinished = { collector.records.append($0) }
+    await orch.start()
+    factory.made.first?.fireExit(1)
+    await settle()
+
+    XCTAssertEqual(collector.records.last?.outcome, .failed)
+    XCTAssertEqual(collector.records.last?.exitStatus, 1)
+  }
+
+  func testExitAfterTeardownIsNotRecorded() async {
+    let (orch, _, factory) = makeOrchestrator(count: 1)
+    let collector = RecordCollector()
+    orch.onRunFinished = { collector.records.append($0) }
+    await orch.start()
+    let provider = factory.made.first
+    await orch.stop()  // user went offline: state -> .offline, epoch bumped
+    // A late exit arriving after teardown is a reap, not a real run — and in the
+    // app the orchestrator is dropped right after stop(), so this async callback
+    // would no-op via [weak self] anyway. Either way: nothing recorded.
+    provider?.fireExit(0)
+    await settle()
+
+    XCTAssertTrue(collector.records.isEmpty)
+  }
+
+  func testWindowsDescriptorStampsRecordOS() async {
+    let cp = FakeControlPlane()
+    let factory = FakeFactory()
+    let config = FleetConfig(owner: "o", repo: "r", labels: ["self-hosted"], desiredCount: 1)
+    let orch = RunnerOrchestrator(
+      controlPlane: cp, factory: factory, config: config, os: .windows,
+      machinePrefix: "mactions-testmac")
+    let collector = RecordCollector()
+    orch.onRunFinished = { collector.records.append($0) }
+    await orch.start()
+    factory.made.first?.fireExit(0)
+    await settle()
+
+    XCTAssertEqual(collector.records.last?.os, .windows)
   }
 }

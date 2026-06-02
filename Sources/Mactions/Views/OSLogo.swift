@@ -1,19 +1,21 @@
+import AppKit
 import MactionsCore
 import SwiftUI
 
-/// Brand marks for each `RunnerOS`, drawn as scalable MONOCHROME vectors that read
-/// as a uniform set. CRITICAL for uniformity: all three are styled through the
-/// SAME `.foregroundStyle(tint)` path (the Apple SF Symbol + the Windows/Tux
-/// `Shape`s). A `Shape.fill(Color)` instead renders grayer than symbol/text
-/// content inside the popover's vibrancy material — which is why the Windows
-/// squares previously looked gray next to the white Apple logo. `.primary` adapts
-/// (white on a dark popover, dark on a light one), so they're never invisible.
-///   - macOS  → `apple.logo` SF Symbol.
-///   - Windows → the 4-pane logo (a 2×2 grid).
-///   - Linux  → a simple Tux silhouette.
+/// Brand marks for each `RunnerOS`, drawn as uniform MONOCHROME, white-tintable
+/// glyphs. Sourced from the custom SF Symbol templates under `Media.xcassets`
+/// (`logo-apple` / `logo-windows` / `logo-ubuntu`).
 ///
-/// To swap in a real bundled image later, replace a branch with
-/// `Image("logo-name").renderingMode(.template)` — the call sites don't change.
+/// Two render paths, picked automatically:
+///   - **Real SF Symbol** (`Image(name, bundle: .module)`) when the asset catalog
+///     has been COMPILED by `actool` — i.e. in a real `.app` (Xcode) build.
+///   - **Embedded glyph** (the `Regular-S` path data parsed by `SVGSymbol`) when
+///     it hasn't — i.e. under `swift build`/`swift run`, which copies the raw
+///     `.xcassets` but never runs actool. Visually identical, so the menubar app
+///     looks right today and upgrades to true SF Symbols for free once packaged.
+///
+/// All three are styled through the same `.foregroundStyle(tint)` + `.drawingGroup()`
+/// path so they read as a uniform set (white on a dark surface, dark on a light one).
 struct OSLogo: View {
   let os: RunnerOS
   var size: CGFloat = 22
@@ -21,77 +23,200 @@ struct OSLogo: View {
 
   var body: some View {
     Group {
-      switch os {
-      case .macOS:
-        // The Apple glyph reads optically smaller than a filled square, so size it
-        // to the full box; the 4-pane / penguin get a slight inset to match.
-        Image(systemName: "apple.logo")
-          .font(.system(size: size, weight: .regular))
-      case .windows:
-        WindowsPanes().frame(width: size * 0.86, height: size * 0.86)
-      case .linux:
-        TuxShape().frame(width: size * 0.92, height: size * 0.92)
+      if Self.bundledSymbolAvailable(symbolName) {
+        Image(symbolName, bundle: .module).resizable().scaledToFit()
+      } else {
+        SVGSymbol(pathData: glyphPath)
       }
     }
     .foregroundStyle(tint)
     .frame(width: size, height: size)
-    // Rasterize off the popover's vibrancy material (NSVisualEffectView): without
-    // this, a Shape FILL gets blended with the background (a muted/greenish cast)
-    // while an SF Symbol renders as bright "vibrant content" — so the Windows
-    // squares looked grayer than the white Apple glyph despite the same tint.
-    // drawingGroup composites all three to opaque pixels at the resolved color, so
-    // they come out identical.
+    // Rasterize off the popover's vibrancy material so a Shape fill matches the
+    // brightness of a symbol/text mark (see git history for the gray-square bug).
     .drawingGroup()
   }
-}
 
-/// The Windows mark: a 2×2 grid of rounded squares (filled by the inherited
-/// foreground style, NOT `.fill(Color)`, so it matches the symbol's white).
-private struct WindowsPanes: Shape {
-  func path(in rect: CGRect) -> Path {
-    let s = min(rect.width, rect.height)
-    let ox = (rect.width - s) / 2
-    let oy = (rect.height - s) / 2
-    let gap = s * 0.12
-    let cell = (s - gap) / 2
-    let r = s * 0.06
-    var p = Path()
-    for row in 0..<2 {
-      for col in 0..<2 {
-        let x = ox + CGFloat(col) * (cell + gap)
-        let y = oy + CGFloat(row) * (cell + gap)
-        p.addRoundedRect(
-          in: CGRect(x: x, y: y, width: cell, height: cell),
-          cornerSize: CGSize(width: r, height: r))
-      }
+  private var symbolName: String {
+    switch os {
+    case .macOS: return "logo-apple"
+    case .windows: return "logo-windows"
+    case .linux: return "logo-ubuntu"
     }
-    return p
+  }
+
+  private var glyphPath: String {
+    switch os {
+    case .macOS: return OSLogoSymbol.apple
+    case .windows: return OSLogoSymbol.windows
+    case .linux: return OSLogoSymbol.ubuntu
+    }
+  }
+
+  /// Whether the COMPILED custom symbol is present in the module bundle. False
+  /// under `swift build` (raw, uncompiled catalog), true in a packaged `.app`.
+  /// Cached per name (probe is cheap, but this runs for every logo in a list).
+  @MainActor private static var availability: [String: Bool] = [:]
+  @MainActor private static func bundledSymbolAvailable(_ name: String) -> Bool {
+    if let cached = availability[name] { return cached }
+    let exists = Bundle.module.image(forResource: NSImage.Name(name)) != nil
+    availability[name] = exists
+    return exists
   }
 }
 
-/// A simple flat Tux silhouette (body + head, little flippers + feet, a beak) as a
-/// single `Shape`, filled by the inherited foreground style so it's the SAME white
-/// as the other marks. A solid silhouette (no punched eyes) keeps it on the single
-/// `.foregroundStyle` path; it still reads as a penguin at tile size.
-private struct TuxShape: Shape {
+/// Renders an SVG path `d` string as a Shape, auto-normalized (aspect-fit,
+/// centered) into the target rect. Supports the command set the OS-logo glyphs
+/// use (M/L/H/V/C/S/Q/T/Z, absolute + relative); unknown commands (e.g. arcs,
+/// which these glyphs don't use) are skipped without crashing.
+struct SVGSymbol: Shape {
+  let pathData: String
+
   func path(in rect: CGRect) -> Path {
-    let s = min(rect.width, rect.height)
-    let ox = (rect.width - s) / 2
-    let oy = (rect.height - s) / 2
-    func box(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat) -> CGRect {
-      CGRect(x: ox + x * s, y: oy + y * s, width: w * s, height: h * s)
+    let raw = SVGPath.parse(pathData)
+    let bounds = raw.boundingRect
+    guard bounds.width > 0, bounds.height > 0, bounds.width.isFinite, bounds.height.isFinite
+    else { return raw }
+    let scale = min(rect.width / bounds.width, rect.height / bounds.height)
+    let scaled = raw.applying(CGAffineTransform(scaleX: scale, y: scale))
+    let sb = scaled.boundingRect
+    return scaled.applying(
+      CGAffineTransform(translationX: rect.midX - sb.midX, y: rect.midY - sb.midY))
+  }
+}
+
+/// Minimal, dependency-free SVG path-data parser → SwiftUI `Path`.
+enum SVGPath {
+  private enum Token { case cmd(Character); case num(CGFloat) }
+
+  static func parse(_ d: String) -> Path {
+    var path = Path()
+    let toks = tokenize(d)
+    var i = 0
+    var cur = CGPoint.zero
+    var startPt = CGPoint.zero
+    var prevCtrl: CGPoint?
+    var cmd: Character = " "
+
+    // Pull the next numeric token, or nil if a command / the end is next. Advances
+    // only when it returns a number, so the main loop always makes progress.
+    func next() -> CGFloat? {
+      guard i < toks.count, case .num(let v) = toks[i] else { return nil }
+      i += 1
+      return v
     }
-    func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: ox + x * s, y: oy + y * s) }
-    var p = Path()
-    p.addEllipse(in: box(0.30, 0.82, 0.16, 0.12))  // left foot
-    p.addEllipse(in: box(0.54, 0.82, 0.16, 0.12))  // right foot
-    p.addEllipse(in: box(0.14, 0.40, 0.16, 0.34))  // left flipper
-    p.addEllipse(in: box(0.70, 0.40, 0.16, 0.34))  // right flipper
-    p.addEllipse(in: box(0.26, 0.10, 0.48, 0.80))  // body + head
-    p.move(to: pt(0.45, 0.30))  // beak
-    p.addLine(to: pt(0.55, 0.30))
-    p.addLine(to: pt(0.50, 0.37))
-    p.closeSubpath()
-    return p
+
+    while i < toks.count {
+      if case .cmd(let c) = toks[i] { cmd = c; i += 1 }
+      switch cmd {
+      case "M", "m":
+        guard let x = next(), let y = next() else { break }
+        cur = cmd == "m" ? CGPoint(x: cur.x + x, y: cur.y + y) : CGPoint(x: x, y: y)
+        path.move(to: cur)
+        startPt = cur
+        prevCtrl = nil
+        cmd = cmd == "m" ? "l" : "L"  // subsequent coordinate pairs are implicit lineto
+      case "L", "l":
+        guard let x = next(), let y = next() else { break }
+        cur = cmd == "l" ? CGPoint(x: cur.x + x, y: cur.y + y) : CGPoint(x: x, y: y)
+        path.addLine(to: cur)
+        prevCtrl = nil
+      case "H", "h":
+        guard let x = next() else { break }
+        cur = cmd == "h" ? CGPoint(x: cur.x + x, y: cur.y) : CGPoint(x: x, y: cur.y)
+        path.addLine(to: cur)
+        prevCtrl = nil
+      case "V", "v":
+        guard let y = next() else { break }
+        cur = cmd == "v" ? CGPoint(x: cur.x, y: cur.y + y) : CGPoint(x: cur.x, y: y)
+        path.addLine(to: cur)
+        prevCtrl = nil
+      case "C", "c":
+        guard let a = next(), let b = next(), let c2 = next(), let d2 = next(), let e = next(),
+          let f = next()
+        else { break }
+        let rel = cmd == "c"
+        let cp1 = rel ? CGPoint(x: cur.x + a, y: cur.y + b) : CGPoint(x: a, y: b)
+        let cp2 = rel ? CGPoint(x: cur.x + c2, y: cur.y + d2) : CGPoint(x: c2, y: d2)
+        let end = rel ? CGPoint(x: cur.x + e, y: cur.y + f) : CGPoint(x: e, y: f)
+        path.addCurve(to: end, control1: cp1, control2: cp2)
+        prevCtrl = cp2
+        cur = end
+      case "S", "s":
+        guard let c2x = next(), let c2y = next(), let ex = next(), let ey = next() else { break }
+        let rel = cmd == "s"
+        let cp2 = rel ? CGPoint(x: cur.x + c2x, y: cur.y + c2y) : CGPoint(x: c2x, y: c2y)
+        let end = rel ? CGPoint(x: cur.x + ex, y: cur.y + ey) : CGPoint(x: ex, y: ey)
+        let cp1 = prevCtrl.map { CGPoint(x: 2 * cur.x - $0.x, y: 2 * cur.y - $0.y) } ?? cur
+        path.addCurve(to: end, control1: cp1, control2: cp2)
+        prevCtrl = cp2
+        cur = end
+      case "Q", "q":
+        guard let qx = next(), let qy = next(), let ex = next(), let ey = next() else { break }
+        let rel = cmd == "q"
+        let cp = rel ? CGPoint(x: cur.x + qx, y: cur.y + qy) : CGPoint(x: qx, y: qy)
+        let end = rel ? CGPoint(x: cur.x + ex, y: cur.y + ey) : CGPoint(x: ex, y: ey)
+        path.addQuadCurve(to: end, control: cp)
+        prevCtrl = cp
+        cur = end
+      case "T", "t":
+        guard let ex = next(), let ey = next() else { break }
+        let rel = cmd == "t"
+        let end = rel ? CGPoint(x: cur.x + ex, y: cur.y + ey) : CGPoint(x: ex, y: ey)
+        let cp = prevCtrl.map { CGPoint(x: 2 * cur.x - $0.x, y: 2 * cur.y - $0.y) } ?? cur
+        path.addQuadCurve(to: end, control: cp)
+        prevCtrl = cp
+        cur = end
+      case "Z", "z":
+        path.closeSubpath()
+        cur = startPt
+        prevCtrl = nil
+      default:
+        _ = next()  // unknown command — consume a number to guarantee progress
+      }
+    }
+    return path
+  }
+
+  private static func tokenize(_ d: String) -> [Token] {
+    var tokens: [Token] = []
+    let chars = Array(d)
+    let n = chars.count
+    let commands = Set("MmLlHhVvCcSsQqTtAaZz")
+    var i = 0
+    while i < n {
+      let c = chars[i]
+      if c == " " || c == "," || c == "\n" || c == "\t" || c == "\r" {
+        i += 1
+        continue
+      }
+      if commands.contains(c) {
+        tokens.append(.cmd(c))
+        i += 1
+        continue
+      }
+      // Parse a float: optional sign, digits, one dot, optional exponent. A second
+      // '.' or a sign (outside an exponent) starts the NEXT number.
+      var j = i
+      if chars[j] == "+" || chars[j] == "-" { j += 1 }
+      var seenDot = false
+      while j < n {
+        let cj = chars[j]
+        if cj.isNumber {
+          j += 1
+        } else if cj == "." {
+          if seenDot { break }
+          seenDot = true
+          j += 1
+        } else if cj == "e" || cj == "E" {
+          j += 1
+          if j < n, chars[j] == "+" || chars[j] == "-" { j += 1 }
+        } else {
+          break
+        }
+      }
+      if j > i, let value = Double(String(chars[i..<j])) { tokens.append(.num(CGFloat(value))) }
+      i = max(j, i + 1)
+    }
+    return tokens
   }
 }

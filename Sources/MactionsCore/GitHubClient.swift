@@ -16,6 +16,75 @@ public struct RemoteRunner: Decodable, Equatable, Sendable {
   public let busy: Bool
 }
 
+/// Drops the `Authorization` header when a request is redirected to a different
+/// host. Used for the job-log download, whose 302 points at a pre-signed blob URL
+/// that needs no auth — so the GitHub token never travels to the storage host.
+private final class RedirectAuthStripper: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+  func urlSession(
+    _ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void
+  ) {
+    if request.url?.host != task.originalRequest?.url?.host {
+      var stripped = request
+      stripped.setValue(nil, forHTTPHeaderField: "Authorization")
+      completionHandler(stripped)
+    } else {
+      completionHandler(request)
+    }
+  }
+}
+
+/// A minimal workflow-run summary — just enough to find the run that contains
+/// the job our ephemeral runner executed (we scan recent runs by creation time).
+public struct WorkflowRunSummary: Decodable, Sendable, Equatable {
+  public let id: Int
+  public let createdAt: Date?
+  public let status: String?
+
+  enum CodingKeys: String, CodingKey {
+    case id
+    case createdAt = "created_at"
+    case status
+  }
+}
+
+/// One step of a job (the Jobs API returns these), so the dashboard can show a
+/// live-ish progress checklist for a running runner without log streaming.
+public struct WorkflowStep: Decodable, Sendable, Equatable, Identifiable {
+  public let name: String
+  public let status: String  // queued | in_progress | completed
+  public let conclusion: String?  // success | failure | skipped | cancelled | null
+  public let number: Int
+  public var id: Int { number }
+}
+
+/// A GitHub Actions job. The key field for us is `runnerName`: an ephemeral
+/// runner runs exactly one job, and the job carries the unique `mactions-…`
+/// runner name we minted, so we can correlate a local run → its job → its log.
+public struct WorkflowJob: Decodable, Sendable, Equatable, Identifiable {
+  public let id: Int
+  public let runId: Int
+  public let name: String
+  public let status: String  // queued | in_progress | completed
+  public let conclusion: String?  // success | failure | cancelled | skipped | null
+  public let runnerName: String?
+  public let runnerId: Int?
+  public let htmlURL: String?
+  public let startedAt: Date?
+  public let completedAt: Date?
+  public let steps: [WorkflowStep]?
+
+  enum CodingKeys: String, CodingKey {
+    case id, name, status, conclusion, steps
+    case runId = "run_id"
+    case runnerName = "runner_name"
+    case runnerId = "runner_id"
+    case htmlURL = "html_url"
+    case startedAt = "started_at"
+    case completedAt = "completed_at"
+  }
+}
+
 /// The slice of the GitHub Actions API the orchestrator needs. A protocol so
 /// tests can drive the orchestrator with a fake (no network).
 public protocol RunnerControlPlane: Sendable {
@@ -118,6 +187,94 @@ public struct GitHubClient: RunnerControlPlane {
 
   public func deleteRunner(id: Int) async throws {
     _ = try await send(deleteRunnerRequest(id: id), allowEmpty: true)
+  }
+
+  // MARK: Actions logs (jobs + runner→job correlation)
+
+  /// Decoder for the Actions endpoints (GitHub returns ISO-8601 `Z` timestamps).
+  private static func actionsDecoder() -> JSONDecoder {
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    return decoder
+  }
+
+  public func listWorkflowRunsRequest(perPage: Int = 40) -> URLRequest {
+    var components = URLComponents(
+      url: apiBase.appendingPathComponent("repos/\(owner)/\(repo)/actions/runs"),
+      resolvingAgainstBaseURL: false)!
+    components.queryItems = [URLQueryItem(name: "per_page", value: String(perPage))]
+    var req = request(url: components.url!, method: "GET")
+    req.timeoutInterval = 20  // bound each call so a slow network can't stall findJob's loop
+    return req
+  }
+
+  public func listJobsRequest(runId: Int) -> URLRequest {
+    var components = URLComponents(
+      url: apiBase.appendingPathComponent("repos/\(owner)/\(repo)/actions/runs/\(runId)/jobs"),
+      resolvingAgainstBaseURL: false)!
+    components.queryItems = [
+      URLQueryItem(name: "per_page", value: "100"),
+      URLQueryItem(name: "filter", value: "all"),
+    ]
+    var req = request(url: components.url!, method: "GET")
+    req.timeoutInterval = 20
+    return req
+  }
+
+  public func jobLogsRequest(jobId: Int) -> URLRequest {
+    // 302s to a short-lived signed URL whose body is the plaintext log; URLSession
+    // follows the redirect by default, so `send` returns the log bytes directly.
+    base("repos/\(owner)/\(repo)/actions/jobs/\(jobId)/logs", method: "GET")
+  }
+
+  public func listRecentWorkflowRuns(perPage: Int = 40) async throws -> [WorkflowRunSummary] {
+    struct Response: Decodable { let workflow_runs: [WorkflowRunSummary] }
+    let data = try await send(listWorkflowRunsRequest(perPage: perPage))
+    return try Self.actionsDecoder().decode(Response.self, from: data).workflow_runs
+  }
+
+  public func listJobs(runId: Int) async throws -> [WorkflowJob] {
+    struct Response: Decodable { let jobs: [WorkflowJob] }
+    let data = try await send(listJobsRequest(runId: runId))
+    return try Self.actionsDecoder().decode(Response.self, from: data).jobs
+  }
+
+  /// Download a finished job's log as text. The endpoint 302s to a short-lived
+  /// signed blob URL that needs NO auth, so we follow the redirect with a session
+  /// that strips the `Authorization` header on a cross-host hop — the GitHub token
+  /// must never leak to the storage host (belt-and-suspenders even if URLSession
+  /// already strips it). The endpoint 404s while the job is in-progress and after
+  /// GitHub's retention window expires — callers handle the throw as "unavailable".
+  public func fetchJobLog(jobId: Int) async throws -> String {
+    let session = URLSession(
+      configuration: .ephemeral, delegate: RedirectAuthStripper(), delegateQueue: nil)
+    defer { session.finishTasksAndInvalidate() }
+    let (data, response) = try await session.data(for: jobLogsRequest(jobId: jobId))
+    if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+      throw ClientError.http(http.statusCode, String(data: data, encoding: .utf8) ?? "")
+    }
+    return String(data: data, encoding: .utf8) ?? ""
+  }
+
+  /// Find the single job our ephemeral runner ran, by matching the unique runner
+  /// name across recent workflow runs. Bounded: scans up to `maxRuns` of the most
+  /// recent runs created at/after `since` (minus a margin for clock skew / queue
+  /// time), newest first, and early-exits on the first match. Returns nil if not
+  /// found (job not yet visible, run too old to be in the recent window, etc.).
+  /// Best-effort: network errors are swallowed (returns nil / what it found).
+  public func findJob(runnerName: String, since: Date, maxRuns: Int = 15) async -> WorkflowJob? {
+    guard let runs = try? await listRecentWorkflowRuns(perPage: 40) else { return nil }
+    let earliest = since.addingTimeInterval(-300)  // 5 min slack before the runner came up
+    let candidates =
+      runs
+      .filter { ($0.createdAt ?? .distantPast) >= earliest }
+      .sorted { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
+      .prefix(maxRuns)
+    for run in candidates {
+      guard let jobs = try? await listJobs(runId: run.id) else { continue }
+      if let job = jobs.first(where: { $0.runnerName == runnerName }) { return job }
+    }
+    return nil
   }
 
   @discardableResult

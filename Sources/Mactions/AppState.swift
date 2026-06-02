@@ -75,6 +75,10 @@ final class AppState: ObservableObject {
   @Published var state: FleetState = .offline
   @Published var runners: [FleetRunnerRow] = []
   @Published var statusMessage: String?
+  /// Finished runs (newest first), surfaced in the dashboard window's history.
+  /// Loaded from disk on launch and appended to as runners exit; persisted off
+  /// the main actor. "Past runs since turning on" — and across restarts.
+  @Published var runHistory: [RunRecord] = []
 
   /// One orchestrator per repo×OS, keyed by `owner/name` (macOS) or
   /// `owner/name (Windows)`.
@@ -103,6 +107,12 @@ final class AppState: ObservableObject {
       legacyWindowsEnabled: defaults.bool(forKey: "windowsEnabled"),
       windowsImageReady: windowsImageReady)
     isSignedIn = TokenStore.load() != nil
+    // Restore past-run history (small JSON; cheap synchronous read like the
+    // token/config loads above) so the dashboard has it immediately on open.
+    runHistory = RunHistoryStore.load()
+    // Warm the per-VM footprint cache off the main actor (avoids a main-thread
+    // VMX read during dashboard renders).
+    refreshWindowsPerVMGB()
     // Reap anything a previous crash / force-quit left behind (orphaned runner
     // processes, leaked Windows VM clones) BEFORE the user does anything — not
     // just on go-online. Off the main actor so app launch isn't blocked on the
@@ -307,8 +317,10 @@ final class AppState: ObservableObject {
             let client = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
             let fleet = FleetConfig(
               owner: repo.owner, repo: repo.name, labels: labels, desiredCount: runnersPerRepo)
-            let orch = RunnerOrchestrator(controlPlane: client, factory: factory, config: fleet)
+            let orch = RunnerOrchestrator(
+              controlPlane: client, factory: factory, config: fleet, os: .macOS)
             orch.onChange = { [weak self] in self?.sync() }
+            orch.onRunFinished = { [weak self] record in self?.recordRun(record) }
             orchestrators[repo.fullName] = orch
             fleetOS[repo.fullName] = .macOS
             created.append(orch)
@@ -320,8 +332,9 @@ final class AppState: ObservableObject {
             let winFleet = FleetConfig(
               owner: repo.owner, repo: repo.name, labels: windowsLabels, desiredCount: 1)
             let winOrch = RunnerOrchestrator(
-              controlPlane: winClient, factory: windowsFactory, config: winFleet)
+              controlPlane: winClient, factory: windowsFactory, config: winFleet, os: .windows)
             winOrch.onChange = { [weak self] in self?.sync() }
+            winOrch.onRunFinished = { [weak self] record in self?.recordRun(record) }
             let winKey = "\(repo.fullName) (Windows)"
             orchestrators[winKey] = winOrch
             fleetOS[winKey] = .windows
@@ -696,7 +709,7 @@ final class AppState: ObservableObject {
   /// `memsize` (which every linked clone inherits) when readable, else the
   /// default. Read off the main actor would be ideal, but it's a single tiny
   /// file read — cheap enough to do inline on the goOnline Task.
-  static func windowsPerVMGB(baseImage: String) -> Int {
+  nonisolated static func windowsPerVMGB(baseImage: String) -> Int {
     let vmx = HostCleanup.mactionsRoot()
       .appendingPathComponent("fusion", isDirectory: true)
       .appendingPathComponent("\(baseImage).vmx", isDirectory: false)
@@ -717,6 +730,209 @@ final class AppState: ObservableObject {
       Bundle.main.bundlePath + "/Contents/Resources/scripts/prepare-windows-image",
     ]
     return candidates.first { !$0.isEmpty && FileManager.default.isExecutableFile(atPath: $0) }
+  }
+
+  // MARK: Run history + capacity (dashboard window)
+
+  /// Serializes history writes. Each `persistHistory` chains its save after the
+  /// previous one's, so saves run in submission order (= main-actor record order)
+  /// and the newest snapshot is always written last — two near-simultaneous runner
+  /// exits can't let a stale snapshot win the file write. Main-actor state, so no
+  /// locking. (The in-memory `runHistory` is the source of truth during a session;
+  /// disk is only read on launch.)
+  private var lastHistorySave = Task<Void, Never> {}
+
+  /// Append a finished run to history (newest first), cap it, and persist off the
+  /// main actor. Called on the main actor from an orchestrator's `onRunFinished`.
+  private func recordRun(_ record: RunRecord) {
+    runHistory.insert(record, at: 0)
+    if runHistory.count > RunHistoryStore.maxRecords {
+      runHistory.removeLast(runHistory.count - RunHistoryStore.maxRecords)
+    }
+    persistHistory()
+  }
+
+  /// Wipe the persisted run history (dashboard "Clear" button).
+  func clearRunHistory() {
+    runHistory = []
+    persistHistory()
+  }
+
+  /// Persist the current history off the main actor, serialized behind any
+  /// in-flight save (see `lastHistorySave`).
+  private func persistHistory() {
+    let snapshot = runHistory
+    let previous = lastHistorySave
+    lastHistorySave = Task.detached {
+      _ = await previous.value  // run strictly after the prior save
+      RunHistoryStore.save(snapshot)
+    }
+  }
+
+  /// Open `~/.mactions/logs` in Finder — where durable build/run transcripts and
+  /// the history JSON live. Creates it first so the reveal never no-ops.
+  func revealLogsInFinder() {
+    let dir = HostCleanup.logsRoot()
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    NSWorkspace.shared.open(dir)
+  }
+
+  /// A read-only capacity snapshot for the dashboard. This is the STATIC budget
+  /// `goOnline` uses (host RAM + the Windows VM cap), plus live runner counts —
+  /// NOT live per-VM memory sampling (that's a later phase). Computed on demand.
+  struct CapacitySnapshot {
+    let hostRAMBytes: UInt64
+    let windowsPerVMGB: Int
+    /// Max concurrent Windows VMs the budget allows (0 if no image / too little
+    /// RAM). Mirrors what `goOnline` enforces.
+    let windowsMaxConcurrentVMs: Int
+    let liveMacRunners: Int
+    let liveWindowsRunners: Int
+    /// RAM the *currently live* Windows VMs are budgeted to use (count × per-VM).
+    var windowsCommittedGB: Int { liveWindowsRunners * windowsPerVMGB }
+  }
+
+  /// Cached per-VM RAM footprint (GB) so `capacity` — read during view renders —
+  /// never does file IO on the main thread. The VMX read happens on a detached
+  /// task; refreshed on launch + when the dashboard appears.
+  @Published private(set) var windowsPerVMGBCached = WindowsVMBudget.defaultPerVMGB
+
+  func refreshWindowsPerVMGB() {
+    let image = windowsBaseImage
+    Task {
+      let gb = await Task.detached { Self.windowsPerVMGB(baseImage: image) }.value
+      windowsPerVMGBCached = gb
+    }
+  }
+
+  var capacity: CapacitySnapshot {
+    let perVM = windowsPerVMGBCached
+    let ram = ProcessInfo.processInfo.physicalMemory
+    return CapacitySnapshot(
+      hostRAMBytes: ram,
+      windowsPerVMGB: perVM,
+      windowsMaxConcurrentVMs: windowsImageReady
+        ? WindowsVMBudget.maxConcurrentVMs(physicalMemoryBytes: ram, perVMGB: perVM)
+        : 0,
+      liveMacRunners: runners.filter { $0.os == .macOS }.count,
+      liveWindowsRunners: runners.filter { $0.os == .windows }.count)
+  }
+
+  // MARK: Live memory sampling (dashboard Memory tab)
+
+  /// Rolling buffer of live memory readings for the gauge + sparkline. Sampled
+  /// ONLY while the dashboard window is open (started/stopped by the window
+  /// controller), so there's no background cost when nobody's watching.
+  @Published private(set) var memorySamples: [MemorySample] = []
+  static let maxMemorySamples = 120
+
+  var latestMemory: MemorySample? { memorySamples.last }
+
+  private var memorySamplingTask: Task<Void, Never>?
+
+  /// Start the live memory sampler. Driven by the dashboard window opening (see
+  /// `DashboardWindowController`) rather than SwiftUI view lifecycle: the window is
+  /// reused (`isReleasedWhenClosed = false`), so a view-anchored `.task` wouldn't
+  /// reliably stop on close. Idempotent.
+  func startMemorySampling() {
+    guard memorySamplingTask == nil else { return }
+    memorySamplingTask = Task { [weak self] in
+      while !Task.isCancelled {
+        // The ps + Mach sampling runs on a detached task; the `await` SUSPENDS the
+        // main actor (never blocks it) and we only publish the result here.
+        let sample = await Task.detached { MemorySampler.sample(runsRootPath: HostCleanup.runsRoot().path) }
+          .value
+        guard let self, !Task.isCancelled else { break }
+        self.appendMemorySample(sample)
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+      }
+    }
+  }
+
+  /// Stop the live memory sampler (window closed).
+  func stopMemorySampling() {
+    memorySamplingTask?.cancel()
+    memorySamplingTask = nil
+  }
+
+  private func appendMemorySample(_ sample: MemorySample) {
+    memorySamples.append(sample)
+    if memorySamples.count > Self.maxMemorySamples {
+      memorySamples.removeFirst(memorySamples.count - Self.maxMemorySamples)
+    }
+  }
+
+  // MARK: GitHub Actions logs (inline, on-demand)
+
+  /// In-app log view state for a past run, keyed by the runner name
+  /// (`RunRecord.id`). Each ephemeral runner ran exactly one job, so this maps
+  /// one run → one job's log.
+  enum JobLogState: Sendable, Equatable {
+    case loading
+    case loaded(job: WorkflowJob?, lines: [String])
+    case unavailable(String)
+  }
+  @Published var jobLogs: [String: JobLogState] = [:]
+
+  /// Live-job lookup state for a currently-online runner, keyed by runner name.
+  /// Used to show the running job's step checklist (GitHub doesn't expose a live
+  /// log stream, but the Jobs API returns per-step status).
+  enum RunnerJobState: Sendable, Equatable {
+    case loading
+    case found(WorkflowJob)
+    case notFound
+  }
+  @Published var runnerJobs: [String: RunnerJobState] = [:]
+
+  private func client(forRepo repo: String) -> GitHubClient? {
+    guard let token = TokenStore.load() else { return nil }
+    let parts = repo.split(separator: "/")
+    guard parts.count == 2 else { return nil }
+    return GitHubClient(owner: String(parts[0]), repo: String(parts[1]), token: token)
+  }
+
+  /// Fetch (and cache) a past run's GitHub Actions job log for inline display.
+  /// Correlates by the unique runner name, then downloads the job log. Cheap to
+  /// re-call: returns the cached result unless `force`.
+  func loadJobLog(for record: RunRecord, force: Bool = false) async {
+    if !force, let state = jobLogs[record.id], case .loaded = state { return }
+    guard let client = client(forRepo: record.repo) else {
+      jobLogs[record.id] = .unavailable("Sign in to GitHub to fetch logs.")
+      return
+    }
+    jobLogs[record.id] = .loading
+    // `findJob` / `fetchJobLog` are nonisolated async, so they run OFF the main
+    // actor (the awaits suspend it, never block) AND respect cancellation: closing
+    // the dashboard cancels this `.task`, which cancels the in-flight URLSession
+    // calls. (Task.detached would have detached from that cancellation.)
+    guard let job = await client.findJob(runnerName: record.id, since: record.startedAt) else {
+      jobLogs[record.id] = .unavailable(
+        "No matching job found on GitHub — it may have expired, or GitHub hasn't indexed it yet.")
+      return
+    }
+    let text = (try? await client.fetchJobLog(jobId: job.id)) ?? ""
+    jobLogs[record.id] = .loaded(job: job, lines: await splitLines(text))
+  }
+
+  /// Split text into lines off the main actor (nonisolated async) so a large log
+  /// never churns the main thread when it's stored/rendered.
+  private nonisolated func splitLines(_ text: String) async -> [String] {
+    text.isEmpty ? [] : text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+  }
+
+  /// Look up the job a currently-online runner is executing (for the live step
+  /// checklist). Re-callable on a poll; updates the cached entry in place.
+  func loadRunnerJob(for runnerName: String, repo: String) async {
+    guard let client = client(forRepo: repo) else {
+      runnerJobs[runnerName] = .notFound
+      return
+    }
+    if runnerJobs[runnerName] == nil { runnerJobs[runnerName] = .loading }
+    let since = Date().addingTimeInterval(-3 * 3600)  // runner came up recently
+    // Structured await: off-main (nonisolated async) + cancels when the runner is
+    // deselected / the dashboard closes.
+    let job = await client.findJob(runnerName: runnerName, since: since)
+    runnerJobs[runnerName] = job.map(RunnerJobState.found) ?? .notFound
   }
 
   private func sync() {

@@ -21,6 +21,13 @@ Proof-of-concept. Honest accounting:
 - ✅ **Searchable multi-repo picker** (lists repos you can admin) + one ephemeral fleet per selected repo, run concurrently.
 - ✅ **Local-process provider**: runs the actions-runner agent directly on the Mac (no VM isolation, but each run is an isolated clone that's wiped on exit — see Host hygiene). This is the runnable MVP path.
 - ✅ **SwiftUI menubar app**: status, config, online/offline, live runner list; deregisters on quit.
+- ✅ **Optional dashboard window** (`DashboardWindowController` — AppKit `NSWindow` hosting SwiftUI, opened from the popover's ⊞ button). A **Pulse-style console** with **Runners / History / Memory** tabs in a master–detail layout:
+  - **History** records completed/failed runs (persisted to `~/.mactions/logs/run-history.json`, survives restarts). Selecting a run fetches its **GitHub Actions job log** via the REST API and shows it **inline** (monospaced, line-numbered, searchable) — correlated to the run by the unique `mactions-…` runner name, so it works for **macOS *and* Windows** (logs live on GitHub, sidestepping in-guest capture). Teardown reaps aren't recorded; only runs that finish on their own while online are.
+  - **Runners** shows the live fleet; selecting a runner polls its current job's **step checklist** (Jobs API `steps`).
+  - **Memory** is a **live** gauge + sparkline + per-bucket RSS (Windows VMs / local runners / app), via `MemorySampler` (Mach `host_statistics64` + `ps`), sampled **only while the window is open**.
+  - **Dockless until opened** — showing flips the app to `.regular` (dock icon), closing flips back to `.accessory`; closing the window never quits or takes runners offline. **Liquid Glass** (macOS 26+, `#available`-guarded, material fallback) on the control layer (chips in a `GlassEffectContainer`, search fields, buttons) — never on content, never glass-on-glass.
+  - **OS-logo tiles** render from **custom SF Symbol** templates staged as a `.symbolset` (`Sources/Mactions/Media.xcassets`). `swift build` doesn't run `actool`, so `OSLogo` prefers the compiled symbol when present and falls back to drawing the identical `Regular-S` glyph via a tiny SVG-path parser (`SVGSymbol`); it upgrades to true SF Symbols once packaged as a real `.app`.
+  - **Performance contract:** all slow work (GitHub fetches, `ps`, VMX reads, log parsing) runs off the main actor (nonisolated async / detached); the views only read published state, so the Mac UI never stutters.
 - 🧪 **Tart provider** (VM isolation): implemented against the `tart` CLI but **experimental** — depends on a prepared base image + SSH bootstrap (see Providers).
 - 🟢 **Windows provider** (`WindowsVMProvider`): **PROVEN END TO END on VMware Fusion (2026-06-01).** A real ephemeral **Win11-ARM** GitHub Actions runner registered **outbound** to GitHub and ran a **green Windows job** (native `RUNNER_ARCH=ARM64`) on a Mac, then auto-deregistered and the clone powered itself off — host left clean. **VMware Fusion (free)** is the working backend: its `vmrun` CLI does headless clone/start/stop/deleteVM + snapshots, and its EFI boots Win11-ARM — where **stock Homebrew QEMU's firmware hangs** and **UTM is Aqua/SPICE-bound** (both attempted first; see the finding under [Windows support](#windows-support)). Per job: `vmrun clone … linked -snapshot=base-provisioned` a provisioned base, inject a JIT **config disc** (`mactions/jitconfig`), boot → the guest's `MactionsRunOnce` task runs `run.cmd --jitconfig` for ONE job + powers off → the clone is deleted. The Swift **`VMwareCLI`** backend (+ the `scripts/mactions-fusion-vm` lifecycle helper) drives this loop and **"Go online" auto-selects Fusion**; the **one-time base build is now automated end to end** (`scripts/prepare-windows-image` → `scripts/fusion-windows-base`: no-prompt ISO remaster, unattended install, VMware-Tools/vmxnet3, bootstrap, snapshot). **VMware Fusion is the sole backend — QEMU/UTM/Parallels were removed.** The full flow is **proven via the UI** (2026-06-01: the app built the base itself → green `win-smoke` job → clean teardown, host left spotless), and **hardened**: the base build **verifies provisioning before it snapshots** (so a failed install can't false-succeed), a **host-RAM cap** bounds concurrent VMs (no thrashing), build failures land in `~/.mactions/logs`, and "Rebuild / update" force-rebuilds for newer Windows. The repo is now **Swift 6** (strict concurrency). See [Windows support](#windows-support).
 
@@ -32,14 +39,16 @@ Two SwiftPM targets so orchestration logic stays UI-free and testable:
 MactionsCore (library, pure Foundation)        Mactions (executable, SwiftUI/AppKit)
   GitHubAuth      device flow + PAT + token file   MactionsApp   @main, MenuBarExtra, AppDelegate
   GitHubCLIAuth   reuse `gh auth token`            AppState      glue: one orchestrator per
-  GitHubClient    generate-jitconfig/list/delete                 selected repo
+  GitHubClient    jitconfig/list/delete + actions runs/jobs/logs  selected repo
   RepoLister      list admin repos (the picker)    MenuContentView  searchable multi-repo picker
-  RunnerInstaller downloads the runner agent
-  Providers       Local + Tart + Windows + factories
-  Orchestrator    start/stop/maintain-N
+  RunnerInstaller downloads the runner agent       DashboardWindowController  optional window (dockless until open)
+  Providers       Local + Tart + Windows + factories  DashboardView  Pulse-style console: runners / history+inline GH logs / live memory
+  Orchestrator    start/stop/maintain-N (+ run-finished events)  OSLogo  custom-SF-Symbol tiles (+ SVGSymbol glyph fallback)
+  RunHistory      RunRecord + on-disk run-history store (~/.mactions/logs)
+  MemorySampler   host (host_statistics64) + per-process RSS (ps) → Memory tab
   WindowsPreflight prereq detect (Fusion + converters + xorriso) + brew installer
   WindowsImage    UUP-dump latest-ISO resolve + build-id auto-update
-  Cleanup, Shell  host hygiene + process helper
+  Cleanup, Shell  host hygiene + process helper        Media.xcassets  staged custom SF Symbols (compile in a real .app)
 
   WindowsVMCLI impl (sole backend):
     VMwareCLI     VMware Fusion via vmrun (driven by the mactions-fusion-vm helper)
