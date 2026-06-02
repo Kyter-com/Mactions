@@ -40,6 +40,24 @@ public func machineRunnerPrefix(host: String = ProcessInfo.processInfo.hostName)
   return "mactions-\(safe.isEmpty ? "mac" : String(safe.prefix(24)))"
 }
 
+/// Deregister every runner registered under `prefix` (default: this machine's
+/// prefix). Used on go-offline teardown AND at go-online: a clean `stop()`
+/// deregisters our ephemeral runners, but a crash/force-quit skips it, leaving a
+/// "ghost" registration (an agent killed before it could self-deregister) that
+/// GitHub only auto-prunes much later. Reaping it at go-online — before any new
+/// runner is provisioned — keeps the runner list clean without waiting on
+/// GitHub. Scoped to our `mactions-<host>` prefix, so it never touches another
+/// Mac's runners. Best-effort: a list/delete failure is swallowed (GitHub's own
+/// ephemeral cleanup is the backstop).
+public func deregisterOrphanRunners(
+  _ controlPlane: RunnerControlPlane, prefix: String = machineRunnerPrefix()
+) async {
+  guard let remote = try? await controlPlane.listRunners() else { return }
+  for runner in remote where runner.name.hasPrefix(prefix) {
+    try? await controlPlane.deleteRunner(id: runner.id)
+  }
+}
+
 /// Owns the lifecycle of N ephemeral runners for one repo.
 ///
 /// The fleet is kept at `desiredCount` by **reconciliation**, not a single
@@ -141,11 +159,7 @@ public final class RunnerOrchestrator {
     // Belt-and-suspenders: ephemeral runners deregister themselves on exit, but
     // a killed agent can leave a ghost. Proactively delete anything still
     // registered under THIS machine's prefix — never another Mac's runners.
-    if let remote = try? await controlPlane.listRunners() {
-      for r in remote where r.name.hasPrefix(machinePrefix) {
-        try? await controlPlane.deleteRunner(id: r.id)
-      }
-    }
+    await deregisterOrphanRunners(controlPlane, prefix: machinePrefix)
     state = .offline
     notify()
   }

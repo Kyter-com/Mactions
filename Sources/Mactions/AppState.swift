@@ -274,6 +274,18 @@ final class AppState: ObservableObject {
       // any provisioning so a stale clone can't survive into this generation.
       await Task.detached { HostCleanup.sweepOrphans() }.value
       guard fleetEpoch == myEpoch else { return }  // went offline during the sweep
+      // sweepOrphans clears local disk/clones + kills orphan agent processes,
+      // but not the *remote* GitHub registration. A clean go-offline runs
+      // stop()'s deregister, but a crash/force-quit skips it, leaving ghost
+      // runners that GitHub only auto-prunes much later. Reap them now — before
+      // provisioning, so every match under this machine's prefix is provably a
+      // prior-session orphan, never a runner from this generation. Per-repo,
+      // best-effort; scoped to our prefix so another Mac's runners are untouched.
+      for repo in repos {
+        guard fleetEpoch == myEpoch else { return }
+        await deregisterOrphanRunners(GitHubClient(owner: repo.owner, repo: repo.name, token: token))
+      }
+      guard fleetEpoch == myEpoch else { return }
       var created: [RunnerOrchestrator] = []
       do {
         let wantsMac = selectedOSes.contains(.macOS)
