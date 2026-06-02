@@ -223,6 +223,96 @@ public enum WindowsImage {
     try? build.write(to: baseImageBuildFile(), atomically: true, encoding: .utf8)
   }
 
+  // MARK: - Provisioning-recipe version + maintenance state (pure → unit-testable)
+
+  /// Provisioning-recipe version the CURRENT build scripts produce. It tracks
+  /// `bootstrap.ps1` (what gets baked into the base): bump it whenever a
+  /// bootstrap change makes an ALREADY-BUILT base functionally stale — e.g. the
+  /// MinGit→PortableGit switch that added `bash` (PR #19). Do NOT bump for
+  /// comment/whitespace-only edits. This MUST equal `PROVISIONING_RECIPE_VERSION`
+  /// in `scripts/prepare-windows-image` — the authority that gets stamped into
+  /// `windows-base.recipe` at build time — and a unit test asserts they match.
+  public static let currentProvisioningRecipeVersion = 2
+
+  /// Where `prepare-windows-image` records the provisioning-recipe version the
+  /// base was built with. A sibling of `windows-base.build`; must survive run
+  /// sweeps (NOT under `runs/`).
+  public static func baseImageRecipeFile() -> URL {
+    HostCleanup.mactionsRoot().appendingPathComponent("windows-base.recipe", isDirectory: false)
+  }
+
+  /// The provisioning-recipe version the current base image was built with, or
+  /// `nil` if none was recorded — either no image yet, or a base built by a
+  /// Mactions that predates recipe-versioning. Callers treat `nil` as STALE:
+  /// those old bases predate the bootstrap changes recipe-versioning exists to
+  /// catch (the bash/PortableGit fix), so they genuinely warrant a rebuild.
+  public static func recordedRecipeVersion() -> Int? {
+    guard let raw = try? String(contentsOf: baseImageRecipeFile(), encoding: .utf8) else {
+      return nil
+    }
+    return Int(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+  }
+
+  /// Why the base image needs a rebuild — or that it doesn't. Pure-computed from
+  /// the recorded OS build + recipe version vs the latest available build + the
+  /// current recipe. Drives the UI banner text and the "rebuild needed" badge.
+  public enum MaintenanceReason: Equatable, Sendable {
+    /// Fresh — no rebuild needed.
+    case upToDate
+    /// A newer Windows 11 ARM64 GA build is available.
+    case osBuildAvailable(latest: String)
+    /// The provisioning recipe was updated since this base was built (e.g. bash
+    /// was added) — same OS build, but the base is functionally outdated.
+    case provisioningOutdated
+    /// Both a newer OS build AND an updated provisioning recipe.
+    case both(latest: String)
+    /// No base image has been built yet.
+    case notBuilt
+
+    /// True iff a rebuild would actually change something worth doing.
+    public var needsRebuild: Bool {
+      switch self {
+      case .upToDate, .notBuilt: return false
+      case .osBuildAvailable, .provisioningOutdated, .both: return true
+      }
+    }
+  }
+
+  /// Decide the base image's maintenance state. `latestBuild` is `nil` when the
+  /// (throttled, networked) OS-build check hasn't run or failed — in that case
+  /// we deliberately do NOT claim an OS update (no false nudges offline), but we
+  /// STILL flag recipe staleness, which is a purely local comparison.
+  public static func maintenanceReason(
+    recordedBuild: String?,
+    recordedRecipe: Int?,
+    latestBuild: String?,
+    currentRecipe: Int = currentProvisioningRecipeVersion
+  ) -> MaintenanceReason {
+    let hasImage = !((recordedBuild?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) ?? true)
+    guard hasImage else { return .notBuilt }
+    let recipeStale = (recordedRecipe ?? 0) < currentRecipe
+    // OS staleness needs the networked `latest`; `nil` ⇒ don't assert an OS
+    // update (avoids false offline nudges). Recipe staleness is purely local.
+    if let latestBuild, updateAvailable(installed: recordedBuild, latest: latestBuild) {
+      return recipeStale ? .both(latest: latestBuild) : .osBuildAvailable(latest: latestBuild)
+    }
+    return recipeStale ? .provisioningOutdated : .upToDate
+  }
+
+  /// A one-line, user-facing nudge for a maintenance reason (`nil` ⇒ no banner).
+  public static func maintenanceNotice(for reason: MaintenanceReason) -> String? {
+    switch reason {
+    case .upToDate, .notBuilt:
+      return nil
+    case let .osBuildAvailable(latest):
+      return "A newer Windows 11 ARM64 build (\(latest)) is available — rebuild to update the base image."
+    case .provisioningOutdated:
+      return "The Windows base image needs maintenance — the runner setup recipe was updated (e.g. Git/bash). Rebuild to apply it."
+    case let .both(latest):
+      return "The Windows base image needs a rebuild: a newer Windows 11 ARM64 build (\(latest)) is available AND the runner setup recipe was updated."
+    }
+  }
+
   // MARK: - ISO-converter dependency check (pure → unit-testable)
 
   /// One ISO-converter dependency: the command the UUP-dump convert script

@@ -251,4 +251,109 @@ final class WindowsImageTests: XCTestCase {
       Set(scriptExcludes), Set(WindowsImage.nonBaseTitleSubstrings),
       "nonBaseTitleSubstrings drifted from the script's EXCLUDE — bump BOTH together")
   }
+
+  // MARK: Maintenance reason (the "does the base need a rebuild, and why?" core)
+
+  private var cur: Int { WindowsImage.currentProvisioningRecipeVersion }
+
+  func testMaintenanceReasonUpToDate() {
+    let r = WindowsImage.maintenanceReason(
+      recordedBuild: "26200.8524", recordedRecipe: cur, latestBuild: "26200.8524")
+    XCTAssertEqual(r, .upToDate)
+    XCTAssertFalse(r.needsRebuild)
+    XCTAssertNil(WindowsImage.maintenanceNotice(for: r))
+  }
+
+  func testMaintenanceReasonOSBuildOnly() {
+    let r = WindowsImage.maintenanceReason(
+      recordedBuild: "26200.8000", recordedRecipe: cur, latestBuild: "26200.8524")
+    XCTAssertEqual(r, .osBuildAvailable(latest: "26200.8524"))
+    XCTAssertTrue(r.needsRebuild)
+    XCTAssertEqual(WindowsImage.maintenanceNotice(for: r)?.contains("26200.8524"), true)
+  }
+
+  func testMaintenanceReasonRecipeOnly() {
+    // Same OS build, older recipe → the NEW dimension this feature adds (e.g. the
+    // base was built before the MinGit→PortableGit/bash bump).
+    let r = WindowsImage.maintenanceReason(
+      recordedBuild: "26200.8524", recordedRecipe: cur - 1, latestBuild: "26200.8524")
+    XCTAssertEqual(r, .provisioningOutdated)
+    XCTAssertTrue(r.needsRebuild)
+  }
+
+  func testMaintenanceReasonBoth() {
+    let r = WindowsImage.maintenanceReason(
+      recordedBuild: "26200.8000", recordedRecipe: cur - 1, latestBuild: "26200.8524")
+    XCTAssertEqual(r, .both(latest: "26200.8524"))
+    XCTAssertTrue(r.needsRebuild)
+  }
+
+  func testMaintenanceReasonNilRecipeIsStale() {
+    // A base built before recipe-versioning (no windows-base.recipe) → treated as
+    // stale, since those predate the bash/PortableGit fix.
+    let r = WindowsImage.maintenanceReason(
+      recordedBuild: "26200.8524", recordedRecipe: nil, latestBuild: "26200.8524")
+    XCTAssertEqual(r, .provisioningOutdated)
+  }
+
+  func testMaintenanceReasonNoNetworkSuppressesOSClaimButNotRecipe() {
+    // latestBuild nil (offline / check not run): never falsely claim an OS update…
+    XCTAssertEqual(
+      WindowsImage.maintenanceReason(
+        recordedBuild: "26200.8000", recordedRecipe: cur, latestBuild: nil),
+      .upToDate)
+    // …but recipe staleness is a local comparison, so it still surfaces.
+    XCTAssertEqual(
+      WindowsImage.maintenanceReason(
+        recordedBuild: "26200.8000", recordedRecipe: cur - 1, latestBuild: nil),
+      .provisioningOutdated)
+  }
+
+  func testMaintenanceReasonNotBuilt() {
+    for build in [nil, "", "   "] as [String?] {
+      let r = WindowsImage.maintenanceReason(
+        recordedBuild: build, recordedRecipe: nil, latestBuild: "26200.8524")
+      XCTAssertEqual(r, .notBuilt)
+      XCTAssertFalse(r.needsRebuild)
+      XCTAssertNil(WindowsImage.maintenanceNotice(for: r))
+    }
+  }
+
+  func testBaseImageRecipeFileLivesAtMactionsRootNotUnderRuns() {
+    let file = WindowsImage.baseImageRecipeFile()
+    XCTAssertEqual(file.lastPathComponent, "windows-base.recipe")
+    XCTAssertEqual(file.deletingLastPathComponent().path, HostCleanup.mactionsRoot().path)
+    XCTAssertFalse(file.path.contains("/runs/"))
+  }
+
+  // MARK: Recipe-version parity (Swift <-> the prepare-windows-image script)
+
+  /// `WindowsImage.currentProvisioningRecipeVersion` (the comparison value) MUST
+  /// equal `PROVISIONING_RECIPE_VERSION` in `scripts/prepare-windows-image` (the
+  /// authority stamped into the base). If they drift, the app either never nudges
+  /// for a real recipe change or nags forever after a rebuild. Same drift-guard
+  /// spirit as the GA-allowlist parity test above.
+  func testRecipeVersionConstantMatchesPrepareScript() {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let scriptURL = repoRoot.appendingPathComponent("scripts/prepare-windows-image")
+    guard let script = try? String(contentsOf: scriptURL, encoding: .utf8) else {
+      return XCTFail("could not read \(scriptURL.path) to check recipe-version parity")
+    }
+    guard
+      let line = script.split(separator: "\n").first(where: {
+        $0.hasPrefix("PROVISIONING_RECIPE_VERSION=")
+      })
+    else {
+      return XCTFail("couldn't locate PROVISIONING_RECIPE_VERSION=<int> in prepare-windows-image")
+    }
+    let raw = String(line.dropFirst("PROVISIONING_RECIPE_VERSION=".count))
+      .trimmingCharacters(in: .whitespaces)
+    guard let scriptVersion = Int(raw) else {
+      return XCTFail("PROVISIONING_RECIPE_VERSION is not an int: \(line)")
+    }
+    XCTAssertEqual(
+      scriptVersion, WindowsImage.currentProvisioningRecipeVersion,
+      "currentProvisioningRecipeVersion drifted from PROVISIONING_RECIPE_VERSION — bump BOTH together")
+  }
 }

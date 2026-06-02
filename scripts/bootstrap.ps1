@@ -2,6 +2,12 @@
   bootstrap.ps1 - runs INSIDE the Windows 11 ARM guest on first logon
   (invoked once by autounattend.xml's FirstLogonCommands, at BUILD time).
 
+  MAINTAINER NOTE: any change here that makes an ALREADY-BUILT base functionally
+  stale (e.g. the MinGit->PortableGit switch that added bash) must bump
+  PROVISIONING_RECIPE_VERSION in prepare-windows-image (mirrored as
+  WindowsImage.currentProvisioningRecipeVersion; a unit test keeps them equal),
+  so the app flags existing bases as needing a rebuild.
+
   Turns a fresh Win11-ARM install into a Mactions runner base image for the
   HEADLESS / OUTBOUND-REGISTRATION model (no inbound SSH, no guest IP discovery):
     1. Download + extract the LATEST win-arm64 actions-runner agent to
