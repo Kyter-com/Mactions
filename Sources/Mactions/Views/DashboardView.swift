@@ -13,13 +13,23 @@ import SwiftUI
 /// Mac UI never stutters while logs load or memory samples.
 struct DashboardView: View {
   @EnvironmentObject private var app: AppState
-  @State private var tab: Tab = .runners
+  @State private var tab: Tab? = .setup
 
   enum Tab: String, CaseIterable, Identifiable {
+    case setup = "Setup"
     case runners = "Runners"
     case history = "History"
     case memory = "Memory"
     var id: String { rawValue }
+
+    var systemImage: String {
+      switch self {
+      case .setup: return "gearshape"
+      case .runners: return "bolt.horizontal"
+      case .history: return "clock.arrow.circlepath"
+      case .memory: return "memorychip"
+      }
+    }
   }
 
   var body: some View {
@@ -28,24 +38,26 @@ struct DashboardView: View {
       Divider()
       CapacityStrip()
       Divider()
-      Picker("View", selection: $tab) {
-        ForEach(Tab.allCases) { Text($0.rawValue).tag($0) }
-      }
-      .pickerStyle(.segmented)
-      .labelsHidden()
-      .padding(.horizontal, 16)
-      .padding(.vertical, 10)
-
-      Group {
-        switch tab {
-        case .runners: RunnersPane()
-        case .history: HistoryPane()
-        case .memory: MemoryPane()
+      // Rune-style left sidebar: pick a pane on the left, it fills the detail.
+      NavigationSplitView {
+        List(Tab.allCases, selection: $tab) { item in
+          Label(item.rawValue, systemImage: item.systemImage).tag(item)
         }
+        .listStyle(.sidebar)
+        .navigationSplitViewColumnWidth(min: 160, ideal: 180, max: 240)
+      } detail: {
+        Group {
+          switch tab ?? .setup {
+          case .setup: SetupPane()
+          case .runners: RunnersPane()
+          case .history: HistoryPane()
+          case .memory: MemoryPane()
+          }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
       }
-      .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
-    .frame(minWidth: 720, minHeight: 460)
+    .frame(minWidth: 820, minHeight: 560)
     .onAppear { app.refreshWindowsPerVMGB() }
     // Live memory sampling is started/stopped by DashboardWindowController as the
     // window opens/closes — deterministic across the reused window, unlike a
@@ -86,7 +98,7 @@ private struct DashboardHeader: View {
           || app.state == .starting || app.state == .stopping)
       .help(
         app.selectedRepos.isEmpty
-          ? "Pick at least one repository in the menu bar first."
+          ? "Pick at least one repository in Setup first."
           : "Bring the configured runner fleet online / offline.")
     }
     .padding(.horizontal, 16).padding(.vertical, 12)
@@ -673,17 +685,6 @@ private struct ConclusionBadge: View {
   }
 }
 
-private struct Badge: View {
-  let label: String
-  let color: Color
-  var body: some View {
-    Text(label)
-      .font(.system(size: 10, weight: .semibold)).foregroundStyle(color)
-      .padding(.horizontal, 7).padding(.vertical, 2)
-      .liquidGlassTinted(color, in: Capsule())
-  }
-}
-
 private struct DashboardEmptyState: View {
   let systemImage: String
   let title: String
@@ -781,19 +782,5 @@ extension View {
     } else {
       self.buttonStyle(.bordered)
     }
-  }
-}
-
-/// Groups nested Liquid Glass effects so they batch + can morph together (Apple's
-/// guidance: always wrap multiple `.glassEffect` views in a container). Passes
-/// content through unchanged on < macOS 26.
-@MainActor @ViewBuilder
-private func GlassGroup<Content: View>(
-  spacing: CGFloat = 8, @ViewBuilder _ content: () -> Content
-) -> some View {
-  if #available(macOS 26.0, *) {
-    GlassEffectContainer(spacing: spacing, content: content)
-  } else {
-    content()
   }
 }
