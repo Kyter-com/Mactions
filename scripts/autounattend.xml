@@ -211,8 +211,17 @@
         <HideLocalAccountScreen>true</HideLocalAccountScreen>
         <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
         <ProtectYourPC>3</ProtectYourPC>
-        <SkipMachineOOBE>true</SkipMachineOOBE>
-        <SkipUserOOBE>true</SkipUserOOBE>
+        <!--
+          NO SkipMachineOOBE/SkipUserOOBE. They are DEPRECATED on 24H2/25H2 and Microsoft
+          warns "Don't use the SkipMachineOOBE setting to automate OOBE." Verified live why:
+          windeploy.exe runs both <FirstLogonCommands> AND C:\Windows\Setup\Scripts\SetupComplete.cmd
+          at OOBE-completion — and with Skip*OOBE present, BOTH silently failed to fire on
+          repeated builds (OOBE reached IMAGE_STATE_COMPLETE, the runner auto-logged-on, but
+          neither launcher ran → bootstrap never started). The Hide* settings + the provisioned
+          LocalAccount + AutoLogon are what actually automate OOBE no-touch; Skip*OOBE only made
+          the post-OOBE launchers fire non-deterministically. Removing them lets windeploy run
+          FirstLogonCommands + SetupComplete.cmd reliably.
+        -->
       </OOBE>
       <FirstLogonCommands>
         <!--
