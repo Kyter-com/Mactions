@@ -66,26 +66,53 @@ public final class LocalProcessProvider: RunnerProvider, @unchecked Sendable {
     // the whole point of "separate PC every time".)
     let jobHome = runDirectory.appendingPathComponent("_home", isDirectory: true)
     let jobTmp = runDirectory.appendingPathComponent("_tmp", isDirectory: true)
-    // macOS `security` persists the per-user keychain search list to
-    // $HOME/Library/Preferences/com.apple.security.plist. With HOME redirected
-    // into the throwaway clone that directory doesn't exist, so
-    // `security list-keychains -s` silently no-ops (rc=0 but nothing persists)
-    // and the search list collapses to empty inside the job. That breaks macOS
-    // code signing: electron-builder (and any tool that imports a cert into a
-    // temp keychain) registers it via list-keychains, then finds no identity
-    // and falls back to an ad-hoc signature that fails notarization — even
-    // though the same CSC_LINK secret signs cleanly on a normal HOME (e.g. a
-    // GitHub-hosted runner). Seeding the dir restores search-list persistence.
+    // macOS `security` derives the per-user keychain search list from $HOME. With
+    // HOME redirected into the throwaway clone, the user's login keychain
+    // (~/Library/Keychains/login.keychain-db) drops out and the list collapses to
+    // just /Library/Keychains/System.keychain — so `security find-identity -v -p
+    // codesigning` returns 0 identities inside the job. That breaks macOS code
+    // signing: electron-builder (even with CSC_LINK) can't resolve a valid Developer
+    // ID identity, nor the leaf's Developer ID intermediate to validate its own temp
+    // CSC keychain, so it falls back to an ad-hoc signature that fails notarization —
+    // even though the same secret signs cleanly on a normal HOME / hosted runner.
+    // (Verified live: System-only / 0 identities under a redirected HOME; the valid
+    // identity reappears the moment the login keychain is back in the search list.)
+    // Note an empty Library/Preferences does NOT fix this — there's usually no
+    // com.apple.security.plist to persist to. We must explicitly point the job's user
+    // search list at the host login keychain + System below.
     let jobKeychainPrefs = jobHome.appendingPathComponent("Library/Preferences", isDirectory: true)
     for dir in [jobHome, jobTmp, jobKeychainPrefs] {
       try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }
     var env = ProcessInfo.processInfo.environment
+    let realHome = env["HOME"]
     env["HOME"] = jobHome.path
     env["npm_config_cache"] = jobHome.appendingPathComponent(".npm").path
     env["RUNNER_TOOL_CACHE"] = runDirectory.appendingPathComponent("_tool").path
     env["XDG_CACHE_HOME"] = jobHome.appendingPathComponent(".cache").path
     env["TMPDIR"] = jobTmp.path
+
+    // Restore the keychain search list the HOME redirect collapsed: set the job's
+    // *user* search list (persisted to jobHome/Library/Preferences) to the host
+    // login keychain + System. Run with HOME already pointed at jobHome so it writes
+    // into the clone, never the user's real search list. This restores identity
+    // auto-discovery AND lets electron-builder's temp CSC keychain chain up to the
+    // Developer ID intermediate; electron-builder's own temp keychain (CSC_LINK +
+    // set-key-partition-list) still owns the signing key, so no interactive prompts.
+    if let realHome {
+      let loginKeychain = "\(realHome)/Library/Keychains/login.keychain-db"
+      if FileManager.default.fileExists(atPath: loginKeychain) {
+        let seed = Process()
+        seed.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        seed.arguments = [
+          "list-keychains", "-d", "user", "-s",
+          loginKeychain, "/Library/Keychains/System.keychain",
+        ]
+        seed.environment = env  // HOME == jobHome → the list persists into the clone
+        try? seed.run()
+        seed.waitUntilExit()
+      }
+    }
 
     let process = Process()
     process.executableURL = runDirectory.appendingPathComponent("run.sh")
