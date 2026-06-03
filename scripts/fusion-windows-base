@@ -121,7 +121,17 @@ restore_backup() {
 }
 # Restore the prior base on ANY non-zero exit (die, set -e abort, signal) once the
 # backup exists. Success deletes the backup explicitly + exits 0 → no restore.
-on_exit() { local rc=$?; if [[ $rc -ne 0 ]]; then restore_backup; fi; }
+# MACTIONS_KEEP_FAILED=1 leaves the failed disk in place instead (for post-mortems —
+# offline-mount it to read C:\setup\logs\bootstrap.log / C:\Windows\Panther).
+on_exit() {
+  local rc=$?
+  [[ $rc -ne 0 ]] || return 0
+  if [[ -n "${MACTIONS_KEEP_FAILED:-}" ]]; then
+    echo "==> MACTIONS_KEEP_FAILED set — NOT restoring; failed disk kept at ${FUSION_DIR}/${NAME}.vmdk (prior base backed up at ${BACKUP_DIR})." >&2
+  else
+    restore_backup
+  fi
+}
 trap on_exit EXIT
 
 if [[ -f "$VMX" ]]; then
@@ -257,12 +267,17 @@ while vmrun_list_contains "$VMX"; do
       *exist*)         TOOLS_UP=1 ;;   # Tools answered (sentinel not there yet) — bootstrap is running
     esac
   fi
-  # Fast-fail a wedged OOBE handoff: if Tools NEVER come up, the guest never reached
-  # bootstrap.ps1 (stuck in Windows Setup/OOBE). Fail with an actionable, retryable
-  # message instead of silently burning the full INSTALL_TIMEOUT.
+  # Fast-fail when VMware Tools never come up: bootstrap.ps1 (which installs Tools) never
+  # ran. Note this is NOT necessarily an OOBE stall — on 24H2/25H2 OOBE often COMPLETES
+  # (AutoLogon works) yet the fragile FirstLogonCommands trigger doesn't fire, so bootstrap
+  # never launches (verified live by mounting a stalled disk). autounattend.xml now also
+  # launches bootstrap via a specialize-pass RunOnce, which is far more reliable, so this
+  # should be rare. To diagnose if it recurs: set MACTIONS_KEEP_FAILED=1 to keep the disk,
+  # then offline-mount it (qemu-img convert -O raw; hdiutil attach -readonly) and check for
+  # C:\setup\logs\bootstrap.log (did bootstrap run?) and C:\Windows\Panther\UnattendGC.
   if [[ $TOOLS_UP -eq 0 && $ELAPSED -ge $TOOLS_TIMEOUT_SECS ]]; then
     "$VMRUN" -T fusion stop "$VMX" hard >/dev/null 2>&1 || true
-    die "guest stuck after ${ELAPSED}s — VMware Tools never came up, so the unattended Windows Setup/OOBE handoff (autounattend.xml) never reached bootstrap.ps1. This is the flaky Win11-ARM OOBE handoff, not your Mac or config; it is safe to retry (a fresh boot usually clears it). If it recurs, boot $VMX in Fusion to read the OOBE screen."
+    die "guest stuck after ${ELAPSED}s — VMware Tools never came up, so bootstrap.ps1 never ran. OOBE may well have completed; the more likely cause is the FirstLogon launch not firing (now mitigated by a RunOnce launcher in autounattend.xml). Safe to retry. To diagnose: MACTIONS_KEEP_FAILED=1 then offline-mount the disk and check for C:\\setup\\logs\\bootstrap.log."
   fi
   if [[ $((NOW - LAST)) -ge 30 ]]; then
     printf '    [%4ds] still running (provisioned=%s tools_up=%s)...\n' "$ELAPSED" "$PROVISIONED" "$TOOLS_UP"; LAST="$NOW"
