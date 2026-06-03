@@ -472,6 +472,16 @@ struct SetupPane: View {
           .font(.system(size: 9))
           .foregroundStyle(.tertiary)
           .fixedSize(horizontal: false, vertical: true)
+        // A wedged OOBE build otherwise has no in-app stop. Cancel powers off the
+        // build VM cleanly (the script restores the prior base + tidies up).
+        HStack {
+          Spacer(minLength: 0)
+          Button(role: .cancel) { app.cancelWindowsSetup() } label: {
+            Text("Cancel build").font(.system(size: 10))
+          }
+          .controlSize(.small)
+        }
+        .padding(.top, 2)
       }
       .padding(8)
       .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))

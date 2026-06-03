@@ -126,7 +126,7 @@ public enum WindowsPreflight {
   static let brewCandidatePaths = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
   /// VMware Fusion's `vmrun` — inside the .app bundle (not on PATH). Its presence
   /// is the "Fusion installed" signal; Fusion is a manual Broadcom-portal download.
-  static let vmrunPath = "/Applications/VMware Fusion.app/Contents/Library/vmrun"
+  public static let vmrunPath = "/Applications/VMware Fusion.app/Contents/Library/vmrun"
 
   /// Scan the host for all Windows-runner prerequisites. The probe closures are
   /// injectable so the pure assembly (`makeReport`) can be unit-tested without

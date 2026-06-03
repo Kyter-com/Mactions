@@ -109,12 +109,14 @@ public enum WindowsSetupProgress {
     return nil
   }
 
-  /// Heuristic: did a FAILED base build die from an EXTERNAL/transient cause — an
-  /// upstream host being down (UUP dump returning 5xx/522) or a network blip —
-  /// rather than anything wrong with the user's Mac or configuration? Drives a
-  /// "not your setup — safe to retry" hint after a failed build. Pure → testable.
-  /// Conservative: matches only clear network/upstream markers, so a genuine
-  /// LOCAL failure (a missing tool, VMware Fusion absent) is NOT mislabeled.
+  /// Heuristic: did a FAILED base build die from a TRANSIENT cause that's safe to
+  /// retry and NOT the user's fault — an upstream host being down (UUP dump 5xx/522)
+  /// or a network blip, OR the flaky Win11-ARM OOBE handoff stalling (the guest never
+  /// reached bootstrap, so VMware Tools never came up). Both are non-deterministic and
+  /// a fresh attempt usually clears them. Drives a "not your setup — safe to retry"
+  /// banner after a failed build. Pure → testable. Conservative: matches only clear
+  /// transient markers, so a genuine LOCAL/config failure (a missing tool, VMware
+  /// Fusion absent, the new git/bash/pwsh verification) is NOT mislabeled.
   public static func isLikelyTransientFailure(_ output: String) -> Bool {
     let s = output.lowercased()
     let markers = [
@@ -124,6 +126,9 @@ public enum WindowsSetupProgress {
       "download aborted", "couldn't reach", "couldn't download the uup",
       "rate-limited", "could not resolve host", "network is unreachable",
       "connection refused", "connection reset", "operation timed out",
+      // The flaky Win11-ARM OOBE handoff stalling (fusion-windows-base's Tools-up
+      // watchdog fast-fails it) — non-deterministic, safe to retry, not the user's config.
+      "tools never came up", "oobe handoff", "guest stuck after",
     ]
     return markers.contains { s.contains($0) }
   }

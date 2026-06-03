@@ -115,11 +115,17 @@ final class WindowsSetupProgressTests: XCTestCase {
       "error: ISO conversion failed after 3 attempts (see output above)."))
     XCTAssertTrue(WindowsSetupProgress.isLikelyTransientFailure("couldn't reach the UUP dump API after retries"))
     XCTAssertTrue(WindowsSetupProgress.isLikelyTransientFailure("curl: (6) Could not resolve host: api.uupdump.net"))
+    // The flaky OOBE handoff stall (fusion-windows-base's Tools-up watchdog): safe to retry.
+    XCTAssertTrue(WindowsSetupProgress.isLikelyTransientFailure(
+      "error: guest stuck after 2400s — VMware Tools never came up, so the unattended Windows Setup/OOBE handoff (autounattend.xml) never reached bootstrap.ps1. This is the flaky Win11-ARM OOBE handoff, not your Mac or config; it is safe to retry."))
     // Genuine LOCAL failures: must read as NOT transient.
     XCTAssertFalse(WindowsSetupProgress.isLikelyTransientFailure(
       "VMware Fusion isn't installed. Get it free from the Broadcom portal, then try again."))
     XCTAssertFalse(WindowsSetupProgress.isLikelyTransientFailure("auto-download needs these tools first: aria2"))
     XCTAssertFalse(WindowsSetupProgress.isLikelyTransientFailure("converter finished but produced no ISO in /tmp"))
+    // The new git/bash/pwsh verification failure is LOCAL (a broken build), NOT transient.
+    XCTAssertFalse(WindowsSetupProgress.isLikelyTransientFailure(
+      "REQUIRED runner tools missing after provisioning: git (C:\\Git\\cmd\\git.exe)"))
   }
 }
 

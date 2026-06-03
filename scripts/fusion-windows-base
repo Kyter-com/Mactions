@@ -54,7 +54,13 @@ TOOLS_ISO="${TOOLS_ISO:-${VMWARE_LIB}/isoimages/arm64/windows.iso}"
 DISK_GB="${DISK_GB:-64}"
 RAM_MB="${RAM_MB:-8192}"
 CPUS="${CPUS:-4}"
-INSTALL_TIMEOUT_SECS="${INSTALL_TIMEOUT_SECS:-$((90 * 60))}"  # 90 min cap (typical 25-40)
+INSTALL_TIMEOUT_SECS="${INSTALL_TIMEOUT_SECS:-$((90 * 60))}"  # 90 min hard cap (typical 25-40)
+# Fast-fail watchdog: on a healthy build VMware Tools come up mid-bootstrap (well
+# under ~25 min). If they NEVER initialize by here, the guest is wedged in the
+# unattended Setup/OOBE handoff and never reached bootstrap.ps1 — don't burn the
+# full 90 min on a stall the guest can't recover from. 40 min leaves comfortable
+# margin over a slow-but-healthy install while still failing ~50 min sooner.
+TOOLS_TIMEOUT_SECS="${TOOLS_TIMEOUT_SECS:-$((40 * 60))}"
 
 # --- preflight ----------------------------------------------------------------
 die() { echo "error: $*" >&2; exit 1; }
@@ -225,6 +231,7 @@ GUEST_USER="runner"
 GUEST_PW="${MACTIONS_GUEST_PW:-P@ssw0rd-throwaway}"   # matches autounattend.xml (throwaway)
 SENTINEL='C:\actions-runner\.mactions-provisioned'
 PROVISIONED=0
+TOOLS_UP=0   # set once a guest-ops call succeeds (VMware Tools running → guest reached bootstrap)
 
 START="$(date +%s)"
 LAST=0
@@ -240,13 +247,25 @@ while vmrun_list_contains "$VMX"; do
     die "install timeout (${INSTALL_TIMEOUT_SECS}s) — never reached the provisioning sentinel. Guest log (if captured): ${MACTIONS_ROOT}/logs/base-build-bootstrap-timeout.log; else boot the VM in Fusion or read $FUSION_DIR/vmware.log."
   fi
   if [[ $PROVISIONED -eq 0 ]]; then
+    # One guest-ops probe serves two purposes: detect the sentinel, AND detect that
+    # Tools are up at all. vmrun prints "...file exists." / "...does not exist." once
+    # Tools answer; it errors (suppressed) with TOOLS_NOT_RUNNING while they're down,
+    # leaving $out empty. So any "exist" in $out ⇒ Tools came up ⇒ guest reached bootstrap.
     out="$("$VMRUN" -T fusion -gu "$GUEST_USER" -gp "$GUEST_PW" fileExistsInGuest "$VMX" "$SENTINEL" 2>/dev/null || true)"
     case "$out" in
-      *"file exists"*) PROVISIONED=1; echo "    [${ELAPSED}s] provisioning sentinel present — bootstrap completed" ;;
+      *"file exists"*) PROVISIONED=1; TOOLS_UP=1; echo "    [${ELAPSED}s] provisioning sentinel present — bootstrap completed" ;;
+      *exist*)         TOOLS_UP=1 ;;   # Tools answered (sentinel not there yet) — bootstrap is running
     esac
   fi
+  # Fast-fail a wedged OOBE handoff: if Tools NEVER come up, the guest never reached
+  # bootstrap.ps1 (stuck in Windows Setup/OOBE). Fail with an actionable, retryable
+  # message instead of silently burning the full INSTALL_TIMEOUT.
+  if [[ $TOOLS_UP -eq 0 && $ELAPSED -ge $TOOLS_TIMEOUT_SECS ]]; then
+    "$VMRUN" -T fusion stop "$VMX" hard >/dev/null 2>&1 || true
+    die "guest stuck after ${ELAPSED}s — VMware Tools never came up, so the unattended Windows Setup/OOBE handoff (autounattend.xml) never reached bootstrap.ps1. This is the flaky Win11-ARM OOBE handoff, not your Mac or config; it is safe to retry (a fresh boot usually clears it). If it recurs, boot $VMX in Fusion to read the OOBE screen."
+  fi
   if [[ $((NOW - LAST)) -ge 30 ]]; then
-    printf '    [%4ds] still running (provisioned=%s)...\n' "$ELAPSED" "$PROVISIONED"; LAST="$NOW"
+    printf '    [%4ds] still running (provisioned=%s tools_up=%s)...\n' "$ELAPSED" "$PROVISIONED" "$TOOLS_UP"; LAST="$NOW"
   fi
   # 10s cadence (was 15) so bootstrap's 60s pre-shutdown window gives ~6 sentinel
   # polls — one slow/failed guest-ops call then can't false-negative and make us
