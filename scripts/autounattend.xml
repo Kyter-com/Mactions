@@ -28,10 +28,11 @@
                processorArchitecture="arm64"
                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
-      <InputLocale>en-US</InputLocale>
+      <InputLocale>0409:00000409</InputLocale>
       <SystemLocale>en-US</SystemLocale>
       <UILanguage>en-US</UILanguage>
       <UserLocale>en-US</UserLocale>
+      <UILanguageFallback>en-US</UILanguageFallback>
     </component>
     <component name="Microsoft-Windows-Setup"
                processorArchitecture="arm64"
@@ -131,7 +132,19 @@
         -->
         <RunSynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <Path>reg add HKLM\SYSTEM\CurrentControlSet\Control\OOBE /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+          <!--
+            Skip the "Let's connect you to a network" OOBE gate. CRITICAL: OOBE reads
+            BypassNRO ONLY from HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE —
+            the old SYSTEM\CurrentControlSet\Control\OOBE path (used here previously)
+            is a NO-OP, so this never actually skipped the gate. On a headless base
+            build the vmxnet3 NIC has no driver until VMware Tools installs at first
+            logon (AFTER OOBE), so OOBE always hits the network stage with no link;
+            with BypassNRO now honored it takes the offline path deterministically
+            instead of racing (the root cause of the intermittent OOBE hang).
+            (MS removed bypassnro.cmd in 24H2 but the registry VALUE still works on
+            26200-class builds; belt-and-suspenders alongside the LocalAccount below.)
+          -->
+          <Path>reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
         </RunSynchronousCommand>
         <!--
           Stage bootstrap.ps1 onto C:\setup\ from whichever removable drive holds
@@ -160,10 +173,11 @@
     <component name="Microsoft-Windows-International-Core"
                processorArchitecture="arm64"
                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <InputLocale>en-US</InputLocale>
+      <InputLocale>0409:00000409</InputLocale>
       <SystemLocale>en-US</SystemLocale>
       <UILanguage>en-US</UILanguage>
       <UserLocale>en-US</UserLocale>
+      <UILanguageFallback>en-US</UILanguageFallback>
     </component>
     <component name="Microsoft-Windows-Shell-Setup"
                processorArchitecture="arm64"
