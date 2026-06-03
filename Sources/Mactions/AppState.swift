@@ -54,6 +54,9 @@ final class AppState: ObservableObject {
   /// local one, so the UI can frame + tint it accordingly.
   @Published var windowsSetupFailure: String?
   @Published var windowsSetupFailureIsExternal = false
+  /// Set by `cancelWindowsSetup()` so the result handler frames the (expected)
+  /// "powered off without sentinel" script failure as a user cancel, not an error.
+  private var windowsSetupCancelled = false
   /// Latest prerequisite scan (Homebrew, hypervisor, converter tools). Drives the
   /// preflight checklist; refreshed when the Windows section appears + after an
   /// install. `nil` until the first scan.
@@ -542,6 +545,7 @@ final class AppState: ObservableObject {
     windowsSetupStep = .prerequisites
     windowsSetupDetail = nil
     windowsSetupFailure = nil  // a fresh attempt clears the last failure banner
+    windowsSetupCancelled = false  // …and any prior cancel
     statusMessage = "Checking Windows prerequisites…"
     Task {
       // 1) Install missing FREE deps (off the main actor — it may shell out).
@@ -600,6 +604,17 @@ final class AppState: ObservableObject {
           "exit=\(result.map { String($0.status) } ?? "nil (could not launch)")\n\n"
           + "=== stdout ===\n\(result?.stdout ?? "")\n\n=== stderr ===\n\(result?.stderr ?? "")\n")
       endWindowsSetup()
+      // User cancelled (powered off the build VM): the script fails with a
+      // "powered off without sentinel" error, but that's expected — don't show it
+      // as a failure. Cancel left the host clean (fusion-windows-base's teardown ran).
+      if windowsSetupCancelled {
+        windowsSetupCancelled = false
+        windowsSetupFailure = nil
+        windowsImageReady = false
+        saveConfig()
+        statusMessage = "Windows setup cancelled. The base image is unchanged — re-run Rebuild when ready."
+        return
+      }
       if let result, result.ok {
         // Exit 0 means the prep RAN, not that a bootable base VM exists — the
         // unattended OS install + bootstrap happen on the first headless boot.
@@ -643,11 +658,11 @@ final class AppState: ObservableObject {
         windowsSetupFailureIsExternal = transient
         windowsSetupFailure =
           transient
-          ? "The last rebuild couldn't reach an external service (UUP dump / network) — not a problem with your Mac or setup. It's safe to retry; the download resumes where it left off. (\(detail))"
+          ? "The last rebuild hit a transient issue (an upstream service / network blip, or the flaky Win11 OOBE handoff stalling) — not a problem with your Mac or setup. It's safe to retry. (\(detail))"
           : "The last rebuild failed: \(detail)."
         statusMessage =
           (transient
-            ? "Windows rebuild hit a network/upstream issue — safe to retry."
+            ? "Windows rebuild hit a transient issue — safe to retry."
             : "Windows setup failed: \(detail)")
           + (buildLog.map { " Log: \($0)" } ?? "")
       }
@@ -704,6 +719,28 @@ final class AppState: ObservableObject {
     windowsSetupBusy = false
     windowsSetupStep = nil
     windowsSetupDetail = nil
+  }
+
+  /// Abort an in-progress base build from the UI. Powers off the build VM via `vmrun`
+  /// — the same clean teardown `fusion-windows-base` runs on its own timeout: its watch
+  /// loop sees the power-off, takes its failure path (restores the prior base, cleans
+  /// up) and returns, so no processes are orphaned and the host is left as it was. The
+  /// `windowsSetupCancelled` flag makes the result handler report a cancel, not a
+  /// failure. Worth having: a wedged OOBE build otherwise has no in-app stop.
+  func cancelWindowsSetup() {
+    guard windowsSetupBusy, !windowsSetupCancelled else { return }
+    windowsSetupCancelled = true
+    windowsSetupDetail = "Cancelling — powering off the build VM…"
+    let vmx = HostCleanup.mactionsRoot()
+      .appendingPathComponent("fusion", isDirectory: true)
+      .appendingPathComponent("\(windowsBaseImage).vmx").path
+    Task.detached {
+      let p = Process()
+      p.executableURL = URL(fileURLWithPath: WindowsPreflight.vmrunPath)
+      p.arguments = ["-T", "fusion", "stop", vmx, "hard"]
+      try? p.run()
+      p.waitUntilExit()
+    }
   }
 
   /// Toggle an OS tile on/off. No-op while online, for an unimplemented OS
