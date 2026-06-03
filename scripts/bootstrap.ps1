@@ -191,7 +191,12 @@ try {
     $gitDir = 'C:\Git'
     $gitSfx = Join-Path $env:TEMP 'portablegit-arm64.7z.exe'
     if (Test-Path $gitSfx) { Remove-Item $gitSfx -Force }
-    Invoke-WebRequest -Uri $gitAsset.browser_download_url -OutFile $gitSfx -UseBasicParsing
+    # Retry the download — git+bash are REQUIRED (verified before the sentinel below),
+    # so a transient blip here must not silently skip Git and produce a base that fails
+    # `actions/checkout` (falls back to a slow REST tarball) and every `shell: bash` step.
+    Invoke-WithRetry -What 'PortableGit download' {
+      Invoke-WebRequest -Uri $gitAsset.browser_download_url -OutFile $gitSfx -UseBasicParsing
+    }
     if (Test-Path $gitDir) { Remove-Item $gitDir -Recurse -Force }
     # 7-Zip SFX flags: -y auto-confirms (no prompt, no wait), -o<dir> sets the
     # extraction target (no space after -o). PortableGit then runs its own
@@ -259,7 +264,11 @@ try {
   } else {
     $pwshMsi = Join-Path $env:TEMP 'powershell-arm64.msi'
     if (Test-Path $pwshMsi) { Remove-Item $pwshMsi -Force }
-    Invoke-WebRequest -Uri $pwshAsset.browser_download_url -OutFile $pwshMsi -UseBasicParsing
+    # Retry — pwsh is REQUIRED (verified before the sentinel below): actions like
+    # azure/trusted-signing-action default to `shell: pwsh`, absent in stock Windows.
+    Invoke-WithRetry -What 'PowerShell 7 download' {
+      Invoke-WebRequest -Uri $pwshAsset.browser_download_url -OutFile $pwshMsi -UseBasicParsing
+    }
     # /quiet = no UI (safe headless); ADD_PATH=1 = add %ProgramFiles%\PowerShell\7
     # to the MACHINE PATH; /norestart = never reboot mid-build.
     $proc = Start-Process msiexec.exe -Wait -PassThru -ArgumentList `
@@ -442,6 +451,34 @@ Write-Host ''
 Write-Host '== Bootstrap complete. =='
 Write-Host 'Per job, the host injects the JIT via a config disc; the runner registers'
 Write-Host 'OUTBOUND, runs one job, and the VM powers itself off.'
+
+# Verify the REQUIRED runner tools actually installed before we declare the base
+# provisioned. The Git/7-Zip/pwsh installs above are best-effort (try/catch -> warn)
+# so one transient download failure doesn't abort the whole ~hour build — but a
+# SILENTLY-skipped git/bash/pwsh produces a base that snapshots "provisioned" yet
+# can't run `actions/checkout` (falls back to a slow REST tarball), any `shell: bash`
+# step ("bash: command not found"), or any `shell: pwsh` action. That exact silent
+# failure shipped a broken base once. So gate the sentinel on the tools being present:
+# if any REQUIRED one is missing, power off WITHOUT the sentinel and fusion-windows-base
+# refuses to snapshot (fast, clear failure — re-run the build). 7-Zip stays optional.
+# Literal paths (not $gitDir/$pwshDir — those are scoped inside the install try-blocks
+# above and may be unset if a block threw before assigning them).
+$required = [ordered]@{
+  'git'  = 'C:\Git\cmd\git.exe'
+  'bash' = 'C:\Git\bin\bash.exe'
+  'pwsh' = (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe')
+}
+$missing = @()
+foreach ($name in $required.Keys) {
+  if (-not (Test-Path $required[$name])) { $missing += ("{0} ({1})" -f $name, $required[$name]) }
+}
+if ($missing.Count) {
+  Write-Warning ("REQUIRED runner tools missing after provisioning: {0}. NOT writing the provisioning sentinel; powering off so the base build fails fast (a transient download failure is the usual cause — re-run the base build)." -f ($missing -join '; '))
+  try { Stop-Transcript | Out-Null } catch { }
+  shutdown /s /t 5 /c "Mactions base bootstrap FAILED: missing required tools (git/bash/pwsh)"
+  exit 1
+}
+Write-Host 'Verified required runner tools present: git, bash, pwsh.'
 
 # Provisioning sentinel - written LAST, right before the orderly power-off.
 # fusion-windows-base polls for this via VMware Tools guest-ops and ONLY
