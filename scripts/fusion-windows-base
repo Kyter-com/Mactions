@@ -217,9 +217,14 @@ tools.syncTime = "FALSE"
 tools.upgrade.policy = "manual"
 VMXEOF
 
-# --- boot headless + drive the unattended install ----------------------------
-echo "==> Booting headless for the unattended install (no keypress — no-prompt ISO)"
-"$VMRUN" -T fusion start "$VMX" nogui >/dev/null
+# --- boot + drive the unattended install -------------------------------------
+# Headless by default; MACTIONS_BUILD_GUI=1 shows the VM window in Fusion so an
+# operator can WATCH the install/OOBE/first-logon live (used to diagnose a wedge
+# the offline disk can't fully explain — e.g. a hidden prompt or hang).
+BOOT_MODE=nogui
+[[ -n "${MACTIONS_BUILD_GUI:-}" ]] && BOOT_MODE=gui
+echo "==> Booting ($BOOT_MODE) for the unattended install (no keypress — no-prompt ISO)"
+"$VMRUN" -T fusion start "$VMX" "$BOOT_MODE" >/dev/null
 
 # Confirm it powered on (vmrun start returns after power-on).
 for _ in $(seq 1 30); do vmrun_list_contains "$VMX" && break; sleep 2; done
