@@ -36,6 +36,16 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'   # PS 5.1 IWR progress bar throttles large -OutFile downloads ~10x
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# Single-run guard. At BUILD time this script is launched by TWO independent paths so a
+# single fragile trigger can't leave the base un-provisioned: the specialize-pass RunOnce
+# (the reliable launcher) and the oobeSystem FirstLogonCommands (fragile on Win11 24H2/25H2
+# — verified live: OOBE completed but FirstLogonCommands never fired). If both fire on the
+# same logon, the second must no-op, not double-install. New-Item -ErrorAction Stop is the
+# atomic winner-picker across that race.
+New-Item -ItemType Directory -Force -Path 'C:\setup' | Out-Null
+try { $null = New-Item -ItemType File -Path 'C:\setup\.bootstrap-started' -ErrorAction Stop }
+catch { Write-Host 'bootstrap.ps1 already started by another launcher — exiting to avoid a double-run.'; exit 0 }
+
 $RunnerRoot = 'C:\actions-runner'
 
 # Retry a network operation through transient blips (DNS / connection reset /

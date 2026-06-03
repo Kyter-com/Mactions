@@ -28,11 +28,10 @@
                processorArchitecture="arm64"
                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
-      <InputLocale>0409:00000409</InputLocale>
+      <InputLocale>en-US</InputLocale>
       <SystemLocale>en-US</SystemLocale>
       <UILanguage>en-US</UILanguage>
       <UserLocale>en-US</UserLocale>
-      <UILanguageFallback>en-US</UILanguageFallback>
     </component>
     <component name="Microsoft-Windows-Setup"
                processorArchitecture="arm64"
@@ -132,19 +131,7 @@
         -->
         <RunSynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <!--
-            Skip the "Let's connect you to a network" OOBE gate. CRITICAL: OOBE reads
-            BypassNRO ONLY from HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE —
-            the old SYSTEM\CurrentControlSet\Control\OOBE path (used here previously)
-            is a NO-OP, so this never actually skipped the gate. On a headless base
-            build the vmxnet3 NIC has no driver until VMware Tools installs at first
-            logon (AFTER OOBE), so OOBE always hits the network stage with no link;
-            with BypassNRO now honored it takes the offline path deterministically
-            instead of racing (the root cause of the intermittent OOBE hang).
-            (MS removed bypassnro.cmd in 24H2 but the registry VALUE still works on
-            26200-class builds; belt-and-suspenders alongside the LocalAccount below.)
-          -->
-          <Path>reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+          <Path>reg add HKLM\SYSTEM\CurrentControlSet\Control\OOBE /v BypassNRO /t REG_DWORD /d 1 /f</Path>
         </RunSynchronousCommand>
         <!--
           Stage bootstrap.ps1 onto C:\setup\ from whichever removable drive holds
@@ -155,6 +142,32 @@
         <RunSynchronousCommand wcm:action="add">
           <Order>2</Order>
           <Path>cmd /c md C:\setup 2&gt;nul &amp; for %d in (D E F G H I) do @if exist %d:\setup\bootstrap.ps1 copy /y %d:\setup\bootstrap.ps1 C:\setup\</Path>
+        </RunSynchronousCommand>
+        <!--
+          ROBUST, OOBE-INDEPENDENT bootstrap launch. The oobeSystem FirstLogonCommands
+          trigger is FRAGILE on Win11 24H2/25H2 — verified live by mounting a stalled
+          build's disk: OOBE completed and AutoLogon worked (C:\Users\runner built,
+          IMAGE_STATE_COMPLETE) but FirstLogonCommands silently never fired, so
+          bootstrap.ps1 never ran and the base shipped un-provisioned (no VMware Tools,
+          no runner agent). The specialize pass, by contrast, IS reliably honored (this
+          block + the C:\setup stage above both ran on that same failed build). So launch
+          bootstrap from here, two ways that don't depend on the OOBE FirstLogon trigger:
+            Order 3 — turn UAC off NOW (applied on the post-specialize reboot, before
+                      first logon) so the RunOnce below runs with the autologon'd admin's
+                      FULL token (bootstrap needs elevation; bootstrap also sets this, but
+                      that copy is reboot-gated and too late for RunOnce).
+            Order 4 — a HKLM RunOnce that runs the already-staged C:\setup\bootstrap.ps1
+                      on the first interactive logon. RunOnce self-deletes after it fires;
+                      bootstrap.ps1 self-guards against a double-run if the FirstLogonCommands
+                      below ALSO fires (kept as defense-in-depth).
+        -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\policies\system /v EnableLUA /t REG_DWORD /d 0 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce /v MactionsBootstrap /t REG_SZ /d "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\setup\bootstrap.ps1" /f</Path>
         </RunSynchronousCommand>
       </RunSynchronous>
     </component>
@@ -173,11 +186,10 @@
     <component name="Microsoft-Windows-International-Core"
                processorArchitecture="arm64"
                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <InputLocale>0409:00000409</InputLocale>
+      <InputLocale>en-US</InputLocale>
       <SystemLocale>en-US</SystemLocale>
       <UILanguage>en-US</UILanguage>
       <UserLocale>en-US</UserLocale>
-      <UILanguageFallback>en-US</UILanguageFallback>
     </component>
     <component name="Microsoft-Windows-Shell-Setup"
                processorArchitecture="arm64"
