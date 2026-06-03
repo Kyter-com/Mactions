@@ -233,7 +233,14 @@ public enum WindowsImage {
   /// MUST equal `PROVISIONING_RECIPE_VERSION` in `scripts/prepare-windows-image` —
   /// the authority that gets stamped into `windows-base.recipe` at build time —
   /// and a unit test asserts they match.
-  public static let currentProvisioningRecipeVersion = 3
+  ///
+  /// v4: bootstrap.ps1 now VERIFIES git/bash/pwsh are present before writing the
+  /// provisioning sentinel (and retries their downloads). v3 bases can be silently
+  /// missing those tools — a transient PortableGit download failure was swallowed and
+  /// still snapshotted, shipping a base where `actions/checkout` falls back to a REST
+  /// tarball and every `shell: bash`/`shell: pwsh` step dies. So v3 bases are
+  /// untrustworthy and warrant a rebuild to a verified v4.
+  public static let currentProvisioningRecipeVersion = 4
 
   /// Where `prepare-windows-image` records the provisioning-recipe version the
   /// base was built with. A sibling of `windows-base.build`; must survive run
