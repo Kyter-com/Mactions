@@ -144,30 +144,22 @@
           <Path>cmd /c md C:\setup 2&gt;nul &amp; for %d in (D E F G H I) do @if exist %d:\setup\bootstrap.ps1 copy /y %d:\setup\bootstrap.ps1 C:\setup\</Path>
         </RunSynchronousCommand>
         <!--
-          ROBUST, OOBE-INDEPENDENT bootstrap launch. The oobeSystem FirstLogonCommands
-          trigger is FRAGILE on Win11 24H2/25H2 — verified live by mounting a stalled
-          build's disk: OOBE completed and AutoLogon worked (C:\Users\runner built,
-          IMAGE_STATE_COMPLETE) but FirstLogonCommands silently never fired, so
-          bootstrap.ps1 never ran and the base shipped un-provisioned (no VMware Tools,
-          no runner agent). The specialize pass, by contrast, IS reliably honored (this
-          block + the C:\setup stage above both ran on that same failed build). So launch
-          bootstrap from here, two ways that don't depend on the OOBE FirstLogon trigger:
-            Order 3 — turn UAC off NOW (applied on the post-specialize reboot, before
-                      first logon) so the RunOnce below runs with the autologon'd admin's
-                      FULL token (bootstrap needs elevation; bootstrap also sets this, but
-                      that copy is reboot-gated and too late for RunOnce).
-            Order 4 — a HKLM RunOnce that runs the already-staged C:\setup\bootstrap.ps1
-                      on the first interactive logon. RunOnce self-deletes after it fires;
-                      bootstrap.ps1 self-guards against a double-run if the FirstLogonCommands
-                      below ALSO fires (kept as defense-in-depth).
+          ROBUST bootstrap launch via SetupComplete.cmd. Verified live by mounting stalled
+          builds' disks: OOBE COMPLETES (AutoLogon works, C:\Users\runner built,
+          IMAGE_STATE_COMPLETE) but the oobeSystem <FirstLogonCommands> silently never fires
+          on 24H2/25H2 — and a HKLM RunOnce written here didn't fire either: its reg-add /d
+          value (quoted, with spaces) silently failed to WRITE (a sibling no-quote reg-add in
+          the same block DID apply, and explorer DID run RunOnce processing — the value just
+          wasn't there). So avoid the OOBE FirstLogon/RunOnce triggers AND the reg-add quoting
+          bug entirely: Windows Setup runs C:\Windows\Setup\Scripts\SetupComplete.cmd as SYSTEM
+          AFTER OOBE completes, which is exactly what reliably happens here. Stage it with a
+          quote-free `echo` (the specialize pass + C:\setup stage above are proven to run). It
+          launches the already-staged C:\setup\bootstrap.ps1 as SYSTEM; bootstrap.ps1 self-guards
+          against a double-run if the FirstLogonCommands below ALSO fires (defense-in-depth).
         -->
         <RunSynchronousCommand wcm:action="add">
           <Order>3</Order>
-          <Path>reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\policies\system /v EnableLUA /t REG_DWORD /d 0 /f</Path>
-        </RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add">
-          <Order>4</Order>
-          <Path>reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce /v MactionsBootstrap /t REG_SZ /d "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\setup\bootstrap.ps1" /f</Path>
+          <Path>cmd /c md C:\Windows\Setup\Scripts 2&gt;nul &amp; echo powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\setup\bootstrap.ps1 &gt; C:\Windows\Setup\Scripts\SetupComplete.cmd</Path>
         </RunSynchronousCommand>
       </RunSynchronous>
     </component>
