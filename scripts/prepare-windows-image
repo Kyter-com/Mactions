@@ -147,7 +147,15 @@ RECORDED_BUILD=""
 # v4: bootstrap.ps1 verifies git/bash/pwsh before the sentinel (+ retries their
 # downloads). v3 bases can be silently missing those tools (a swallowed transient
 # download failure still snapshotted), so they warrant a rebuild to a verified v4.
-PROVISIONING_RECIPE_VERSION=4
+# v5: bootstrap.ps1 gains the package picker ($SelectedPackages, injected from
+# MACTIONS_WINDOWS_PACKAGES at ISO-build time): opt-in GitHub-hosted-image
+# parity packages - toolcache entries (node/Python/Go at the versions GitHub's
+# windows-11-arm image ships, installed via their own manifests) and global
+# tools (gh, CMake, .NET 8, Temurin Java, jq+yq). RUNNER_TOOL_CACHE /
+# AGENT_TOOLSDIRECTORY are set machine-wide unconditionally. Selection CHANGES
+# are tracked separately (windows-base.packages); this version only bumps when
+# bootstrap's capabilities change.
+PROVISIONING_RECIPE_VERSION=5
 
 # Fetch a UUP dump URL with backoff, writing the body to OUTFILE. Retries on
 # network errors, HTTP 429 (UUP dump's ~20-25s per-IP throttle), and 5xx; fails
@@ -376,6 +384,33 @@ build_unattend_iso() {
   mkdir -p "$staging/setup"
   cp "$HERE/autounattend.xml" "$staging/autounattend.xml"
   cp "$HERE/bootstrap.ps1"    "$staging/setup/bootstrap.ps1"
+  # Optional packages picked in the Mactions UI ride in via
+  # MACTIONS_WINDOWS_PACKAGES (csv of catalog ids, e.g. "node-24,gh"). Swap the
+  # $SelectedPackages placeholder line in the STAGED copy only - the repo file
+  # always keeps the empty default. Ids are whitelisted to [a-z0-9.-] so nothing
+  # can smuggle quoting into the PowerShell array literal. awk leaves every
+  # other byte alone (incl. the UTF-8 BOM on line 1 - the placeholder is far
+  # below it), preserving the strict BOM+ASCII contract the guest needs.
+  if [[ -n "${MACTIONS_WINDOWS_PACKAGES:-}" ]]; then
+    local pkgline="" id ids=()
+    IFS=',' read -r -a ids <<< "$MACTIONS_WINDOWS_PACKAGES"
+    for id in "${ids[@]}"; do
+      id="${id//[[:space:]]/}"
+      [[ -z "$id" ]] && continue
+      [[ "$id" =~ ^[a-z0-9][a-z0-9.-]*$ ]] \
+        || die "invalid package id '$id' in MACTIONS_WINDOWS_PACKAGES (lowercase letters, digits, dots, dashes)"
+      pkgline+="${pkgline:+, }'$id'"
+    done
+    if [[ -n "$pkgline" ]]; then
+      echo "==> Baking selected packages into bootstrap: ${MACTIONS_WINDOWS_PACKAGES}" >&2
+      awk -v repl="\$SelectedPackages = @(${pkgline})  # MACTIONS-PACKAGES-LINE (injected by prepare-windows-image)" \
+        '/# MACTIONS-PACKAGES-LINE/ { print repl; next } { print }' \
+        "$staging/setup/bootstrap.ps1" > "$staging/setup/bootstrap.ps1.tmp"
+      mv "$staging/setup/bootstrap.ps1.tmp" "$staging/setup/bootstrap.ps1"
+      grep -q "MACTIONS-PACKAGES-LINE (injected" "$staging/setup/bootstrap.ps1" \
+        || die "package injection failed - the MACTIONS-PACKAGES-LINE anchor is missing from bootstrap.ps1"
+    fi
+  fi
   # -ov + an explicit rm so a re-run is idempotent; without it makehybrid aborts
   # with "already exists" / "Bad file descriptor" when a prior ISO is present.
   rm -f "$out"
@@ -515,6 +550,10 @@ case "$TOOL" in
     # that predates a rebuild-worthy bootstrap change (e.g. the bash/PortableGit fix).
     mkdir -p "$MACTIONS_ROOT"
     printf '%s\n' "$PROVISIONING_RECIPE_VERSION" > "$MACTIONS_ROOT/windows-base.recipe"
+    # Package selection baked into THIS base (csv of catalog ids; empty when none).
+    # The app compares it to the current UI selection to nudge "rebuild to apply"
+    # when the user changes checkboxes after a build.
+    printf '%s\n' "${MACTIONS_WINDOWS_PACKAGES:-}" > "$MACTIONS_ROOT/windows-base.packages"
     rm -rf "$CACHE_ROOT" 2>/dev/null || true
     echo
     echo "==> Fusion base build done. Base lives at ~/.mactions/fusion/$NAME.vmx"

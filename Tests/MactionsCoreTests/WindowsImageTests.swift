@@ -395,4 +395,88 @@ final class WindowsImageTests: XCTestCase {
     XCTAssertNil(WindowsImage.parseBaseHealth(""))
     XCTAssertNil(WindowsImage.parseBaseHealth("no equals signs here\njust words\n"))
   }
+
+  // MARK: Package catalog (the UI picker) + selection plumbing
+
+  /// Catalog ids are the wire format (`MACTIONS_WINDOWS_PACKAGES` csv → a
+  /// PowerShell array literal in the staged bootstrap), so they must be unique
+  /// and match prepare-windows-image's `[a-z0-9][a-z0-9.-]*` whitelist — an id
+  /// outside it would die at ISO-build time.
+  func testPackageCatalogIdsAreUniqueAndWireSafe() {
+    let ids = WindowsImage.packageCatalog.map(\.id)
+    XCTAssertEqual(ids.count, Set(ids).count, "duplicate catalog ids")
+    for id in ids {
+      XCTAssertNotNil(
+        id.range(of: "^[a-z0-9][a-z0-9.-]*$", options: .regularExpression),
+        "catalog id '\(id)' would be rejected by prepare-windows-image's whitelist")
+    }
+  }
+
+  /// Every catalog id must have a matching install path in bootstrap.ps1 (a
+  /// toolcache-catalog key or a switch case — both appear as the quoted id),
+  /// and the injection anchor must exist. Same drift-guard spirit as the
+  /// recipe-version parity test: the app offering a checkbox bootstrap can't
+  /// honor would build a base silently missing it.
+  func testPackageCatalogMatchesBootstrapScript() {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let scriptURL = repoRoot.appendingPathComponent("scripts/bootstrap.ps1")
+    guard let script = try? String(contentsOf: scriptURL, encoding: .utf8) else {
+      return XCTFail("could not read \(scriptURL.path) to check package-catalog parity")
+    }
+    XCTAssertTrue(
+      script.contains("# MACTIONS-PACKAGES-LINE"),
+      "the $SelectedPackages injection anchor is missing from bootstrap.ps1")
+    for pkg in WindowsImage.packageCatalog {
+      XCTAssertTrue(
+        script.contains("'\(pkg.id)'"),
+        "catalog id '\(pkg.id)' has no matching entry in bootstrap.ps1 (toolcache catalog key or switch case)")
+    }
+  }
+
+  func testParsePackageList() {
+    XCTAssertEqual(WindowsImage.parsePackageList("node-24,gh"), ["node-24", "gh"])
+    XCTAssertEqual(WindowsImage.parsePackageList(" node-24 , gh \n"), ["node-24", "gh"])
+    XCTAssertEqual(WindowsImage.parsePackageList("\n"), [])
+    XCTAssertEqual(WindowsImage.parsePackageList(""), [])
+  }
+
+  /// Package staleness: reported only when nothing bigger is stale, since an
+  /// OS/recipe rebuild bakes the current selection anyway.
+  func testMaintenanceReasonPackagesChanged() {
+    // Same recipe, selection drifted from what the base carries → nudge.
+    XCTAssertEqual(
+      WindowsImage.maintenanceReason(
+        recordedBuild: "26200.1", recordedRecipe: 5, latestBuild: nil, currentRecipe: 5,
+        selectedPackages: ["node-24"], recordedPackages: []),
+      .packagesChanged)
+    XCTAssertTrue(WindowsImage.MaintenanceReason.packagesChanged.needsRebuild)
+    // Selection matches → up to date.
+    XCTAssertEqual(
+      WindowsImage.maintenanceReason(
+        recordedBuild: "26200.1", recordedRecipe: 5, latestBuild: nil, currentRecipe: 5,
+        selectedPackages: ["node-24"], recordedPackages: ["node-24"]),
+      .upToDate)
+    // Recipe staleness OUTRANKS packages (one rebuild fixes both).
+    XCTAssertEqual(
+      WindowsImage.maintenanceReason(
+        recordedBuild: "26200.1", recordedRecipe: 4, latestBuild: nil, currentRecipe: 5,
+        selectedPackages: ["node-24"], recordedPackages: []),
+      .provisioningOutdated)
+    // Pre-picker base (nil recorded) + empty selection: no false nudge.
+    XCTAssertEqual(
+      WindowsImage.maintenanceReason(
+        recordedBuild: "26200.1", recordedRecipe: 5, latestBuild: nil, currentRecipe: 5,
+        selectedPackages: [], recordedPackages: nil),
+      .upToDate)
+    // Pre-picker base + a real selection: the user asked for packages the base
+    // doesn't have → nudge.
+    XCTAssertEqual(
+      WindowsImage.maintenanceReason(
+        recordedBuild: "26200.1", recordedRecipe: 5, latestBuild: nil, currentRecipe: 5,
+        selectedPackages: ["gh"], recordedPackages: nil),
+      .packagesChanged)
+    // A notice string exists for the new case.
+    XCTAssertNotNil(WindowsImage.maintenanceNotice(for: .packagesChanged))
+  }
 }

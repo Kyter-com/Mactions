@@ -56,6 +56,13 @@ catch {
 
 $RunnerRoot = 'C:\actions-runner'
 
+# Optional extra packages selected in the Mactions UI (installed in section 0c).
+# prepare-windows-image swaps this LINE in the STAGED copy at ISO-build time
+# (anchored on the marker comment - do not remove it); the repo default stays
+# empty. Ids map 1:1 to WindowsImage.packageCatalog in the app - a unit test
+# keeps the two in lockstep.
+$SelectedPackages = @()  # MACTIONS-PACKAGES-LINE
+
 # Retry a network operation through transient blips (DNS / connection reset /
 # 5xx / a momentary drop) with linear backoff, so a brief network hiccup during
 # the (long) base build doesn't fail the whole image. Throws a clear message only
@@ -151,17 +158,20 @@ if (-not (Test-Outbound)) {
 #     Windows ships only PS 5.1, so we bake pwsh in - the same reasoning that
 #     put bash (via PortableGit) in the base: shells belong in the image.
 #
-# Tools the runner agent itself bootstraps on demand (so we DON'T install):
-#   - Node.js (actions/setup-node downloads the right version per .nvmrc)
-#   - .NET (actions/setup-dotnet)
-#   - Python (actions/setup-python)
+# Everything else from GitHub's hosted windows-11-arm image is OPT-IN via the
+# Mactions UI ($SelectedPackages above): toolcache entries (node/Python/Go -
+# section 0b) and global tools (gh, CMake, .NET, Java, jq/yq - section 0c).
+# Unselected tools still work in workflows via actions/setup-* at job time -
+# the base just stays lean.
 function Install-Msi {
   param([Parameter(Mandatory)][string]$Url,
-        [Parameter(Mandatory)][string]$LocalName)
+        [Parameter(Mandatory)][string]$LocalName,
+        [string[]]$Properties = @())   # extra msiexec PROPERTY=value args (e.g. ADD_CMAKE_TO_PATH=System)
   $tmp = Join-Path $env:TEMP $LocalName
   if (Test-Path $tmp) { Remove-Item $tmp -Force }
   Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing
-  $proc = Start-Process msiexec.exe -ArgumentList '/i', $tmp, '/quiet', '/norestart' -Wait -PassThru
+  $msiArgs = @('/i', $tmp, '/quiet', '/norestart') + $Properties
+  $proc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
   Remove-Item $tmp -Force
   if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
     throw "msiexec /i $LocalName failed with exit code $($proc.ExitCode)"
@@ -313,6 +323,257 @@ try {
   }
 } catch {
   Write-Warning "PowerShell 7 install failed (continuing): $_"
+}
+
+# --- 0b. GitHub-hosted toolcache entries (selected in the Mactions UI) -------
+# Pre-warm C:\hostedtoolcache\windows with tool versions from GitHub's own
+# hosted `windows-11-arm` runner image, installed the SAME way GitHub installs
+# them (this mirrors Install-Toolset.ps1 in actions/runner-images): for each
+# selected entry, read the actions/*-versions manifest, download the matching
+# win32 archive, and run the setup.ps1 each archive embeds - it self-installs
+# into the toolcache and writes the `<arch>.complete` marker that
+# actions/setup-node / -python / -go check before downloading anything.
+#
+# Why: per-job clones are throwaway, so without this EVERY job that uses a
+# setup-* action re-downloads its tool through NAT. Pre-warmed, those actions
+# hit the cache instantly AND resolve the exact versions GitHub's hosted
+# windows-11-arm runners resolve - the same compatibility story. Anything NOT
+# selected still works: setup-* downloads it at job time, just slower.
+#
+# The available ids mirror images/windows/toolsets/toolset-win-11-arm64.json in
+# actions/runner-images as of recipe v5 (2026-06). Python x64 is offered under
+# emulation exactly as GitHub ships it (some wheels are x64-only). When
+# refreshing: re-check that file and bump the recipe version.
+#
+# SELECTED entries are FATAL on failure (after retries): a silently missing one
+# would snapshot a base that LOOKS provisioned but lacks what the user asked
+# for - the same silent-partial-base failure mode the v4 git/bash/pwsh
+# verification closed. Markers are also re-verified before the sentinel below.
+$ToolCacheDir = 'C:\hostedtoolcache\windows'
+New-Item -ItemType Directory -Force -Path $ToolCacheDir | Out-Null
+# Both names, machine-wide, ALWAYS (selection or not): the actions runner reads
+# RUNNER_TOOL_CACHE, the embedded setup.ps1 scripts read AGENT_TOOLSDIRECTORY
+# first, and GitHub's hosted images set both. With nothing pre-warmed, setup-*
+# actions simply populate this dir per job (clone-ephemeral) instead of _work\_tool.
+[Environment]::SetEnvironmentVariable('RUNNER_TOOL_CACHE', $ToolCacheDir, 'Machine')
+[Environment]::SetEnvironmentVariable('AGENT_TOOLSDIRECTORY', $ToolCacheDir, 'Machine')
+$env:RUNNER_TOOL_CACHE = $ToolCacheDir
+$env:AGENT_TOOLSDIRECTORY = $ToolCacheDir
+
+function Install-ToolcacheVersion {
+  param(
+    [Parameter(Mandatory)][object]$Manifest,   # parsed versions-manifest.json (newest-first)
+    [Parameter(Mandatory)][string]$Tool,       # toolcache dir name: 'node' / 'Python' / 'go'
+    [Parameter(Mandatory)][string]$Spec,       # version spec, e.g. '22.*'
+    [Parameter(Mandatory)][string]$Arch        # 'arm64' / 'x64'
+  )
+  # First match = latest matching (the manifest is ordered newest-first). The
+  # [version] cast filters out prerelease tags (e.g. 3.14.0-rc.2) - same filter
+  # GitHub's Install-Toolset.ps1 applies. Exact -eq on arch also excludes the
+  # '-freethreaded' Python variants.
+  $entry = $Manifest |
+    Where-Object { $_.version -like $Spec -and ($_.version -as [version]) } |
+    Select-Object -First 1
+  if (-not $entry) { throw "no $Tool version matching '$Spec' in the versions manifest" }
+  $file = $entry.files |
+    Where-Object { $_.platform -eq 'win32' -and $_.arch -eq $Arch } |
+    Select-Object -First 1
+  if (-not $file) { throw "no win32/$Arch asset for $Tool $($entry.version) in the versions manifest" }
+  Write-Host ("  {0} {1} ({2}): {3}" -f $Tool, $entry.version, $Arch, $file.filename)
+  $zip = Join-Path $env:TEMP $file.filename
+  $dir = Join-Path $env:TEMP ([System.IO.Path]::GetFileNameWithoutExtension($file.filename))
+  if (Test-Path $zip) { Remove-Item $zip -Force }
+  if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+  Invoke-WithRetry -What "$Tool $($entry.version) ($Arch) download" {
+    Invoke-WebRequest -Uri $file.download_url -OutFile $zip -UseBasicParsing
+  }
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $dir)
+  Remove-Item $zip -Force
+  # Each actions/*-versions archive embeds setup.ps1: it installs into
+  # AGENT_TOOLSDIRECTORY (set above) and writes the .complete marker itself.
+  # Run from inside the extracted dir - the script uses relative paths.
+  Push-Location $dir
+  try { & (Join-Path $dir 'setup.ps1') | Out-Null } finally { Pop-Location }
+  Remove-Item $dir -Recurse -Force
+  # Verify the marker the setup script is contracted to write - a tool that
+  # "installed" without it would make setup-* actions re-download anyway.
+  $marker = Join-Path $ToolCacheDir (Join-Path $Tool (Join-Path $entry.version "$Arch.complete"))
+  if (-not (Test-Path $marker)) {
+    throw "$Tool $($entry.version) $Arch setup.ps1 ran but the completion marker is missing: $marker"
+  }
+}
+
+# Every offerable toolcache entry, keyed by the catalog id the UI uses. The
+# matrix mirrors toolset-win-11-arm64.json; the UI shows one checkbox per id.
+$NodeManifestUrl   = 'https://raw.githubusercontent.com/actions/node-versions/main/versions-manifest.json'
+$PythonManifestUrl = 'https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json'
+$GoManifestUrl     = 'https://raw.githubusercontent.com/actions/go-versions/main/versions-manifest.json'
+$toolcacheCatalog = @{
+  'node-22'         = @{ Tool = 'node';   Url = $NodeManifestUrl;   Arch = 'arm64'; Spec = '22.*' }
+  'node-24'         = @{ Tool = 'node';   Url = $NodeManifestUrl;   Arch = 'arm64'; Spec = '24.*' }
+  'python-3.12'     = @{ Tool = 'Python'; Url = $PythonManifestUrl; Arch = 'arm64'; Spec = '3.12.*' }
+  'python-3.13'     = @{ Tool = 'Python'; Url = $PythonManifestUrl; Arch = 'arm64'; Spec = '3.13.*' }
+  'python-3.13-x64' = @{ Tool = 'Python'; Url = $PythonManifestUrl; Arch = 'x64';   Spec = '3.13.*' }
+  'python-3.14'     = @{ Tool = 'Python'; Url = $PythonManifestUrl; Arch = 'arm64'; Spec = '3.14.*' }
+  'go-1.22'         = @{ Tool = 'go';     Url = $GoManifestUrl;     Arch = 'arm64'; Spec = '1.22.*' }
+  'go-1.23'         = @{ Tool = 'go';     Url = $GoManifestUrl;     Arch = 'arm64'; Spec = '1.23.*' }
+  'go-1.24'         = @{ Tool = 'go';     Url = $GoManifestUrl;     Arch = 'arm64'; Spec = '1.24.*' }
+  'go-1.25'         = @{ Tool = 'go';     Url = $GoManifestUrl;     Arch = 'arm64'; Spec = '1.25.*' }
+}
+$selectedToolcache = @($SelectedPackages | Where-Object { $toolcacheCatalog.ContainsKey($_) })
+if ($selectedToolcache.Count) {
+  Write-Host ("Pre-warming the GitHub Actions toolcache ({0} selected)..." -f $selectedToolcache.Count)
+  # Fetch each distinct manifest once, then install every selected entry.
+  $manifests = @{}
+  foreach ($id in $selectedToolcache) {
+    $entry = $toolcacheCatalog[$id]
+    if (-not $manifests.ContainsKey($entry.Url)) {
+      $manifests[$entry.Url] = Invoke-WithRetry -What "$($entry.Tool) versions-manifest fetch" {
+        Invoke-RestMethod $entry.Url -Headers @{ 'User-Agent' = 'mactions' }
+      }
+    }
+    Install-ToolcacheVersion -Manifest $manifests[$entry.Url] -Tool $entry.Tool -Spec $entry.Spec -Arch $entry.Arch
+  }
+  Write-Host 'Toolcache pre-warm complete.'
+}
+
+# --- 0c. Optional tools (selected in the Mactions UI) ------------------------
+# The non-toolcache half of the catalog: CLIs/SDKs GitHub's hosted
+# windows-11-arm image preinstalls globally. One `switch` case per catalog id
+# (the app's WindowsImage.packageCatalog mirrors these; a unit test pins the
+# parity). SELECTED tools are FATAL on failure after retries - same reasoning
+# as the toolcache above - and each registers verify probes in $packageProbes,
+# re-checked before the provisioning sentinel.
+$packageProbes = @{}
+foreach ($pkg in $SelectedPackages) {
+  if ($toolcacheCatalog.ContainsKey($pkg)) { continue }  # handled in section 0b
+  Write-Host "Installing selected tool '$pkg'..."
+  switch ($pkg) {
+    'gh' {
+      # GitHub CLI - native ARM64 MSI from the latest cli/cli release (the MSI
+      # wires up the machine PATH itself).
+      $rel = Invoke-WithRetry -What 'GitHub CLI release lookup' {
+        Invoke-RestMethod 'https://api.github.com/repos/cli/cli/releases/latest' `
+          -Headers @{ 'User-Agent' = 'mactions'; 'Accept' = 'application/vnd.github+json' }
+      }
+      $a = $rel.assets | Where-Object { $_.name -match '^gh_.*_windows_arm64\.msi$' } | Select-Object -First 1
+      if (-not $a) { throw "no windows_arm64 .msi in cli/cli release $($rel.tag_name)" }
+      Invoke-WithRetry -What 'GitHub CLI install' {
+        Install-Msi -Url $a.browser_download_url -LocalName 'gh-arm64.msi'
+      }
+      $packageProbes['gh'] = @(@{ Dir = 'C:\Program Files\GitHub CLI'; File = 'gh.exe' })
+    }
+    'cmake' {
+      # CMake - native ARM64 MSI from the latest Kitware release.
+      # ADD_CMAKE_TO_PATH=System puts cmake on the machine PATH.
+      $rel = Invoke-WithRetry -What 'CMake release lookup' {
+        Invoke-RestMethod 'https://api.github.com/repos/Kitware/CMake/releases/latest' `
+          -Headers @{ 'User-Agent' = 'mactions'; 'Accept' = 'application/vnd.github+json' }
+      }
+      $a = $rel.assets | Where-Object { $_.name -match '^cmake-.*-windows-arm64\.msi$' } | Select-Object -First 1
+      if (-not $a) { throw "no windows-arm64 .msi in CMake release $($rel.tag_name)" }
+      Invoke-WithRetry -What 'CMake install' {
+        Install-Msi -Url $a.browser_download_url -LocalName 'cmake-arm64.msi' -Properties @('ADD_CMAKE_TO_PATH=System')
+      }
+      $packageProbes['cmake'] = @(@{ Dir = 'C:\Program Files\CMake'; File = 'cmake.exe' })
+    }
+    'dotnet-8' {
+      # .NET SDK 8 (LTS), native arm64, via Microsoft's official dotnet-install
+      # script - the same family GitHub preinstalls. DOTNET_ROOT + machine PATH
+      # so both raw `dotnet` calls and actions/setup-dotnet resolve it.
+      $di = Join-Path $env:TEMP 'dotnet-install.ps1'
+      Invoke-WithRetry -What 'dotnet-install.ps1 download' {
+        Invoke-WebRequest 'https://dot.net/v1/dotnet-install.ps1' -OutFile $di -UseBasicParsing
+      }
+      $dotnetDir = Join-Path $env:ProgramFiles 'dotnet'
+      Invoke-WithRetry -What '.NET 8 SDK install' {
+        & $di -Channel '8.0' -Architecture 'arm64' -InstallDir $dotnetDir | Out-Null
+      }
+      Remove-Item $di -Force
+      $machPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+      if ($machPath -notlike "*$dotnetDir*") {
+        [Environment]::SetEnvironmentVariable('Path', $machPath.TrimEnd(';') + ';' + $dotnetDir, 'Machine')
+      }
+      [Environment]::SetEnvironmentVariable('DOTNET_ROOT', $dotnetDir, 'Machine')
+      $packageProbes['dotnet-8'] = @(@{ Dir = $dotnetDir; File = 'dotnet.exe' })
+    }
+    'java-21' {
+      # Temurin JDK 21 (LTS), native windows/aarch64, via the Adoptium API (the
+      # same distribution GitHub's images default to). The MSI features wire up
+      # PATH + JAVA_HOME.
+      $msi = Join-Path $env:TEMP 'temurin-21-arm64.msi'
+      Invoke-WithRetry -What 'Temurin 21 download' {
+        Invoke-WebRequest 'https://api.adoptium.net/v3/installer/latest/21/ga/windows/aarch64/jdk/hotspot/normal/eclipse' `
+          -OutFile $msi -UseBasicParsing
+      }
+      $proc = Start-Process msiexec.exe -Wait -PassThru -ArgumentList `
+        '/i', $msi, '/quiet', '/norestart', 'ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJavaHome'
+      Remove-Item $msi -Force
+      if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) { throw "Temurin 21 MSI failed with exit code $($proc.ExitCode)" }
+      $packageProbes['java-21'] = @(@{ Dir = 'C:\Program Files\Eclipse Adoptium'; File = 'java.exe' })
+    }
+    'java-23' {
+      # Temurin JDK 23 - the second Java GitHub's windows-11-arm image ships.
+      $msi = Join-Path $env:TEMP 'temurin-23-arm64.msi'
+      Invoke-WithRetry -What 'Temurin 23 download' {
+        Invoke-WebRequest 'https://api.adoptium.net/v3/installer/latest/23/ga/windows/aarch64/jdk/hotspot/normal/eclipse' `
+          -OutFile $msi -UseBasicParsing
+      }
+      $proc = Start-Process msiexec.exe -Wait -PassThru -ArgumentList `
+        '/i', $msi, '/quiet', '/norestart', 'ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJavaHome'
+      Remove-Item $msi -Force
+      if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) { throw "Temurin 23 MSI failed with exit code $($proc.ExitCode)" }
+      $packageProbes['java-23'] = @(@{ Dir = 'C:\Program Files\Eclipse Adoptium'; File = 'java.exe' })
+    }
+    'jq-yq' {
+      # jq + yq single-binary CLIs into C:\tools (on PATH). jq ships no
+      # windows-arm64 build - the amd64 .exe runs under emulation, exactly how
+      # GitHub ships x64-only tools on their ARM image. yq is native arm64.
+      $toolsDir = 'C:\tools'
+      New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
+      $rel = Invoke-WithRetry -What 'jq release lookup' {
+        Invoke-RestMethod 'https://api.github.com/repos/jqlang/jq/releases/latest' `
+          -Headers @{ 'User-Agent' = 'mactions'; 'Accept' = 'application/vnd.github+json' }
+      }
+      $a = $rel.assets | Where-Object { $_.name -eq 'jq-windows-amd64.exe' } | Select-Object -First 1
+      if (-not $a) { throw "no jq-windows-amd64.exe in jq release $($rel.tag_name)" }
+      Invoke-WithRetry -What 'jq download' {
+        Invoke-WebRequest $a.browser_download_url -OutFile (Join-Path $toolsDir 'jq.exe') -UseBasicParsing
+      }
+      $rel = Invoke-WithRetry -What 'yq release lookup' {
+        Invoke-RestMethod 'https://api.github.com/repos/mikefarah/yq/releases/latest' `
+          -Headers @{ 'User-Agent' = 'mactions'; 'Accept' = 'application/vnd.github+json' }
+      }
+      $a = $rel.assets | Where-Object { $_.name -eq 'yq_windows_arm64.exe' } | Select-Object -First 1
+      if (-not $a) { throw "no yq_windows_arm64.exe in yq release $($rel.tag_name)" }
+      Invoke-WithRetry -What 'yq download' {
+        Invoke-WebRequest $a.browser_download_url -OutFile (Join-Path $toolsDir 'yq.exe') -UseBasicParsing
+      }
+      $machPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+      if ($machPath -notlike "*$toolsDir*") {
+        [Environment]::SetEnvironmentVariable('Path', $machPath.TrimEnd(';') + ';' + $toolsDir, 'Machine')
+      }
+      $packageProbes['jq-yq'] = @(
+        @{ Dir = $toolsDir; File = 'jq.exe' },
+        @{ Dir = $toolsDir; File = 'yq.exe' }
+      )
+    }
+    default {
+      # Unknown id: the app and this script drifted (or a hand-set env var).
+      # Warn loudly but do not kill the build - the verification below only
+      # gates on what actually has probes.
+      Write-Warning "unknown package id '$pkg' - skipping (app/bootstrap catalog drift?)"
+    }
+  }
+  # Immediate per-tool verification - fail at the tool that broke, not at the end.
+  if ($packageProbes.ContainsKey($pkg)) {
+    foreach ($p in $packageProbes[$pkg]) {
+      $hit = Get-ChildItem -Path $p.Dir -Filter $p.File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+      if (-not $hit) { throw "package '$pkg': $($p.File) not found under $($p.Dir) after install" }
+      Write-Host ("  verified {0}: {1}" -f $pkg, $hit.FullName)
+    }
+  }
 }
 
 # --- 1. win-arm64 actions-runner agent --------------------------------------
@@ -490,13 +751,30 @@ $missing = @()
 foreach ($name in $required.Keys) {
   if (-not (Test-Path $required[$name])) { $missing += ("{0} ({1})" -f $name, $required[$name]) }
 }
+# The selected packages (sections 0b/0c) are fatal inline, so reaching here
+# means they all installed - but re-verify anyway (belt-and-braces, same spirit
+# as the literal paths above): a base missing something the user CHECKED would
+# quietly lose exactly what they asked the rebuild for.
+foreach ($id in $selectedToolcache) {
+  $tc = $toolcacheCatalog[$id]
+  $toolDir = Join-Path $ToolCacheDir $tc.Tool
+  $markers = Get-ChildItem -Path $toolDir -Filter "$($tc.Arch).complete" -Recurse -ErrorAction SilentlyContinue
+  if (-not $markers) { $missing += ("toolcache {0} (no {1}.complete markers under {2})" -f $id, $tc.Arch, $toolDir) }
+}
+foreach ($pkg in $packageProbes.Keys) {
+  foreach ($p in $packageProbes[$pkg]) {
+    $hit = Get-ChildItem -Path $p.Dir -Filter $p.File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $hit) { $missing += ("package {0} ({1} under {2})" -f $pkg, $p.File, $p.Dir) }
+  }
+}
 if ($missing.Count) {
   Write-Warning ("REQUIRED runner tools missing after provisioning: {0}. NOT writing the provisioning sentinel; powering off so the base build fails fast (a transient download failure is the usual cause - re-run the base build)." -f ($missing -join '; '))
   try { Stop-Transcript | Out-Null } catch { }
-  shutdown /s /t 5 /c "Mactions base bootstrap FAILED: missing required tools (git/bash/pwsh)"
+  shutdown /s /t 5 /c "Mactions base bootstrap FAILED: missing required tools (git/bash/pwsh or a selected package)"
   exit 1
 }
-Write-Host 'Verified required runner tools present: git, bash, pwsh.'
+Write-Host ("Verified required runner tools present: git, bash, pwsh{0}." -f $(
+  if ($SelectedPackages.Count) { " + selected packages: " + ($SelectedPackages -join ', ') } else { '' }))
 
 # Provisioning sentinel - written LAST, right before the orderly power-off.
 # fusion-windows-base polls for this via VMware Tools guest-ops and ONLY

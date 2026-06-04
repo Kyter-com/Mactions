@@ -89,17 +89,17 @@ final class WindowsSetupProgressTests: XCTestCase {
     XCTAssertEqual(
       WindowsSetupProgress.detail(for: "    [1500s] still running (provisioned=1 tools_up=1)..."),
       "Provisioning verified — waiting for the guest to power off…")
-    // Past the typical 25–40 min window the tick says so (the "is it stuck?"
+    // Past the typical 30–50 min window the tick says so (the "is it stuck?"
     // moment) — and why waiting is still safe (the script watchdogs a wedge).
     let long = WindowsSetupProgress.detail(
-      for: "    [2760s] still running (provisioned=0 tools_up=1)...")
+      for: "    [3400s] still running (provisioned=0 tools_up=1)...")
     XCTAssertNotNil(long)
-    XCTAssertTrue(long!.contains("46m elapsed"), "got: \(long!)")
+    XCTAssertTrue(long!.contains("56m elapsed"), "got: \(long!)")
     XCTAssertTrue(long!.contains("longer than typical"), "got: \(long!)")
     XCTAssertFalse(
-      WindowsSetupProgress.detail(for: "    [ 742s] still running (provisioned=0 tools_up=1)...")!
+      WindowsSetupProgress.detail(for: "    [2760s] still running (provisioned=0 tools_up=1)...")!
         .contains("longer than typical"),
-      "the over-time hint must not fire inside the typical window")
+      "the over-time hint must not fire inside the typical window (46m is normal in v5)")
     // Exact strings the scripts emit (prepare-windows-image:268 + :461), so a
     // future wording drift in the real markers fails these tests.
     XCTAssertEqual(
