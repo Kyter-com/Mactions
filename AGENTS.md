@@ -231,7 +231,7 @@ Friendly by design — no env vars, no hand-copied long tokens.
 
 ```bash
 swift build          # compiles MactionsCore + the app
-swift test           # 60 unit tests (requests, device-flow guard, repo lister, orchestrator, cleanup, Windows VM command shapes, Windows image build-id/UUP-dump logic, Windows preflight detection + free-first brew-command builder)
+swift test           # 103 unit tests (requests, device-flow guard, repo lister, orchestrator, cleanup, Windows VM command shapes, Windows image build-id/UUP-dump logic, Windows preflight detection + free-first brew-command builder)
 swift run Mactions   # launches the menubar app for dev (look in the menubar)
 ```
 
