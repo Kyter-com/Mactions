@@ -1,4 +1,4 @@
-<#
+﻿<#
   bootstrap.ps1 - runs INSIDE the Windows 11 ARM guest on first logon
   (invoked once by autounattend.xml's FirstLogonCommands, at BUILD time).
 
@@ -39,12 +39,20 @@ $ProgressPreference    = 'SilentlyContinue'   # PS 5.1 IWR progress bar throttle
 # Single-run guard. At BUILD time this script is launched by TWO independent paths so a
 # single fragile trigger can't leave the base un-provisioned: the specialize-pass RunOnce
 # (the reliable launcher) and the oobeSystem FirstLogonCommands (fragile on Win11 24H2/25H2
-# — verified live: OOBE completed but FirstLogonCommands never fired). If both fire on the
+# - verified live: OOBE completed but FirstLogonCommands never fired). If both fire on the
 # same logon, the second must no-op, not double-install. New-Item -ErrorAction Stop is the
 # atomic winner-picker across that race.
 New-Item -ItemType Directory -Force -Path 'C:\setup' | Out-Null
 try { $null = New-Item -ItemType File -Path 'C:\setup\.bootstrap-started' -ErrorAction Stop }
-catch { Write-Host 'bootstrap.ps1 already started by another launcher — exiting to avoid a double-run.'; exit 0 }
+catch {
+  # Only an EXISTING lock means "another launcher won". Any other failure (e.g. access
+  # denied under a non-elevated token) must be loud, not silently read as already-started.
+  if (Test-Path 'C:\setup\.bootstrap-started') {
+    Write-Host 'bootstrap.ps1 already started by another launcher - exiting to avoid a double-run.'
+    exit 0
+  }
+  throw
+}
 
 $RunnerRoot = 'C:\actions-runner'
 
@@ -140,7 +148,7 @@ if (-not (Test-Outbound)) {
 #   - 7-Zip: common need for archive actions; also a fast unzip path.
 #   - PowerShell 7 (pwsh): the default Windows-runner shell since 2019; many
 #     actions hard-require `shell: pwsh` (e.g. azure/trusted-signing-action).
-#     Windows ships only PS 5.1, so we bake pwsh in — the same reasoning that
+#     Windows ships only PS 5.1, so we bake pwsh in - the same reasoning that
 #     put bash (via PortableGit) in the base: shells belong in the image.
 #
 # Tools the runner agent itself bootstraps on demand (so we DON'T install):
@@ -201,7 +209,7 @@ try {
     $gitDir = 'C:\Git'
     $gitSfx = Join-Path $env:TEMP 'portablegit-arm64.7z.exe'
     if (Test-Path $gitSfx) { Remove-Item $gitSfx -Force }
-    # Retry the download — git+bash are REQUIRED (verified before the sentinel below),
+    # Retry the download - git+bash are REQUIRED (verified before the sentinel below),
     # so a transient blip here must not silently skip Git and produce a base that fails
     # `actions/checkout` (falls back to a slow REST tarball) and every `shell: bash` step.
     Invoke-WithRetry -What 'PortableGit download' {
@@ -240,13 +248,13 @@ try {
 # Inno's /VERYSILENT). There's no "latest" URL alias, so the version is pinned
 # and must be bumped manually (check https://www.7-zip.org/download.html).
 # Non-fatal: the try/catch lets the runner come up without it.
-$SevenZipUrl = 'https://www.7-zip.org/a/7z2601-arm64.exe'   # MANUAL pin (no "latest" alias) — bump at https://www.7-zip.org/download.html
+$SevenZipUrl = 'https://www.7-zip.org/a/7z2601-arm64.exe'   # MANUAL pin (no "latest" alias) - bump at https://www.7-zip.org/download.html
 Write-Host 'Installing 7-Zip (ARM64)...'
 try {
   Install-Exe -Url $SevenZipUrl -LocalName '7z-arm64.exe' -Args @('/S')
 } catch {
   # Non-fatal: the runner comes up without 7-Zip. The pinned version can 404 once
-  # 7-Zip ships a newer ARM64 build — say so explicitly so it's obvious the base
+  # 7-Zip ships a newer ARM64 build - say so explicitly so it's obvious the base
   # is missing 7-Zip (and which URL to bump) rather than a silent omission.
   Write-Warning "7-Zip install skipped (continuing without it): $SevenZipUrl failed - $_. If this is a 404, bump the pinned version in bootstrap.ps1."
 }
@@ -274,7 +282,7 @@ try {
   } else {
     $pwshMsi = Join-Path $env:TEMP 'powershell-arm64.msi'
     if (Test-Path $pwshMsi) { Remove-Item $pwshMsi -Force }
-    # Retry — pwsh is REQUIRED (verified before the sentinel below): actions like
+    # Retry - pwsh is REQUIRED (verified before the sentinel below): actions like
     # azure/trusted-signing-action default to `shell: pwsh`, absent in stock Windows.
     Invoke-WithRetry -What 'PowerShell 7 download' {
       Invoke-WebRequest -Uri $pwshAsset.browser_download_url -OutFile $pwshMsi -UseBasicParsing
@@ -311,7 +319,7 @@ try {
 # Resolve the LATEST runner release at build time. The agent self-updates at job
 # time anyway, so pinning buys nothing and only risks a 404 on a yanked/aged tag.
 $ghHeaders = @{ 'User-Agent' = 'mactions'; 'Accept' = 'application/vnd.github+json' }
-# Retry through transient blips — this lookup is REQUIRED (no agent without it), so
+# Retry through transient blips - this lookup is REQUIRED (no agent without it), so
 # a momentary drop here must not fail the build.
 $rel = Invoke-WithRetry -What 'actions-runner release lookup' {
   Invoke-RestMethod 'https://api.github.com/repos/actions/runner/releases/latest' -Headers $ghHeaders
@@ -464,14 +472,14 @@ Write-Host 'OUTBOUND, runs one job, and the VM powers itself off.'
 
 # Verify the REQUIRED runner tools actually installed before we declare the base
 # provisioned. The Git/7-Zip/pwsh installs above are best-effort (try/catch -> warn)
-# so one transient download failure doesn't abort the whole ~hour build — but a
+# so one transient download failure doesn't abort the whole ~hour build - but a
 # SILENTLY-skipped git/bash/pwsh produces a base that snapshots "provisioned" yet
 # can't run `actions/checkout` (falls back to a slow REST tarball), any `shell: bash`
 # step ("bash: command not found"), or any `shell: pwsh` action. That exact silent
 # failure shipped a broken base once. So gate the sentinel on the tools being present:
 # if any REQUIRED one is missing, power off WITHOUT the sentinel and fusion-windows-base
-# refuses to snapshot (fast, clear failure — re-run the build). 7-Zip stays optional.
-# Literal paths (not $gitDir/$pwshDir — those are scoped inside the install try-blocks
+# refuses to snapshot (fast, clear failure - re-run the build). 7-Zip stays optional.
+# Literal paths (not $gitDir/$pwshDir - those are scoped inside the install try-blocks
 # above and may be unset if a block threw before assigning them).
 $required = [ordered]@{
   'git'  = 'C:\Git\cmd\git.exe'
@@ -483,7 +491,7 @@ foreach ($name in $required.Keys) {
   if (-not (Test-Path $required[$name])) { $missing += ("{0} ({1})" -f $name, $required[$name]) }
 }
 if ($missing.Count) {
-  Write-Warning ("REQUIRED runner tools missing after provisioning: {0}. NOT writing the provisioning sentinel; powering off so the base build fails fast (a transient download failure is the usual cause — re-run the base build)." -f ($missing -join '; '))
+  Write-Warning ("REQUIRED runner tools missing after provisioning: {0}. NOT writing the provisioning sentinel; powering off so the base build fails fast (a transient download failure is the usual cause - re-run the base build)." -f ($missing -join '; '))
   try { Stop-Transcript | Out-Null } catch { }
   shutdown /s /t 5 /c "Mactions base bootstrap FAILED: missing required tools (git/bash/pwsh)"
   exit 1
@@ -500,7 +508,7 @@ New-Item -ItemType File -Force -Path (Join-Path $RunnerRoot '.mactions-provision
 # Auto-power-off so fusion-windows-base detects completion via guest shutdown
 # (it polls `vmrun list`) without a human in the loop. The 60s delay lets the
 # FirstLogonCommands wrapper mark Setup complete + flush post-FLC work before the
-# VM goes down — and, with the host polling the sentinel every ~10s via guest-ops,
+# VM goes down - and, with the host polling the sentinel every ~10s via guest-ops,
 # leaves a wide enough window (~6 polls) that one slow/failed guest-ops call can't
 # false-negative and make the host discard a genuinely-provisioned base.
 shutdown /s /t 60 /c "Mactions base image bootstrap complete"
