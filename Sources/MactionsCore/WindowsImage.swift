@@ -261,6 +261,71 @@ public enum WindowsImage {
     return Int(raw.trimmingCharacters(in: .whitespacesAndNewlines))
   }
 
+  // MARK: - Base health (informational stamp written by fusion-windows-base)
+
+  /// What we verifiably know about the built base, recorded at build success:
+  /// when, how long, that VMware Tools answered (the provisioning sentinel can
+  /// ONLY be observed via Tools guest-ops, so a recorded base implies Tools are
+  /// installed + working), and where the guest's own `bootstrap.log` was copied
+  /// (captured in the ~60s window between sentinel and guest power-off). Purely
+  /// informational — never drives maintenance/rebuild decisions (that's
+  /// `MaintenanceReason`), just the "what's in my base" summary line in the UI.
+  public struct BaseHealth: Equatable, Sendable {
+    /// ISO-8601 UTC timestamp the build finished, as recorded (`built=`).
+    public var builtAt: String?
+    /// Boot → power-off duration in seconds (`elapsed_secs=`).
+    public var elapsedSecs: Int?
+    /// VMware Tools answered guest-ops during the build (`tools=up`).
+    public var toolsUp: Bool
+    /// Host path of the copied guest `C:\setup\logs\bootstrap.log` (`guest_log=`),
+    /// if the in-window copy landed. Callers should re-check it still exists.
+    public var guestLogPath: String?
+
+    public init(
+      builtAt: String? = nil, elapsedSecs: Int? = nil, toolsUp: Bool = false,
+      guestLogPath: String? = nil
+    ) {
+      self.builtAt = builtAt
+      self.elapsedSecs = elapsedSecs
+      self.toolsUp = toolsUp
+      self.guestLogPath = guestLogPath
+    }
+  }
+
+  /// Where `fusion-windows-base` records the health stamp. A sibling of
+  /// `windows-base.build`/`.recipe` (must survive run sweeps). Only written on a
+  /// VERIFIED build (sentinel + snapshot), and a failed rebuild restores the
+  /// prior base without touching it — so it always describes the base on disk.
+  public static func baseHealthFile() -> URL {
+    HostCleanup.mactionsRoot().appendingPathComponent("windows-base.health", isDirectory: false)
+  }
+
+  /// The recorded health of the current base, or `nil` if none was recorded
+  /// (no base yet, or one built before health stamping existed — fine, the UI
+  /// just omits those details).
+  public static func recordedBaseHealth() -> BaseHealth? {
+    guard let raw = try? String(contentsOf: baseHealthFile(), encoding: .utf8) else { return nil }
+    return parseBaseHealth(raw)
+  }
+
+  /// Parse the `key=value`-per-line health file. Pure → unit-testable; unknown
+  /// keys are ignored (forward-compatible), `nil` for an empty/garbage file.
+  public static func parseBaseHealth(_ raw: String) -> BaseHealth? {
+    var kv: [String: String] = [:]
+    for line in raw.split(whereSeparator: \.isNewline) {
+      guard let eq = line.firstIndex(of: "=") else { continue }
+      let key = line[..<eq].trimmingCharacters(in: .whitespaces)
+      let value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+      if !key.isEmpty, !value.isEmpty { kv[key] = value }
+    }
+    guard !kv.isEmpty else { return nil }
+    return BaseHealth(
+      builtAt: kv["built"],
+      elapsedSecs: kv["elapsed_secs"].flatMap(Int.init),
+      toolsUp: kv["tools"] == "up",
+      guestLogPath: kv["guest_log"])
+  }
+
   /// Why the base image needs a rebuild — or that it doesn't. Pure-computed from
   /// the recorded OS build + recipe version vs the latest available build + the
   /// current recipe. Drives the UI banner text and the "rebuild needed" badge.

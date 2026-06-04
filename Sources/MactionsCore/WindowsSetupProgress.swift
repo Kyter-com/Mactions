@@ -94,11 +94,26 @@ public enum WindowsSetupProgress {
   public static func detail(for line: String) -> String? {
     let l = line.lowercased()
     if l.contains("still running") {
-      // "    [  742s] still running (provisioned=0)..." → "Installing… (12m elapsed)"
-      if let secs = firstBracketedSeconds(in: line) {
-        return "Installing… (\(humanDuration(secs)) elapsed)"
+      // "    [ 742s] still running (provisioned=0 tools_up=1)...". tools_up=1
+      // means VMware Tools answered a guest-ops probe — and Tools are installed
+      // BY bootstrap.ps1, so the Windows install itself is done and provisioning
+      // is underway. Splitting the one long "Installing" phase into its two real
+      // halves answers the mid-build "is it stuck?" anxiety honestly.
+      if l.contains("provisioned=1") {
+        return "Provisioning verified — waiting for the guest to power off…"
       }
-      return "Installing…"
+      let toolsUp = l.contains("tools_up=1")
+      var text = toolsUp ? "Windows installed — provisioning the runner agent…" : "Installing Windows…"
+      if let secs = firstBracketedSeconds(in: line) {
+        text += " (\(humanDuration(secs)) elapsed)"
+        // Past the typical 25–40 min window, say so — and say why waiting is
+        // still safe (the script's own watchdogs kill a genuinely wedged guest:
+        // Tools-up at 40 min, hard cap at 90).
+        if secs >= 45 * 60 {
+          text += " — longer than typical; the build stops itself if the guest is stuck."
+        }
+      }
+      return text
     }
     if l.contains("provisioning sentinel present") { return "Provisioning verified — finishing up." }
     if l.contains("reusing cached win11") { return "Reusing the cached ISO from the last attempt (resumed)." }

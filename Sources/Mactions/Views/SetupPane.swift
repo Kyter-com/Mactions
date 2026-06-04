@@ -15,6 +15,8 @@ struct SetupPane: View {
   @State private var pat = ""
   @State private var repoFilter = ""
   @State private var confirmRebuild = false
+  /// The Windows build-options disclosure (debug toggles) — collapsed by default.
+  @State private var showBuildOptions = false
   /// The repo picker is collapsed to a one-line summary; expanded only while the
   /// user is actively choosing (auto-expands when nothing is selected yet).
   @State private var showRepoPicker = false
@@ -44,6 +46,7 @@ struct SetupPane: View {
     .onAppear {
       app.refreshWindowsPreflight()
       app.checkForWindowsImageUpdate()
+      app.refreshWindowsBaseInfo()
       if app.selectedRepos.isEmpty { showRepoPicker = true }
     }
   }
@@ -289,6 +292,7 @@ struct SetupPane: View {
             : "Install VMware Fusion (free, Broadcom portal), then tap Windows to build the base image."
         )
         .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        buildOptions
       }
     } else if app.windowsImageReady {
       VStack(alignment: .leading, spacing: 6) {
@@ -300,7 +304,24 @@ struct SetupPane: View {
           }
           .font(.caption2).foregroundStyle(.orange)
         }
+        // What's verifiably in the base (build · recipe · built date · Tools ·
+        // duration) + one-click logs — so "is my base healthy?" has an answer
+        // that isn't booting the VM.
+        if let summary = app.windowsBaseSummary {
+          Text(summary)
+            .font(.system(size: 9)).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        HStack(spacing: 12) {
+          if let log = app.windowsBuildLogPath {
+            viewLogButton("Build log", path: log)
+          }
+          if let guestLog = app.windowsGuestLogPath {
+            viewLogButton("Guest provisioning log", path: guestLog)
+          }
+        }
         rebuildButton
+        buildOptions
         // Explain a disabled button rather than leaving it a dead control.
         if !app.windowsBackendAvailable {
           Text("Install VMware Fusion to rebuild.")
@@ -319,6 +340,31 @@ struct SetupPane: View {
         Text(rebuildDialogMessage)
       }
     }
+  }
+
+  /// Build options the prep scripts honor as env vars (`MACTIONS_BUILD_GUI` /
+  /// `MACTIONS_KEEP_FAILED`) — surfaced as checkboxes because the GUI app can't
+  /// set env vars any other way. Tucked in a disclosure: debugging aids, not the
+  /// happy path. Persisted, and applied to the NEXT build.
+  private var buildOptions: some View {
+    DisclosureGroup(isExpanded: $showBuildOptions) {
+      VStack(alignment: .leading, spacing: 4) {
+        Toggle("Show the VM window during builds", isOn: $app.windowsBuildShowsWindow)
+          .help(
+            "Opens the build VM in VMware Fusion so you can watch the Windows install/OOBE live. Purely visual — the build itself is identical (MACTIONS_BUILD_GUI).")
+        Toggle("Keep a failed build's disk for diagnosis", isOn: $app.windowsKeepFailedDisk)
+          .help(
+            "On failure, keeps the half-built disk (and the prior base's backup) instead of restoring, so the disk can be offline-mounted to read C:\\setup\\logs\\bootstrap.log. Uses extra disk space until the next successful build (MACTIONS_KEEP_FAILED).")
+      }
+      .toggleStyle(.checkbox)
+      .font(.caption2)
+      .padding(.top, 2)
+      .onChange(of: app.windowsBuildShowsWindow) { _ in app.saveConfig() }
+      .onChange(of: app.windowsKeepFailedDisk) { _ in app.saveConfig() }
+    } label: {
+      Text("Build options").font(.caption2).foregroundStyle(.secondary)
+    }
+    .disabled(app.windowsSetupBusy)
   }
 
   /// A real (Liquid Glass) Rebuild button — prominent when a rebuild is actually
@@ -343,16 +389,34 @@ struct SetupPane: View {
   }
 
   private func windowsFailureBanner(_ message: String, external: Bool) -> some View {
-    HStack(alignment: .top, spacing: 6) {
-      Image(systemName: external ? "wifi.exclamationmark" : "exclamationmark.octagon.fill")
-        .font(.caption)
-      Text(message).fixedSize(horizontal: false, vertical: true)
+    VStack(alignment: .leading, spacing: 6) {
+      HStack(alignment: .top, spacing: 6) {
+        Image(systemName: external ? "wifi.exclamationmark" : "exclamationmark.octagon.fill")
+          .font(.caption)
+        Text(message).fixedSize(horizontal: false, vertical: true)
+      }
+      .foregroundStyle(external ? Color.orange : Color.red)
+      // The full transcript is already on disk — make it one click instead of a
+      // path to copy out of the status line.
+      if let log = app.windowsBuildLogPath {
+        viewLogButton("View build log", path: log)
+      }
     }
     .font(.caption2)
-    .foregroundStyle(external ? Color.orange : Color.red)
     .padding(8)
     .frame(maxWidth: .infinity, alignment: .leading)
     .background(RoundedRectangle(cornerRadius: 8).fill((external ? Color.orange : Color.red).opacity(0.12)))
+  }
+
+  /// A small link-style button that opens a log file in the default text viewer.
+  private func viewLogButton(_ title: String, path: String) -> some View {
+    Button {
+      NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    } label: {
+      Label(title, systemImage: "doc.text.magnifyingglass").font(.caption2)
+    }
+    .buttonStyle(.link)
+    .help(path)
   }
 
   /// SF Symbol for the current maintenance reason — distinguishes a newer OS
