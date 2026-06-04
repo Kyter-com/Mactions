@@ -17,8 +17,6 @@ struct SetupPane: View {
   @State private var confirmRebuild = false
   /// The Windows build-options disclosure (debug toggles) — collapsed by default.
   @State private var showBuildOptions = false
-  /// The Windows package-picker disclosure — collapsed by default.
-  @State private var showPackages = false
   /// The repo picker is collapsed to a one-line summary; expanded only while the
   /// user is actively choosing (auto-expands when nothing is selected yet).
   @State private var showRepoPicker = false
@@ -290,11 +288,10 @@ struct SetupPane: View {
         WindowsPreflightChecklist(app: app)
         Text(
           app.windowsBackendAvailable
-            ? "Tap the Windows tile to build the one-time base image (~30–50 min, resumable)."
+            ? "Tap the Windows tile to build the one-time base image (~30–40 min, resumable)."
             : "Install VMware Fusion (free, Broadcom portal), then tap Windows to build the base image."
         )
         .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-        packagePicker
         buildOptions
       }
     } else if app.windowsImageReady {
@@ -324,7 +321,6 @@ struct SetupPane: View {
           }
         }
         rebuildButton
-        packagePicker
         buildOptions
         // Explain a disabled button rather than leaving it a dead control.
         if !app.windowsBackendAvailable {
@@ -342,59 +338,6 @@ struct SetupPane: View {
         Button("Cancel", role: .cancel) {}
       } message: {
         Text(rebuildDialogMessage)
-      }
-    }
-  }
-
-  /// The package picker: one checkbox per item GitHub's hosted `windows-11-arm`
-  /// image ships (toolcache entries + global tools — `WindowsImage.packageCatalog`).
-  /// Checked items are baked into the base at the next (re)build, installed the
-  /// same way GitHub installs them; unchecked items still work in workflows via
-  /// `actions/setup-*` / install steps at job time. Changing the selection on a
-  /// built base flips the maintenance nudge to "rebuild to apply".
-  private var packagePicker: some View {
-    DisclosureGroup(isExpanded: $showPackages) {
-      VStack(alignment: .leading, spacing: 6) {
-        Text(
-          "The menu is exactly what GitHub's hosted windows-11-arm runners ship — check what your workflows need and it's baked into the base (same versions, same install method). Anything unchecked still works via setup-* actions at job time."
-        )
-        .font(.system(size: 9)).foregroundStyle(.tertiary)
-        .fixedSize(horizontal: false, vertical: true)
-        packageGroup("TOOL CACHE — setup-node / -python / -go hit these instantly", group: .toolcache)
-        packageGroup("TOOLS ON PATH", group: .tool)
-      }
-      .padding(.top, 2)
-    } label: {
-      HStack(spacing: 6) {
-        Text("Packages").font(.caption2).foregroundStyle(.secondary)
-        if !app.selectedWindowsPackages.isEmpty {
-          Text("\(app.selectedWindowsPackages.count) selected")
-            .font(.system(size: 9)).foregroundStyle(.secondary)
-            .padding(.horizontal, 5).padding(.vertical, 1)
-            .background(Capsule().fill(Color.accentColor.opacity(0.18)))
-        }
-      }
-    }
-    .disabled(app.windowsSetupBusy || app.state != .offline)
-  }
-
-  private func packageGroup(_ header: String, group: WindowsImage.WindowsPackage.Group) -> some View {
-    VStack(alignment: .leading, spacing: 3) {
-      Text(header).font(.system(size: 8, weight: .semibold)).foregroundStyle(.tertiary)
-        .padding(.top, 2)
-      ForEach(WindowsImage.packageCatalog.filter { $0.group == group }) { pkg in
-        Toggle(isOn: Binding(
-          get: { app.selectedWindowsPackages.contains(pkg.id) },
-          set: { app.toggleWindowsPackage(pkg.id, on: $0) }
-        )) {
-          HStack(spacing: 5) {
-            Text(pkg.title).font(.caption2)
-            Text("\(pkg.detail) \(pkg.approxSize)")
-              .font(.system(size: 8)).foregroundStyle(.tertiary)
-              .lineLimit(1).truncationMode(.tail)
-          }
-        }
-        .toggleStyle(.checkbox)
       }
     }
   }
@@ -484,31 +427,23 @@ struct SetupPane: View {
     case .osBuildAvailable: return "arrow.up.circle"
     case .provisioningOutdated: return "wrench.and.screwdriver"
     case .both: return "exclamationmark.triangle"
-    case .packagesChanged: return "shippingbox"
     case .upToDate, .notBuilt: return "arrow.clockwise.circle"
     }
   }
 
-  /// A recipe-only or packages-only rebuild reuses the cached Win11 ISO (the OS
-  /// build is unchanged), so it skips the ~8 GB download; an OS-build update
-  /// re-downloads. The confirm label/message reflect that so the step is honest
-  /// about its cost.
+  /// A recipe-only rebuild reuses the cached Win11 ISO (the OS build is
+  /// unchanged), so it skips the ~8 GB download; an OS-build update re-downloads.
+  /// The confirm label/message reflect that so the step is honest about its cost.
   private var rebuildConfirmLabel: String {
-    switch app.windowsMaintenance {
-    case .provisioningOutdated, .packagesChanged: return "Rebuild (reuses cached ISO)"
-    default: return "Rebuild (re-downloads ~8 GB)"
-    }
+    if case .provisioningOutdated = app.windowsMaintenance { return "Rebuild (reuses cached ISO)" }
+    return "Rebuild (re-downloads ~8 GB)"
   }
 
   private var rebuildDialogMessage: String {
-    switch app.windowsMaintenance {
-    case .provisioningOutdated:
-      return "Rebuilds the base VM headless with the updated runner setup recipe — about 35–50 minutes. Reuses the cached Win11 ARM64 ISO (the Windows build is unchanged), so no large re-download. Replaces the existing base image."
-    case .packagesChanged:
-      return "Rebuilds the base VM headless with the new package selection baked in — about 35–50 minutes (longer with many packages). Reuses the cached Win11 ARM64 ISO, so no large re-download. Replaces the existing base image."
-    default:
-      return "Re-downloads the latest Win11 ARM64 ISO (~8 GB) and rebuilds the base VM headless — about 35–50 minutes. This replaces the existing base image."
+    if case .provisioningOutdated = app.windowsMaintenance {
+      return "Rebuilds the base VM headless with the updated runner setup recipe — about 30–40 minutes. Reuses the cached Win11 ARM64 ISO (the Windows build is unchanged), so no large re-download. Replaces the existing base image."
     }
+    return "Re-downloads the latest Win11 ARM64 ISO (~8 GB) and rebuilds the base VM headless — about 30–40 minutes. This replaces the existing base image."
   }
 
   /// True when a prereq the Windows path needs is still missing (so the setup

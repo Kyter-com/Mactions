@@ -240,18 +240,7 @@ public enum WindowsImage {
   /// still snapshotted, shipping a base where `actions/checkout` falls back to a REST
   /// tarball and every `shell: bash`/`shell: pwsh` step dies. So v3 bases are
   /// untrustworthy and warrant a rebuild to a verified v4.
-  ///
-  /// v5: bootstrap.ps1 gains the package picker (`$SelectedPackages` → sections
-  /// 0b/0c): opt-in GitHub-hosted-image parity packages — toolcache entries
-  /// (node/Python/Go at the versions GitHub's `windows-11-arm` image ships,
-  /// installed via their own manifests + embedded setup.ps1, mirroring
-  /// `Install-Toolset.ps1`) and global tools (gh, CMake, .NET 8, Temurin Java,
-  /// jq+yq). `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` are set machine-wide
-  /// unconditionally (matching GitHub). Selected packages are fatal-on-failure
-  /// and verified before the sentinel. Package SELECTION changes are tracked
-  /// separately (`windows-base.packages` → `.packagesChanged`), so this version
-  /// only bumps when bootstrap's CAPABILITIES change.
-  public static let currentProvisioningRecipeVersion = 5
+  public static let currentProvisioningRecipeVersion = 4
 
   /// Where `prepare-windows-image` records the provisioning-recipe version the
   /// base was built with. A sibling of `windows-base.build`; must survive run
@@ -337,114 +326,6 @@ public enum WindowsImage {
       guestLogPath: kv["guest_log"])
   }
 
-  // MARK: - Optional package catalog (the UI picker; baked at base-build time)
-
-  /// One opt-in package the user can bake into the Windows base — the curated
-  /// "what GitHub's hosted `windows-11-arm` image has" menu (its
-  /// `toolset-win-11-arm64.json` toolcache entries + globally preinstalled
-  /// tools). `id` doubles as the wire format: it's what
-  /// `MACTIONS_WINDOWS_PACKAGES` carries and what `bootstrap.ps1` dispatches on
-  /// (a unit test pins that parity). Anything left unchecked still works in
-  /// workflows via `actions/setup-*` / install steps at job time — the base
-  /// just stays lean.
-  public struct WindowsPackage: Identifiable, Equatable, Sendable {
-    /// Which picker section the row belongs to.
-    public enum Group: String, Sendable {
-      /// Pre-warmed `C:\hostedtoolcache\windows` entries — what `setup-node` /
-      /// `-python` / `-go` check before downloading.
-      case toolcache
-      /// Globally installed CLIs/SDKs (on PATH for every job).
-      case tool
-    }
-
-    public let id: String
-    public let title: String
-    /// One-liner for the picker row (what it is / why you'd want it).
-    public let detail: String
-    /// Honest cost label shown in the row (download + disk are real).
-    public let approxSize: String
-    public let group: Group
-  }
-
-  /// The full menu, mirroring GitHub's hosted `windows-11-arm` image (toolset
-  /// JSON + preinstalled tools) as of recipe v5. Order = display order.
-  public static let packageCatalog: [WindowsPackage] = [
-    // Toolcache (used by actions/setup-node / -python / -go).
-    .init(
-      id: "node-22", title: "Node.js 22 (arm64)",
-      detail: "Pre-warms the toolcache for setup-node.", approxSize: "~60 MB", group: .toolcache),
-    .init(
-      id: "node-24", title: "Node.js 24 (arm64)",
-      detail: "Pre-warms the toolcache for setup-node.", approxSize: "~60 MB", group: .toolcache),
-    .init(
-      id: "python-3.12", title: "Python 3.12 (arm64)",
-      detail: "Pre-warms the toolcache for setup-python.", approxSize: "~100 MB", group: .toolcache),
-    .init(
-      id: "python-3.13", title: "Python 3.13 (arm64)",
-      detail: "GitHub's default Python on windows-11-arm.", approxSize: "~100 MB", group: .toolcache),
-    .init(
-      id: "python-3.13-x64", title: "Python 3.13 (x64, emulated)",
-      detail: "For x64-only wheels — GitHub ships this too.", approxSize: "~100 MB", group: .toolcache),
-    .init(
-      id: "python-3.14", title: "Python 3.14 (arm64)",
-      detail: "Pre-warms the toolcache for setup-python.", approxSize: "~100 MB", group: .toolcache),
-    .init(
-      id: "go-1.22", title: "Go 1.22 (arm64)",
-      detail: "Pre-warms the toolcache for setup-go.", approxSize: "~250 MB", group: .toolcache),
-    .init(
-      id: "go-1.23", title: "Go 1.23 (arm64)",
-      detail: "Pre-warms the toolcache for setup-go.", approxSize: "~250 MB", group: .toolcache),
-    .init(
-      id: "go-1.24", title: "Go 1.24 (arm64)",
-      detail: "GitHub's default Go on windows-11-arm.", approxSize: "~250 MB", group: .toolcache),
-    .init(
-      id: "go-1.25", title: "Go 1.25 (arm64)",
-      detail: "Pre-warms the toolcache for setup-go.", approxSize: "~250 MB", group: .toolcache),
-    // Global tools (installed on PATH).
-    .init(
-      id: "gh", title: "GitHub CLI",
-      detail: "gh — native ARM64 MSI, on PATH.", approxSize: "~15 MB", group: .tool),
-    .init(
-      id: "cmake", title: "CMake",
-      detail: "Native ARM64 MSI, on PATH.", approxSize: "~40 MB", group: .tool),
-    .init(
-      id: "dotnet-8", title: ".NET SDK 8 (LTS)",
-      detail: "Native arm64 via dotnet-install; sets DOTNET_ROOT.", approxSize: "~250 MB", group: .tool),
-    .init(
-      id: "java-21", title: "Java 21 — Temurin (LTS)",
-      detail: "GitHub's default JDK; native aarch64 MSI, sets JAVA_HOME.", approxSize: "~300 MB", group: .tool),
-    .init(
-      id: "java-23", title: "Java 23 — Temurin",
-      detail: "The second JDK GitHub's ARM image ships.", approxSize: "~300 MB", group: .tool),
-    .init(
-      id: "jq-yq", title: "jq + yq",
-      detail: "JSON/YAML CLIs in C:\\tools (jq is x64-under-emulation, like GitHub ships it).",
-      approxSize: "~15 MB", group: .tool),
-  ]
-
-  /// Where `prepare-windows-image` records the package selection baked into the
-  /// base (csv of catalog ids; an empty file means "built with none"). Sibling
-  /// of `windows-base.build`/`.recipe` — survives run sweeps.
-  public static func baseImagePackagesFile() -> URL {
-    HostCleanup.mactionsRoot().appendingPathComponent("windows-base.packages", isDirectory: false)
-  }
-
-  /// The package set the current base was built with, or `nil` when never
-  /// recorded (no base, or a base that predates the package picker — those get
-  /// the recipe-outdated nudge anyway, which a rebuild resolves together).
-  public static func recordedPackages() -> Set<String>? {
-    guard let raw = try? String(contentsOf: baseImagePackagesFile(), encoding: .utf8) else { return nil }
-    return parsePackageList(raw)
-  }
-
-  /// Parse a csv/newline list of package ids into a set. Pure → unit-testable.
-  public static func parsePackageList(_ raw: String) -> Set<String> {
-    Set(
-      raw.split(whereSeparator: { $0 == "," || $0.isNewline })
-        .map { $0.trimmingCharacters(in: .whitespaces) }
-        .filter { !$0.isEmpty })
-  }
-
   /// Why the base image needs a rebuild — or that it doesn't. Pure-computed from
   /// the recorded OS build + recipe version vs the latest available build + the
   /// current recipe. Drives the UI banner text and the "rebuild needed" badge.
@@ -458,10 +339,6 @@ public enum WindowsImage {
     case provisioningOutdated
     /// Both a newer OS build AND an updated provisioning recipe.
     case both(latest: String)
-    /// The package selection in the UI no longer matches what's baked into the
-    /// base (only reported when nothing bigger is stale — an OS/recipe rebuild
-    /// bakes the current selection anyway).
-    case packagesChanged
     /// No base image has been built yet.
     case notBuilt
 
@@ -469,7 +346,7 @@ public enum WindowsImage {
     public var needsRebuild: Bool {
       switch self {
       case .upToDate, .notBuilt: return false
-      case .osBuildAvailable, .provisioningOutdated, .both, .packagesChanged: return true
+      case .osBuildAvailable, .provisioningOutdated, .both: return true
       }
     }
   }
@@ -482,9 +359,7 @@ public enum WindowsImage {
     recordedBuild: String?,
     recordedRecipe: Int?,
     latestBuild: String?,
-    currentRecipe: Int = currentProvisioningRecipeVersion,
-    selectedPackages: Set<String> = [],
-    recordedPackages: Set<String>? = nil
+    currentRecipe: Int = currentProvisioningRecipeVersion
   ) -> MaintenanceReason {
     let hasImage = !((recordedBuild?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) ?? true)
     guard hasImage else { return .notBuilt }
@@ -494,13 +369,7 @@ public enum WindowsImage {
     if let latestBuild, updateAvailable(installed: recordedBuild, latest: latestBuild) {
       return recipeStale ? .both(latest: latestBuild) : .osBuildAvailable(latest: latestBuild)
     }
-    if recipeStale { return .provisioningOutdated }
-    // Packages last: only worth reporting when nothing bigger is stale (an
-    // OS/recipe rebuild bakes the current selection anyway). A `nil` recorded
-    // set (pre-picker base) only nudges when the user actually selected
-    // something — an empty selection matches an unrecorded base by definition.
-    if selectedPackages != (recordedPackages ?? []) { return .packagesChanged }
-    return .upToDate
+    return recipeStale ? .provisioningOutdated : .upToDate
   }
 
   /// A one-line, user-facing nudge for a maintenance reason (`nil` ⇒ no banner).
@@ -514,8 +383,6 @@ public enum WindowsImage {
       return "The Windows base image needs maintenance — the runner setup recipe was updated (e.g. Git/bash). Rebuild to apply it."
     case let .both(latest):
       return "The Windows base image needs a rebuild: a newer Windows 11 ARM64 build (\(latest)) is available AND the runner setup recipe was updated."
-    case .packagesChanged:
-      return "The package selection changed since the base was built — rebuild to apply it (reuses the cached ISO)."
     }
   }
 

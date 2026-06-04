@@ -60,11 +60,6 @@ final class AppState: ObservableObject {
   /// them in the GUI app, which can't set env vars any other way.
   @Published var windowsBuildShowsWindow = false
   @Published var windowsKeepFailedDisk = false
-  /// Optional packages (catalog ids from `WindowsImage.packageCatalog`) to bake
-  /// into the next base build — the "what GitHub's hosted windows-11-arm image
-  /// has" picker. Persisted; compared against `windows-base.packages` (what the
-  /// built base actually carries) to drive the "rebuild to apply" nudge.
-  @Published var selectedWindowsPackages: Set<String> = []
   /// Durable transcript of the LAST base build, success or failure (the
   /// `prepare-windows-image-<stamp>.log` written after every attempt) — drives
   /// the "View build log" buttons. Restored on launch from the newest log on
@@ -150,7 +145,6 @@ final class AppState: ObservableObject {
     windowsBaseImage = defaults.string(forKey: "windowsBaseImage") ?? windowsBaseImage
     windowsBuildShowsWindow = defaults.bool(forKey: "windowsBuildShowsWindow")
     windowsKeepFailedDisk = defaults.bool(forKey: "windowsKeepFailedDisk")
-    selectedWindowsPackages = Set(defaults.stringArray(forKey: "windowsPackages") ?? [])
     // Re-point "View build log" at the newest transcript on disk (cheap dir
     // listing) and recompose the base summary — both survive restarts.
     windowsBuildLogPath = Self.latestBuildLogPath()
@@ -187,7 +181,6 @@ final class AppState: ObservableObject {
     defaults.set(windowsBaseImage, forKey: "windowsBaseImage")
     defaults.set(windowsBuildShowsWindow, forKey: "windowsBuildShowsWindow")
     defaults.set(windowsKeepFailedDisk, forKey: "windowsKeepFailedDisk")
-    defaults.set(selectedWindowsPackages.sorted(), forKey: "windowsPackages")
   }
 
   var labels: [String] {
@@ -631,10 +624,6 @@ final class AppState: ObservableObject {
       var extraEnv: [String: String] = [:]
       if windowsBuildShowsWindow { extraEnv["MACTIONS_BUILD_GUI"] = "1" }
       if windowsKeepFailedDisk { extraEnv["MACTIONS_KEEP_FAILED"] = "1" }
-      // Always pass the selection (even empty): prepare-windows-image records it
-      // verbatim into windows-base.packages, so deselecting everything after a
-      // packaged build still rebuilds to a lean base and records the empty set.
-      extraEnv["MACTIONS_WINDOWS_PACKAGES"] = selectedWindowsPackages.sorted().joined(separator: ",")
       let result = await Self.runPrepScript(script, name: image, extraEnv: extraEnv) {
         continuation.yield($0)
       }
@@ -777,9 +766,6 @@ final class AppState: ObservableObject {
     var parts: [String] = []
     if let build = WindowsImage.recordedBaseImageBuild() { parts.append("Windows \(build)") }
     if let recipe = WindowsImage.recordedRecipeVersion() { parts.append("recipe v\(recipe)") }
-    if let packages = WindowsImage.recordedPackages(), !packages.isEmpty {
-      parts.append("\(packages.count) package\(packages.count == 1 ? "" : "s")")
-    }
     if let health = WindowsImage.recordedBaseHealth() {
       if let built = health.builtAt { parts.append("built \(built.prefix(10))") }
       if health.toolsUp { parts.append("VMware Tools ✓") }
@@ -883,14 +869,12 @@ final class AppState: ObservableObject {
   /// property: this fires on every popover `onAppear`).
   func checkForWindowsImageUpdate() {
     guard windowsImageReady else { clearWindowsUpdateNudge(); return }
-    // Recipe + package dimensions first — local, instant, every onAppear.
+    // Recipe dimension first — local, instant, every onAppear.
     applyMaintenance(
       WindowsImage.maintenanceReason(
         recordedBuild: WindowsImage.recordedBaseImageBuild(),
         recordedRecipe: WindowsImage.recordedRecipeVersion(),
-        latestBuild: lastKnownLatestBuild,
-        selectedPackages: selectedWindowsPackages,
-        recordedPackages: WindowsImage.recordedPackages()))
+        latestBuild: lastKnownLatestBuild))
     // OS dimension — networked, throttled.
     if let last = lastWindowsUpdateCheck, Date().timeIntervalSince(last) < 6 * 3600 { return }
     lastWindowsUpdateCheck = Date()
@@ -901,19 +885,8 @@ final class AppState: ObservableObject {
         WindowsImage.maintenanceReason(
           recordedBuild: WindowsImage.recordedBaseImageBuild(),
           recordedRecipe: WindowsImage.recordedRecipeVersion(),
-          latestBuild: latest.build,
-          selectedPackages: selectedWindowsPackages,
-          recordedPackages: WindowsImage.recordedPackages()))
+          latestBuild: latest.build))
     }
-  }
-
-  /// Toggle one optional Windows package (the picker checkboxes). Persists the
-  /// selection and immediately recomputes the maintenance nudge, so checking a
-  /// box on a built base instantly shows "rebuild to apply".
-  func toggleWindowsPackage(_ id: String, on: Bool) {
-    if on { selectedWindowsPackages.insert(id) } else { selectedWindowsPackages.remove(id) }
-    saveConfig()
-    checkForWindowsImageUpdate()
   }
 
   /// Apply a computed maintenance reason to published state: the structured

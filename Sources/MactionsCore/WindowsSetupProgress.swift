@@ -45,8 +45,7 @@ public enum WindowsSetupStep: Int, CaseIterable, Sendable, Comparable {
     case .prerequisites: return "Verifying VMware Fusion + installing free tools via Homebrew."
     case .downloadISO: return "~8 GB from UUP dump, then convert to an ISO — the slow part. Resumes if interrupted."
     case .buildMedia: return "Authoring the unattended + no-prompt boot ISOs."
-    case .installWindows:
-      return "Unattended Windows install + agent bootstrap inside the VM (plus any selected packages). ~30–50 min."
+    case .installWindows: return "Unattended Windows install + agent bootstrap inside the VM. ~25–40 min."
     case .finalize: return "Verifying the provisioning sentinel, then taking the base snapshot."
     }
   }
@@ -107,11 +106,10 @@ public enum WindowsSetupProgress {
       var text = toolsUp ? "Windows installed — provisioning the runner agent…" : "Installing Windows…"
       if let secs = firstBracketedSeconds(in: line) {
         text += " (\(humanDuration(secs)) elapsed)"
-        // Past the typical 30–50 min window (the toolcache pre-warm added ~10
-        // min in recipe v5), say so — and say why waiting is still safe (the
-        // script's own watchdogs kill a genuinely wedged guest: Tools-up at 40
-        // min, hard cap at 90).
-        if secs >= 55 * 60 {
+        // Past the typical 25–40 min window, say so — and say why waiting is
+        // still safe (the script's own watchdogs kill a genuinely wedged guest:
+        // Tools-up at 40 min, hard cap at 90).
+        if secs >= 45 * 60 {
           text += " — longer than typical; the build stops itself if the guest is stuck."
         }
       }
