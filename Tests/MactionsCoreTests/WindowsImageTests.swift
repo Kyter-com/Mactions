@@ -356,4 +356,43 @@ final class WindowsImageTests: XCTestCase {
       scriptVersion, WindowsImage.currentProvisioningRecipeVersion,
       "currentProvisioningRecipeVersion drifted from PROVISIONING_RECIPE_VERSION — bump BOTH together")
   }
+
+  // MARK: Base health stamp (informational; written by fusion-windows-base)
+
+  func testBaseHealthFileLivesAtMactionsRootNotUnderRuns() {
+    let file = WindowsImage.baseHealthFile()
+    XCTAssertEqual(file.lastPathComponent, "windows-base.health")
+    XCTAssertEqual(file.deletingLastPathComponent().path, HostCleanup.mactionsRoot().path)
+    XCTAssertFalse(file.path.contains("/runs/"))
+  }
+
+  /// Parses the exact `key=value` shape fusion-windows-base writes (incl. the
+  /// optional `guest_log=` line), tolerates unknown keys (forward-compatible),
+  /// and returns `nil` for an empty/garbage file rather than a hollow value.
+  func testParseBaseHealth() {
+    let full = """
+      built=2026-06-03T19:42:10Z
+      elapsed_secs=1820
+      tools=up
+      guest_log=/Users/x/.mactions/logs/base-build-bootstrap.log
+      """
+    let health = WindowsImage.parseBaseHealth(full)
+    XCTAssertEqual(health?.builtAt, "2026-06-03T19:42:10Z")
+    XCTAssertEqual(health?.elapsedSecs, 1820)
+    XCTAssertEqual(health?.toolsUp, true)
+    XCTAssertEqual(health?.guestLogPath, "/Users/x/.mactions/logs/base-build-bootstrap.log")
+
+    // The guest-log copy is best-effort — its line may simply be absent.
+    let noLog = WindowsImage.parseBaseHealth("built=2026-06-03T19:42:10Z\nelapsed_secs=90\ntools=up\n")
+    XCTAssertEqual(noLog?.guestLogPath, nil)
+    XCTAssertEqual(noLog?.toolsUp, true)
+
+    // Unknown keys are ignored, known ones still land.
+    let future = WindowsImage.parseBaseHealth("tools=up\nshiny_new_key=42\n")
+    XCTAssertEqual(future?.toolsUp, true)
+
+    // Garbage / empty → nil, not a hollow all-defaults value.
+    XCTAssertNil(WindowsImage.parseBaseHealth(""))
+    XCTAssertNil(WindowsImage.parseBaseHealth("no equals signs here\njust words\n"))
+  }
 }

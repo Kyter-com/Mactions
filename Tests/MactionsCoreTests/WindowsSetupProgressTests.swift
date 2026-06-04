@@ -72,12 +72,34 @@ final class WindowsSetupProgressTests: XCTestCase {
   }
 
   func testDetailSurfacesInstallTicksAndMilestones() {
+    // Pre-tools_up tick format (older transcripts): still reads as installing.
     XCTAssertEqual(
       WindowsSetupProgress.detail(for: "    [ 742s] still running (provisioned=0)..."),
-      "Installing… (12m elapsed)")
+      "Installing Windows… (12m elapsed)")
     XCTAssertEqual(
-      WindowsSetupProgress.detail(for: "    [  45s] still running (provisioned=1)..."),
-      "Installing… (45s elapsed)")
+      WindowsSetupProgress.detail(for: "    [ 742s] still running (provisioned=0 tools_up=0)..."),
+      "Installing Windows… (12m elapsed)")
+    // tools_up=1 — VMware Tools answered guest-ops, and Tools are installed BY
+    // bootstrap.ps1, so the OS install is done and provisioning is underway: the
+    // one long step must read as its two real halves.
+    XCTAssertEqual(
+      WindowsSetupProgress.detail(for: "    [1142s] still running (provisioned=0 tools_up=1)..."),
+      "Windows installed — provisioning the runner agent… (19m elapsed)")
+    // Sentinel seen — just waiting out the guest's own shutdown now.
+    XCTAssertEqual(
+      WindowsSetupProgress.detail(for: "    [1500s] still running (provisioned=1 tools_up=1)..."),
+      "Provisioning verified — waiting for the guest to power off…")
+    // Past the typical 25–40 min window the tick says so (the "is it stuck?"
+    // moment) — and why waiting is still safe (the script watchdogs a wedge).
+    let long = WindowsSetupProgress.detail(
+      for: "    [2760s] still running (provisioned=0 tools_up=1)...")
+    XCTAssertNotNil(long)
+    XCTAssertTrue(long!.contains("46m elapsed"), "got: \(long!)")
+    XCTAssertTrue(long!.contains("longer than typical"), "got: \(long!)")
+    XCTAssertFalse(
+      WindowsSetupProgress.detail(for: "    [ 742s] still running (provisioned=0 tools_up=1)...")!
+        .contains("longer than typical"),
+      "the over-time hint must not fire inside the typical window")
     // Exact strings the scripts emit (prepare-windows-image:268 + :461), so a
     // future wording drift in the real markers fails these tests.
     XCTAssertEqual(

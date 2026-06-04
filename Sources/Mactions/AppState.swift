@@ -54,6 +54,26 @@ final class AppState: ObservableObject {
   /// local one, so the UI can frame + tint it accordingly.
   @Published var windowsSetupFailure: String?
   @Published var windowsSetupFailureIsExternal = false
+  /// Build options (persisted): show the build VM's window in Fusion
+  /// (`MACTIONS_BUILD_GUI`) and keep a failed build's disk for offline forensics
+  /// (`MACTIONS_KEEP_FAILED`). The env knobs exist for CLI runs; these surface
+  /// them in the GUI app, which can't set env vars any other way.
+  @Published var windowsBuildShowsWindow = false
+  @Published var windowsKeepFailedDisk = false
+  /// Durable transcript of the LAST base build, success or failure (the
+  /// `prepare-windows-image-<stamp>.log` written after every attempt) — drives
+  /// the "View build log" buttons. Restored on launch from the newest log on
+  /// disk so it survives an app restart.
+  @Published var windowsBuildLogPath: String?
+  /// One-line "what's in my base" summary (Windows build · recipe · built date ·
+  /// Tools · duration), composed from the recorded build/recipe/health files.
+  /// `nil` when no base has been built. Refreshed when the pane appears + after
+  /// a successful build.
+  @Published var windowsBaseSummary: String?
+  /// The guest's own `C:\setup\logs\bootstrap.log`, copied out by
+  /// `fusion-windows-base` in the sentinel→power-off window. `nil` if the last
+  /// build predates the capture or the copy didn't land.
+  @Published var windowsGuestLogPath: String?
   /// Set by `cancelWindowsSetup()` so the result handler frames the (expected)
   /// "powered off without sentinel" script failure as a user cancel, not an error.
   private var windowsSetupCancelled = false
@@ -123,6 +143,12 @@ final class AppState: ObservableObject {
     clientId = defaults.string(forKey: "clientId") ?? ""
     windowsImageReady = defaults.bool(forKey: "windowsImageReady")
     windowsBaseImage = defaults.string(forKey: "windowsBaseImage") ?? windowsBaseImage
+    windowsBuildShowsWindow = defaults.bool(forKey: "windowsBuildShowsWindow")
+    windowsKeepFailedDisk = defaults.bool(forKey: "windowsKeepFailedDisk")
+    // Re-point "View build log" at the newest transcript on disk (cheap dir
+    // listing) and recompose the base summary — both survive restarts.
+    windowsBuildLogPath = Self.latestBuildLogPath()
+    refreshWindowsBaseInfo()
     // Restore the OS selection (pure logic in RunnerOS.restoreSelection, tested).
     // Back-compat: migrates a pre-OS-selection install from the legacy
     // `windowsEnabled` flag, seeding Windows only when its image is actually ready.
@@ -153,6 +179,8 @@ final class AppState: ObservableObject {
     defaults.set(windowsImageReady, forKey: "windowsImageReady")
     defaults.set(selectedOSes.map(\.rawValue), forKey: "selectedOSes")
     defaults.set(windowsBaseImage, forKey: "windowsBaseImage")
+    defaults.set(windowsBuildShowsWindow, forKey: "windowsBuildShowsWindow")
+    defaults.set(windowsKeepFailedDisk, forKey: "windowsKeepFailedDisk")
   }
 
   var labels: [String] {
@@ -591,7 +619,14 @@ final class AppState: ObservableObject {
       let progress = Task { @MainActor in
         for await line in lines { self.applySetupProgress(line) }
       }
-      let result = await Self.runPrepScript(script, name: image) { continuation.yield($0) }
+      // The persisted build options ride in as the env knobs the scripts already
+      // honor — the GUI app's only way to set them.
+      var extraEnv: [String: String] = [:]
+      if windowsBuildShowsWindow { extraEnv["MACTIONS_BUILD_GUI"] = "1" }
+      if windowsKeepFailedDisk { extraEnv["MACTIONS_KEEP_FAILED"] = "1" }
+      let result = await Self.runPrepScript(script, name: image, extraEnv: extraEnv) {
+        continuation.yield($0)
+      }
       continuation.finish()
       _ = await progress.value
       // Persist the FULL build transcript to ~/.mactions/logs so a failure is
@@ -603,6 +638,7 @@ final class AppState: ObservableObject {
         contents:
           "exit=\(result.map { String($0.status) } ?? "nil (could not launch)")\n\n"
           + "=== stdout ===\n\(result?.stdout ?? "")\n\n=== stderr ===\n\(result?.stderr ?? "")\n")
+      windowsBuildLogPath = buildLog ?? windowsBuildLogPath
       endWindowsSetup()
       // User cancelled (powered off the build VM): the script fails with a
       // "powered off without sentinel" error, but that's expected — don't show it
@@ -628,6 +664,7 @@ final class AppState: ObservableObject {
           // available" nudge and reset the throttle so the next popover open
           // re-checks against the freshly recorded build rather than waiting 6h.
           clearWindowsUpdateNudge()
+          refreshWindowsBaseInfo()  // pick up the fresh build/recipe/health stamps
           statusMessage = "Windows base image '\(image)' is ready."
         } else {
           windowsImageReady = false  // never persist a stale-true
@@ -680,7 +717,8 @@ final class AppState: ObservableObject {
   }
 
   private nonisolated static func runPrepScript(
-    _ script: String, name: String, onLine: @escaping @Sendable (String) -> Void
+    _ script: String, name: String, extraEnv: [String: String] = [:],
+    onLine: @escaping @Sendable (String) -> Void
   ) async -> Shell.Result? {
     await Task.detached {
       // A Finder/login-item launched .app inherits a launchd PATH WITHOUT
@@ -695,10 +733,51 @@ final class AppState: ObservableObject {
       let prepend = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"]
         .filter { !have.contains($0) }
       env["PATH"] = (prepend + [existing]).joined(separator: ":")
+      // The UI build options (show the VM window / keep a failed disk) ride in
+      // as the env knobs the scripts already honor.
+      for (key, value) in extraEnv { env[key] = value }
       // Stream the output (for the live stepper) while still capturing the full
       // transcript for the durable log.
       return try? Shell.runStreaming(script, ["--name", name], environment: env, onLine: onLine)
     }.value
+  }
+
+  /// Newest persisted `prepare-windows-image-*.log` transcript, so "View build
+  /// log" still works after an app restart (the @Published path only covers the
+  /// current session). The stamp is `yyyyMMdd-HHmmss`, so lexicographic order IS
+  /// chronological order.
+  private static func latestBuildLogPath() -> String? {
+    let dir = HostCleanup.logsRoot()
+    let files =
+      (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+    return
+      files
+      .map(\.lastPathComponent)
+      .filter { $0.hasPrefix("prepare-windows-image-") && $0.hasSuffix(".log") }
+      .sorted()
+      .last
+      .map { dir.appendingPathComponent($0).path }
+  }
+
+  /// Recompose the base summary line + guest-log pointer from the recorded
+  /// build/recipe/health files. Cheap (three tiny file reads); called on launch,
+  /// when the Setup pane appears, and after a successful build.
+  func refreshWindowsBaseInfo() {
+    var parts: [String] = []
+    if let build = WindowsImage.recordedBaseImageBuild() { parts.append("Windows \(build)") }
+    if let recipe = WindowsImage.recordedRecipeVersion() { parts.append("recipe v\(recipe)") }
+    if let health = WindowsImage.recordedBaseHealth() {
+      if let built = health.builtAt { parts.append("built \(built.prefix(10))") }
+      if health.toolsUp { parts.append("VMware Tools ✓") }
+      if let secs = health.elapsedSecs, secs >= 60 { parts.append("\(secs / 60) min build") }
+      // Only surface the guest log while it actually exists (purge-able).
+      windowsGuestLogPath = health.guestLogPath.flatMap {
+        FileManager.default.fileExists(atPath: $0) ? $0 : nil
+      }
+    } else {
+      windowsGuestLogPath = nil
+    }
+    windowsBaseSummary = parts.isEmpty ? nil : parts.joined(separator: " · ")
   }
 
   /// Advance the live setup stepper from a line of build output (FORWARD-ONLY, so
