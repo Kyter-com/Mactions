@@ -54,7 +54,7 @@ TOOLS_ISO="${TOOLS_ISO:-${VMWARE_LIB}/isoimages/arm64/windows.iso}"
 DISK_GB="${DISK_GB:-64}"
 RAM_MB="${RAM_MB:-8192}"
 CPUS="${CPUS:-4}"
-INSTALL_TIMEOUT_SECS="${INSTALL_TIMEOUT_SECS:-$((90 * 60))}"  # 90 min hard cap (typical 25-40)
+INSTALL_TIMEOUT_SECS="${INSTALL_TIMEOUT_SECS:-$((90 * 60))}"  # 90 min hard cap (typical 30-50 incl. the toolcache pre-warm)
 # Fast-fail watchdog: on a healthy build VMware Tools come up mid-bootstrap (well
 # under ~25 min). If they NEVER initialize by here, the guest is wedged in the
 # unattended Setup/OOBE handoff and never reached bootstrap.ps1 — don't burn the
