@@ -15,7 +15,8 @@
        node_modules trees).
     2. Drop C:\setup\run-job.ps1 (the PER-CLONE runtime) and register a recurring
        logon Scheduled Task that runs it on EVERY boot.
-    3. Disable UAC for this disposable guest so the task gets a full admin token.
+    3. Apply minimal GitHub-hosted Windows shell policy parity.
+    4. Disable UAC for this disposable guest so the task gets a full admin token.
 
   Per job, the host clones this base, injects a tiny config ISO carrying the JIT
   registration (VMware Fusion: the clone's sata0:0 CD is wired to it at clone
@@ -458,7 +459,13 @@ $principal = New-ScheduledTaskPrincipal -UserId 'runner' -LogonType Interactive 
 Register-ScheduledTask -TaskName 'MactionsRunOnce' -Action $action -Trigger $trigger `
   -Settings $settings -Principal $principal -Force | Out-Null
 
-# --- 3. Disable UAC for the disposable guest --------------------------------
+# --- 3. GitHub-hosted Windows shell policy parity ---------------------------
+# GitHub's Windows images set LocalMachine execution policy to Unrestricted.
+# Keep that same scope/value so explicit `shell: powershell` steps can run the
+# runner's temporary wrapper script. -Force avoids an unattended setup prompt.
+Set-ExecutionPolicy -ExecutionPolicy Unrestricted -Scope LocalMachine -Force
+
+# --- 4. Disable UAC for the disposable guest --------------------------------
 # `runner` is a local admin; with UAC on, the task could get a filtered token,
 # breaking job steps that need admin. This guest is destroyed after one job.
 # Reboot-gated - applied on the first clone boot for a job.

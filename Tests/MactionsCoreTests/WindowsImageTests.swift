@@ -357,6 +357,36 @@ final class WindowsImageTests: XCTestCase {
       "currentProvisioningRecipeVersion drifted from PROVISIONING_RECIPE_VERSION — bump BOTH together")
   }
 
+  /// GitHub-hosted Windows images set the LocalMachine execution policy to
+  /// Unrestricted. Mactions keeps the same narrow scope/value so explicit
+  /// `shell: powershell` steps can run the runner's temporary wrapper script
+  /// without baking extra tools into the image.
+  func testBootstrapSetsHostedWindowsPowerShellExecutionPolicyBeforeSentinel() {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let bootstrapURL = repoRoot.appendingPathComponent("scripts/bootstrap.ps1")
+    guard let script = try? String(contentsOf: bootstrapURL, encoding: .utf8) else {
+      return XCTFail("could not read \(bootstrapURL.path) to check PowerShell policy parity")
+    }
+
+    let policyCommand =
+      "Set-ExecutionPolicy -ExecutionPolicy Unrestricted -Scope LocalMachine -Force"
+    guard let policyRange = script.range(of: policyCommand) else {
+      return XCTFail("bootstrap.ps1 must set LocalMachine execution policy to Unrestricted")
+    }
+    guard
+      let sentinelRange = script.range(
+        of: "New-Item -ItemType File -Force -Path (Join-Path $RunnerRoot '.mactions-provisioned')")
+    else {
+      return XCTFail("could not locate the provisioning sentinel write in bootstrap.ps1")
+    }
+
+    XCTAssertLessThan(
+      policyRange.lowerBound.utf16Offset(in: script),
+      sentinelRange.lowerBound.utf16Offset(in: script),
+      "execution policy must be applied before the base is stamped provisioned")
+  }
+
   // MARK: Base health stamp (informational; written by fusion-windows-base)
 
   func testBaseHealthFileLivesAtMactionsRootNotUnderRuns() {
