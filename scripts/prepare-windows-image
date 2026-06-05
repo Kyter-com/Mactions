@@ -144,12 +144,14 @@ RECORDED_BUILD=""
 # ~/.mactions/windows-base.recipe on a successful build, and MUST stay equal to
 # WindowsImage.currentProvisioningRecipeVersion (a unit test enforces that), which
 # the app reads to decide whether a built base needs a rebuild.
+# v6: bootstrap.ps1 enables the OS-level LongPathsEnabled registry switch,
+# matching GitHub-hosted Windows images for post-checkout deep-path tooling.
 # v5: bootstrap.ps1 sets LocalMachine execution policy to Unrestricted, matching
 # GitHub-hosted Windows images so explicit `shell: powershell` steps can run.
 # v4: bootstrap.ps1 verifies git/bash/pwsh before the sentinel (+ retries their
 # downloads). v3 bases can be silently missing those tools (a swallowed transient
 # download failure still snapshotted), so they warrant a rebuild to a verified v4.
-PROVISIONING_RECIPE_VERSION=5
+PROVISIONING_RECIPE_VERSION=6
 
 # Fetch a UUP dump URL with backoff, writing the body to OUTFILE. Retries on
 # network errors, HTTP 429 (UUP dump's ~20-25s per-IP throttle), and 5xx; fails

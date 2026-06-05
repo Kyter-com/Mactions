@@ -440,6 +440,46 @@ final class WindowsImageTests: XCTestCase {
         + "non-parity base be stamped provisioned and snapshotted")
   }
 
+  /// GitHub-hosted Windows images enable the OS-level Win32 long-path registry
+  /// switch in Configure-BaseImage.ps1. Mactions mirrors that exact OS setting
+  /// (without changing Git core.longpaths, which hosted Git does not set) so
+  /// post-checkout tooling can use deep paths before the base is stamped valid.
+  func testBootstrapEnablesHostedWindowsLongPathsBeforeSentinel() {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let bootstrapURL = repoRoot.appendingPathComponent("scripts/bootstrap.ps1")
+    guard let script = try? String(contentsOf: bootstrapURL, encoding: .utf8) else {
+      return XCTFail("could not read \(bootstrapURL.path) to check long-path parity")
+    }
+
+    let longPathCommand =
+      "Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem' `\n  -Name 'LongPathsEnabled' -Value 1"
+    guard let longPathRange = script.range(of: longPathCommand) else {
+      return XCTFail("bootstrap.ps1 must enable the hosted Windows LongPathsEnabled registry value")
+    }
+    guard
+      let sentinelRange = script.range(
+        of: "New-Item -ItemType File -Force -Path (Join-Path $RunnerRoot '.mactions-provisioned')")
+    else {
+      return XCTFail("could not locate the provisioning sentinel write in bootstrap.ps1")
+    }
+
+    XCTAssertLessThan(
+      longPathRange.lowerBound.utf16Offset(in: script),
+      sentinelRange.lowerBound.utf16Offset(in: script),
+      "long-path parity must be applied before the base is stamped provisioned")
+
+    XCTAssertNotNil(
+      script.range(of: "Get-ItemPropertyValue -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem' `\n  -Name 'LongPathsEnabled'"),
+      "bootstrap.ps1 must verify LongPathsEnabled after writing it")
+    XCTAssertNil(
+      script.range(of: "git config --system core.longpaths"),
+      "Mactions should not set Git core.longpaths as part of this parity change; hosted Git does not set it")
+    XCTAssertNil(
+      script.range(of: "git config --global core.longpaths"),
+      "Mactions should not set Git core.longpaths as part of this parity change; hosted Git does not set it")
+  }
+
   // MARK: Base health stamp (informational; written by fusion-windows-base)
 
   func testBaseHealthFileLivesAtMactionsRootNotUnderRuns() {

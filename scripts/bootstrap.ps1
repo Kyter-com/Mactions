@@ -494,7 +494,23 @@ if ($lmPolicy -ne 'Unrestricted') {
 }
 Write-Host 'LocalMachine execution policy: Unrestricted (hosted-parity) - verified.'
 
-# --- 4. Disable UAC for the disposable guest --------------------------------
+# --- 4. GitHub-hosted Windows long-path parity ------------------------------
+# GitHub's Windows images enable the OS-level Win32 long-path registry switch:
+# HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled=1.
+# Mirror that narrow OS behavior so post-checkout tooling that walks deep trees
+# (node_modules, native build output, MSBuild inputs) does not fail at MAX_PATH
+# where it would work on a hosted Windows image. Keep Git's core.longpaths
+# untouched: hosted Git does not set it either, and checkout has its own behavior.
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' `
+  -Name 'LongPathsEnabled' -Value 1
+$longPaths = Get-ItemPropertyValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' `
+  -Name 'LongPathsEnabled'
+if ([int]$longPaths -ne 1) {
+  throw "LongPathsEnabled is '$longPaths' after Set-ItemProperty (expected 1) - hosted-parity long-path policy did NOT persist; failing the build before the sentinel."
+}
+Write-Host 'LongPathsEnabled: 1 (hosted-parity) - verified.'
+
+# --- 5. Disable UAC for the disposable guest --------------------------------
 # `runner` is a local admin; with UAC on, the task could get a filtered token,
 # breaking job steps that need admin. This guest is destroyed after one job.
 # Reboot-gated - applied on the first clone boot for a job.
