@@ -234,6 +234,8 @@ public enum WindowsImage {
   /// the authority that gets stamped into `windows-base.recipe` at build time —
   /// and a unit test asserts they match.
   ///
+  /// v7: bootstrap.ps1 mirrors hosted Git post-install behavior: system
+  /// safe.directory "*", GCM_INTERACTIVE=Never, and seeded SSH known_hosts.
   /// v6: bootstrap.ps1 enables the OS-level LongPathsEnabled registry switch,
   /// matching GitHub-hosted Windows images for post-checkout deep-path tooling.
   /// v5: bootstrap.ps1 sets LocalMachine execution policy to Unrestricted,
@@ -245,7 +247,7 @@ public enum WindowsImage {
   /// still snapshotted, shipping a base where `actions/checkout` falls back to a REST
   /// tarball and every `shell: bash`/`shell: pwsh` step dies. So v3 bases are
   /// untrustworthy and warrant a rebuild to a verified v4.
-  public static let currentProvisioningRecipeVersion = 6
+  public static let currentProvisioningRecipeVersion = 7
 
   /// Where `prepare-windows-image` records the provisioning-recipe version the
   /// base was built with. A sibling of `windows-base.build`; must survive run

@@ -70,6 +70,10 @@ private struct DashboardHeader: View {
 
   var body: some View {
     HStack(spacing: 12) {
+      AppLogoView(size: 30)
+        .padding(4)
+        .liquidGlass(in: RoundedRectangle(cornerRadius: 10))
+        .help("Mactions")
       Circle().fill(statusColor).frame(width: 10, height: 10)
       Text(stateSubtitle).font(.callout.weight(.medium)).fixedSize()
       Divider().frame(height: 20)

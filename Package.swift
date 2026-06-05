@@ -17,7 +17,7 @@ let package = Package(
     .executableTarget(
       name: "Mactions",
       dependencies: ["MactionsCore"],
-      resources: [.process("Media.xcassets")]
+      resources: [.process("Media.xcassets"), .copy("Mactions.icon")]
     ),
     .testTarget(
       name: "MactionsCoreTests",

@@ -480,6 +480,47 @@ final class WindowsImageTests: XCTestCase {
       "Mactions should not set Git core.longpaths as part of this parity change; hosted Git does not set it")
   }
 
+  /// Hosted Install-Git.ps1 does more than install Git: it sets system
+  /// safe.directory, disables interactive GCM prompts, and seeds known_hosts for
+  /// GitHub/Azure DevOps SSH remotes. Mactions keeps its PortableGit installer
+  /// for unattended ARM64 reliability, but mirrors those post-install semantics.
+  func testBootstrapMirrorsHostedGitPostInstallSemantics() {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let bootstrapURL = repoRoot.appendingPathComponent("scripts/bootstrap.ps1")
+    guard let script = try? String(contentsOf: bootstrapURL, encoding: .utf8) else {
+      return XCTFail("could not read \(bootstrapURL.path) to check Git post-install parity")
+    }
+
+    XCTAssertNotNil(
+      script.range(of: "config --system --add safe.directory '*'"),
+      "bootstrap.ps1 must mirror hosted Git's system safe.directory setting")
+    XCTAssertNotNil(
+      script.range(of: "[Environment]::SetEnvironmentVariable('GCM_INTERACTIVE', 'Never', 'Machine')"),
+      "bootstrap.ps1 must disable interactive Git Credential Manager prompts machine-wide")
+    XCTAssertNotNil(
+      script.range(of: "ssh-keyscan.exe"),
+      "bootstrap.ps1 must use Git's ssh-keyscan to seed known_hosts like hosted Windows")
+    XCTAssertNotNil(
+      script.range(of: "-t rsa,ecdsa,ed25519 github.com"),
+      "bootstrap.ps1 must seed GitHub SSH host keys")
+    XCTAssertNotNil(
+      script.range(of: "-t rsa ssh.dev.azure.com"),
+      "bootstrap.ps1 must seed Azure DevOps SSH host keys")
+    XCTAssertNotNil(
+      script.range(of: "C:\\ProgramData\\ssh\\ssh_known_hosts"),
+      "bootstrap.ps1 must write the system OpenSSH known_hosts file")
+    XCTAssertNotNil(
+      script.range(of: "etc\\ssh\\ssh_known_hosts"),
+      "bootstrap.ps1 must write Git for Windows' bundled OpenSSH known_hosts file")
+    XCTAssertNotNil(
+      script.range(of: "config --system --get-all safe.directory"),
+      "bootstrap.ps1 must verify the system safe.directory value before writing the sentinel")
+    XCTAssertNotNil(
+      script.range(of: "[Environment]::GetEnvironmentVariable('GCM_INTERACTIVE', 'Machine')"),
+      "bootstrap.ps1 must verify GCM_INTERACTIVE before writing the sentinel")
+  }
+
   // MARK: Base health stamp (informational; written by fusion-windows-base)
 
   func testBaseHealthFileLivesAtMactionsRootNotUnderRuns() {

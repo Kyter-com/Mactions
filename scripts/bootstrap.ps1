@@ -239,6 +239,38 @@ try {
     $env:Path = $env:Path + ';' + $gitCmd + ';' + $gitBin
     & "$gitCmd\git.exe" --version | Write-Host
     & "$gitBin\bash.exe" -c 'echo "bash OK: $BASH_VERSION"' | Write-Host
+
+    # Hosted Git post-install parity from actions/runner-images' Install-Git.ps1:
+    # - mark all worktrees safe system-wide (checkout also marks its own path,
+    #   but hosted has the broader system default);
+    # - disable interactive Git Credential Manager prompts in CI;
+    # - seed OpenSSH/Git known_hosts for GitHub and Azure DevOps SSH remotes.
+    # Keep the installer/layout different (PortableGit at C:\Git) because the
+    # official ARM64 Inno installer can show GUI and stall our unattended base.
+    & "$gitCmd\git.exe" config --system --add safe.directory '*'
+    if ($LASTEXITCODE -ne 0) {
+      throw "git config --system --add safe.directory '*' failed with exit code $LASTEXITCODE"
+    }
+    [Environment]::SetEnvironmentVariable('GCM_INTERACTIVE', 'Never', 'Machine')
+    $env:GCM_INTERACTIVE = 'Never'
+
+    $windowsSSHKnownHosts = 'C:\ProgramData\ssh\ssh_known_hosts'
+    $gitSSHKnownHosts = Join-Path $gitDir 'etc\ssh\ssh_known_hosts'
+    $sshKeyScan = Join-Path $gitDir 'usr\bin\ssh-keyscan.exe'
+    if (Test-Path $sshKeyScan) {
+      $githubHostKeys = & $sshKeyScan -t rsa,ecdsa,ed25519 github.com 2>$null
+      $azureHostKeys = & $sshKeyScan -t rsa ssh.dev.azure.com 2>$null
+      if ($githubHostKeys -and $azureHostKeys) {
+        New-Item -ItemType Directory -Force -Path (Split-Path $windowsSSHKnownHosts) | Out-Null
+        New-Item -ItemType Directory -Force -Path (Split-Path $gitSSHKnownHosts) | Out-Null
+        Set-Content -Encoding ASCII -Path $windowsSSHKnownHosts, $gitSSHKnownHosts -Value $githubHostKeys
+        Add-Content -Encoding ASCII -Path $windowsSSHKnownHosts, $gitSSHKnownHosts -Value $azureHostKeys
+      } else {
+        Write-Warning 'ssh-keyscan did not return both GitHub and Azure DevOps host keys; continuing without seeded ssh_known_hosts.'
+      }
+    } else {
+      Write-Warning "ssh-keyscan.exe not found under $sshKeyScan; continuing without seeded ssh_known_hosts."
+    }
   }
 } catch {
   Write-Warning "Git install failed (continuing): $_"
@@ -522,15 +554,16 @@ Write-Host '== Bootstrap complete. =='
 Write-Host 'Per job, the host injects the JIT via a config disc; the runner registers'
 Write-Host 'OUTBOUND, runs one job, and the VM powers itself off.'
 
-# Verify the REQUIRED runner tools actually installed before we declare the base
-# provisioned. The Git/7-Zip/pwsh installs above are best-effort (try/catch -> warn)
-# so one transient download failure doesn't abort the whole ~hour build - but a
-# SILENTLY-skipped git/bash/pwsh produces a base that snapshots "provisioned" yet
-# can't run `actions/checkout` (falls back to a slow REST tarball), any `shell: bash`
-# step ("bash: command not found"), or any `shell: pwsh` action. That exact silent
-# failure shipped a broken base once. So gate the sentinel on the tools being present:
-# if any REQUIRED one is missing, power off WITHOUT the sentinel and fusion-windows-base
-# refuses to snapshot (fast, clear failure - re-run the build). 7-Zip stays optional.
+# Verify the REQUIRED runner tools/settings actually installed before we declare
+# the base provisioned. The Git/7-Zip/pwsh installs above are best-effort
+# (try/catch -> warn) so one transient download failure doesn't abort the whole
+# ~hour build - but a SILENTLY-skipped git/bash/pwsh produces a base that
+# snapshots "provisioned" yet can't run `actions/checkout` (falls back to a slow
+# REST tarball), any `shell: bash` step ("bash: command not found"), or any
+# `shell: pwsh` action. Recipe v7 also requires the local hosted-Git parity
+# settings (`safe.directory=*`, GCM_INTERACTIVE=Never). Gate the sentinel on
+# these local requirements so a swallowed installer/config failure cannot ship a
+# non-parity base. 7-Zip and live `ssh-keyscan` known_hosts seeding stay optional.
 # Literal paths (not $gitDir/$pwshDir - those are scoped inside the install try-blocks
 # above and may be unset if a block threw before assigning them).
 $required = [ordered]@{
@@ -545,10 +578,25 @@ foreach ($name in $required.Keys) {
 if ($missing.Count) {
   Write-Warning ("REQUIRED runner tools missing after provisioning: {0}. NOT writing the provisioning sentinel; powering off so the base build fails fast (a transient download failure is the usual cause - re-run the base build)." -f ($missing -join '; '))
   try { Stop-Transcript | Out-Null } catch { }
-  shutdown /s /t 5 /c "Mactions base bootstrap FAILED: missing required tools (git/bash/pwsh)"
+  shutdown /s /t 5 /c "Mactions base bootstrap FAILED: missing required tools/settings"
   exit 1
 }
-Write-Host 'Verified required runner tools present: git, bash, pwsh.'
+
+$gitSafeDirs = & 'C:\Git\cmd\git.exe' config --system --get-all safe.directory 2>$null
+if ($LASTEXITCODE -ne 0 -or @($gitSafeDirs) -notcontains '*') {
+  $missing += 'git safe.directory (*)'
+}
+$gcmInteractive = [Environment]::GetEnvironmentVariable('GCM_INTERACTIVE', 'Machine')
+if ($gcmInteractive -ne 'Never') {
+  $missing += "GCM_INTERACTIVE Machine env (expected Never, got '$gcmInteractive')"
+}
+if ($missing.Count) {
+  Write-Warning ("REQUIRED runner settings missing after provisioning: {0}. NOT writing the provisioning sentinel; powering off so the base build fails fast." -f ($missing -join '; '))
+  try { Stop-Transcript | Out-Null } catch { }
+  shutdown /s /t 5 /c "Mactions base bootstrap FAILED: missing required tools/settings"
+  exit 1
+}
+Write-Host 'Verified required runner tools/settings present: git, bash, pwsh, git safe.directory, GCM_INTERACTIVE.'
 
 # Provisioning sentinel - written LAST, right before the orderly power-off.
 # fusion-windows-base polls for this via VMware Tools guest-ops and ONLY

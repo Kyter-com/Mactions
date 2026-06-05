@@ -37,6 +37,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // window opens on launch. Closing the window keeps the app (+ fleet) running;
     // clicking the dock icon reopens it (applicationShouldHandleReopen below).
     NSApp.setActivationPolicy(.regular)
+    if let icon = AppLogo.image(insetRatio: AppLogo.macOSDockInsetRatio) {
+      NSApp.applicationIconImage = icon
+    }
     DashboardWindowController.shared.show()
   }
 
