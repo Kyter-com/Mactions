@@ -387,6 +387,59 @@ final class WindowsImageTests: XCTestCase {
       "execution policy must be applied before the base is stamped provisioned")
   }
 
+  /// Both launchers run bootstrap.ps1 with `-ExecutionPolicy Bypass`, so the
+  /// Process scope overrides LocalMachine and Set-ExecutionPolicy raises a
+  /// statement-terminating "ExecutionPolicyOverride" SecurityException AFTER
+  /// persisting the value. Under $ErrorActionPreference='Stop' an unhandled
+  /// override killed bootstrap before the sentinel (live base-build failure,
+  /// 2026-06-05). Guard the handling: the expected override must be tolerated
+  /// (try/catch on SecurityException) AND the outcome must be verified via
+  /// Get-ExecutionPolicy so a genuine write failure still fails the build.
+  func testBootstrapToleratesExecutionPolicyOverrideAndVerifiesItPersisted() {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let bootstrapURL = repoRoot.appendingPathComponent("scripts/bootstrap.ps1")
+    guard let script = try? String(contentsOf: bootstrapURL, encoding: .utf8) else {
+      return XCTFail("could not read \(bootstrapURL.path) to check the override handling")
+    }
+
+    // Assert the exact try/catch adjacency — not just that a catch appears
+    // somewhere later — so a refactor can't leave the policy line bare while a
+    // SecurityException catch on some other try still satisfies the grep.
+    let guardedPolicy = """
+      try {
+        Set-ExecutionPolicy -ExecutionPolicy Unrestricted -Scope LocalMachine -Force
+      } catch [System.Security.SecurityException] {
+      """
+    guard let catchRange = script.range(of: guardedPolicy) else {
+      return XCTFail(
+        "bootstrap.ps1 must wrap the Set-ExecutionPolicy parity write in a try whose catch "
+          + "tolerates the expected ExecutionPolicyOverride SecurityException — without it, the "
+          + "Bypass launcher's Process-scope override kills bootstrap before the sentinel")
+    }
+
+    // Swallowing the error is only safe because the outcome is re-checked: the
+    // LocalMachine value must be read back AND a mismatch must fail the build.
+    let verifyRead = "Get-ExecutionPolicy -Scope LocalMachine"
+    guard let verifyRange = script.range(of: verifyRead) else {
+      return XCTFail(
+        "bootstrap.ps1 must verify the LocalMachine policy persisted after tolerating the override")
+    }
+    XCTAssertLessThan(
+      catchRange.lowerBound.utf16Offset(in: script),
+      verifyRange.lowerBound.utf16Offset(in: script),
+      "the persisted-policy verification must follow the tolerated override")
+
+    let verifyGuard = """
+      if ($lmPolicy -ne 'Unrestricted') {
+        throw
+      """
+    XCTAssertNotNil(
+      script.range(of: verifyGuard),
+      "the read-back must throw on mismatch — a verify that never fails would let a "
+        + "non-parity base be stamped provisioned and snapshotted")
+  }
+
   // MARK: Base health stamp (informational; written by fusion-windows-base)
 
   func testBaseHealthFileLivesAtMactionsRootNotUnderRuns() {

@@ -463,7 +463,36 @@ Register-ScheduledTask -TaskName 'MactionsRunOnce' -Action $action -Trigger $tri
 # GitHub's Windows images set LocalMachine execution policy to Unrestricted.
 # Keep that same scope/value so explicit `shell: powershell` steps can run the
 # runner's temporary wrapper script. -Force avoids an unattended setup prompt.
-Set-ExecutionPolicy -ExecutionPolicy Unrestricted -Scope LocalMachine -Force
+#
+# BOTH launchers run this script with `-ExecutionPolicy Bypass` (autounattend.xml),
+# so the PROCESS scope is Bypass. Set-ExecutionPolicy WRITES the LocalMachine
+# registry value, then reads back the EFFECTIVE policy, sees Process=Bypass still
+# winning (more specific scope), and raises a statement-terminating
+# SecurityException ("...overridden by a policy defined at a more specific
+# scope"). Under $ErrorActionPreference='Stop' an unhandled override killed
+# bootstrap RIGHT HERE - before the sentinel - so the base powered off un-stamped
+# (verified live, 2026-06-05 build: the C:\setup\logs\bootstrap.log transcript
+# ends at this line with ExecutionPolicyOverride, yet Get-ExecutionPolicy -List
+# in the same guest showed LocalMachine=Unrestricted had persisted). Same
+# collision as actions/runner-images#579; by-design per PowerShell#12032 -
+# GitHub's packer provisioner dodges it with execution_policy="unrestricted",
+# but our launchers need Bypass (never prompts, runs the unsigned script). So:
+# swallow ONLY the expected override error, then VERIFY the value persisted so a
+# genuine write failure (e.g. a real MachinePolicy/GPO override) still fails the
+# build loudly instead of snapshotting a non-parity base.
+try {
+  Set-ExecutionPolicy -ExecutionPolicy Unrestricted -Scope LocalMachine -Force
+} catch [System.Security.SecurityException] {
+  # The cmdlet can also surface a genuine write denial as a SecurityException;
+  # only the override's error id is expected here - anything else stays fatal.
+  if ($_.FullyQualifiedErrorId -notlike 'ExecutionPolicyOverride*') { throw }
+  Write-Host 'Set-ExecutionPolicy reported the expected Process-scope (Bypass) override; verifying the LocalMachine value persisted...'
+}
+$lmPolicy = Get-ExecutionPolicy -Scope LocalMachine
+if ($lmPolicy -ne 'Unrestricted') {
+  throw "LocalMachine execution policy is '$lmPolicy' after Set-ExecutionPolicy (expected Unrestricted) - hosted-parity policy did NOT persist; failing the build before the sentinel."
+}
+Write-Host 'LocalMachine execution policy: Unrestricted (hosted-parity) - verified.'
 
 # --- 4. Disable UAC for the disposable guest --------------------------------
 # `runner` is a local admin; with UAC on, the task could get a filtered token,
