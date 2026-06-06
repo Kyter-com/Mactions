@@ -542,7 +542,88 @@ if ([int]$longPaths -ne 1) {
 }
 Write-Host 'LongPathsEnabled: 1 (hosted-parity) - verified.'
 
-# --- 5. Disable UAC for the disposable guest --------------------------------
+# --- 5. GitHub-hosted Windows Update determinism ----------------------------
+# GitHub-hosted Windows images disable Windows Update by policy + service in
+# Configure-System.ps1 so a CI job is never slowed down or rebooted by a
+# background OS update. Mirror the update/telemetry subset here: Mactions updates
+# the base only through an explicit rebuild from a newer ISO. IMPORTANT: the
+# hosted script also disables broad scheduled-task paths, including "\". Do NOT
+# mirror that here because our MactionsRunOnce task lives at the root task path
+# and must stay enabled for every clone boot.
+$hostedSystemPolicy = @(
+  @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'; Name = 'AUOptions'; Value = 1 }
+  @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'; Name = 'NoAutoUpdate'; Value = 1 }
+  @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'; Name = 'DoNotConnectToWindowsUpdateInternetLocations'; Value = 1 }
+  @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'; Name = 'DisableWindowsUpdateAccess'; Value = 1 }
+  @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Metadata'; Name = 'PreventDeviceMetadataFromNetwork'; Value = 1 }
+  @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection'; Name = 'AllowTelemetry'; Value = 0 }
+  @{ Path = 'HKLM:\Software\Policies\Microsoft\Windows\DataCollection'; Name = 'AllowTelemetry'; Value = 0 }
+  @{ Path = 'HKLM:\SOFTWARE\Wow6432Node\Policies\Microsoft\Windows\DataCollection'; Name = 'AllowTelemetry'; Value = 0 }
+  @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows'; Name = 'CEIPEnable'; Value = 0 }
+  @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat'; Name = 'AITEnable'; Value = 0 }
+  @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat'; Name = 'DisableUAR'; Value = 1 }
+  @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance'; Name = 'MaintenanceDisabled'; Value = 1 }
+  @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\MRT'; Name = 'DontOfferThroughWUAU'; Value = 1 }
+  @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\MRT'; Name = 'DontReportInfectionInformation'; Value = 1 }
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\WMI\AutoLogger\AutoLogger-Diagtrack-Listener'; Name = 'Start'; Value = 0 }
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\WMI\AutoLogger\SQMLogger'; Name = 'Start'; Value = 0 }
+)
+foreach ($setting in $hostedSystemPolicy) {
+  $path = $setting['Path']
+  if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+  New-ItemProperty -Path $path -Name $setting['Name'] -Value $setting['Value'] `
+    -PropertyType DWord -Force | Out-Null
+}
+
+$wuServicePath = 'HKLM:\System\CurrentControlSet\Services\wuauserv'
+if (Test-Path $wuServicePath) {
+  Set-ItemProperty -Path $wuServicePath -Name Start -Value 4 -Force
+}
+
+foreach ($serviceName in @('wuauserv', 'DiagTrack', 'dmwappushservice', 'SysMain', 'gupdate', 'gupdatem')) {
+  $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+  if ($svc) {
+    try {
+      if ($svc.Status -ne 'Stopped') {
+        Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+      }
+      Set-Service -Name $serviceName -StartupType Disabled -ErrorAction Stop
+    } catch {
+      Write-Warning "Could not disable service $serviceName (continuing; required Windows Update values are verified below): $_"
+    }
+  }
+}
+
+foreach ($taskPath in @('\Microsoft\Windows\UpdateOrchestrator\', '\Microsoft\Windows\WindowsUpdate\')) {
+  Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue |
+    Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+}
+
+$noAutoUpdate = Get-ItemPropertyValue `
+  -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' `
+  -Name 'NoAutoUpdate'
+if ([int]$noAutoUpdate -ne 1) {
+  throw "NoAutoUpdate is '$noAutoUpdate' after policy write (expected 1) - hosted-parity Windows Update policy did NOT persist; failing the build before the sentinel."
+}
+$disableWUAccess = Get-ItemPropertyValue `
+  -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' `
+  -Name 'DisableWindowsUpdateAccess'
+if ([int]$disableWUAccess -ne 1) {
+  throw "DisableWindowsUpdateAccess is '$disableWUAccess' after policy write (expected 1) - hosted-parity Windows Update policy did NOT persist; failing the build before the sentinel."
+}
+$wuStart = Get-ItemPropertyValue -Path $wuServicePath -Name 'Start'
+if ([int]$wuStart -ne 4) {
+  throw "wuauserv Start is '$wuStart' after service disable (expected 4) - hosted-parity Windows Update service policy did NOT persist; failing the build before the sentinel."
+}
+$telemetry = Get-ItemPropertyValue `
+  -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' `
+  -Name 'AllowTelemetry'
+if ([int]$telemetry -ne 0) {
+  throw "AllowTelemetry is '$telemetry' after policy write (expected 0) - hosted-parity telemetry policy did NOT persist; failing the build before the sentinel."
+}
+Write-Host 'Windows Update disabled by policy/service and telemetry policy verified (hosted-parity).'
+
+# --- 6. Disable UAC for the disposable guest --------------------------------
 # `runner` is a local admin; with UAC on, the task could get a filtered token,
 # breaking job steps that need admin. This guest is destroyed after one job.
 # Reboot-gated - applied on the first clone boot for a job.

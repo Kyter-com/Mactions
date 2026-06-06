@@ -521,6 +521,82 @@ final class WindowsImageTests: XCTestCase {
       "bootstrap.ps1 must verify GCM_INTERACTIVE before writing the sentinel")
   }
 
+  /// Hosted Configure-System.ps1 disables Windows Update by policy/service so
+  /// background OS updates cannot slow or reboot a job. Mactions mirrors that
+  /// deterministic behavior, but not the hosted script's broad root scheduled
+  /// task disable because our MactionsRunOnce task lives at the root path.
+  func testBootstrapDisablesWindowsUpdateWithoutDisablingRootScheduledTasks() {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let bootstrapURL = repoRoot.appendingPathComponent("scripts/bootstrap.ps1")
+    guard let script = try? String(contentsOf: bootstrapURL, encoding: .utf8) else {
+      return XCTFail("could not read \(bootstrapURL.path) to check Windows Update parity")
+    }
+
+    guard let policyRange = script.range(of: "Name = 'NoAutoUpdate'; Value = 1") else {
+      return XCTFail("bootstrap.ps1 must set the hosted Windows NoAutoUpdate policy")
+    }
+    XCTAssertNotNil(
+      script.range(of: "Name = 'AUOptions'; Value = 1"),
+      "bootstrap.ps1 must set hosted Windows AUOptions policy")
+    XCTAssertNotNil(
+      script.range(of: "Name = 'DoNotConnectToWindowsUpdateInternetLocations'; Value = 1"),
+      "bootstrap.ps1 must block Windows Update internet locations like hosted Windows")
+    XCTAssertNotNil(
+      script.range(of: "Name = 'DisableWindowsUpdateAccess'; Value = 1"),
+      "bootstrap.ps1 must set hosted Windows DisableWindowsUpdateAccess policy")
+    XCTAssertNotNil(
+      script.range(of: "Name = 'AllowTelemetry'; Value = 0"),
+      "bootstrap.ps1 must set the hosted Windows telemetry policy")
+    XCTAssertNotNil(
+      script.range(of: "Set-ItemProperty -Path $wuServicePath -Name Start -Value 4 -Force"),
+      "bootstrap.ps1 must disable the Windows Update service start value")
+    XCTAssertNotNil(
+      script.range(of: "'wuauserv', 'DiagTrack', 'dmwappushservice', 'SysMain', 'gupdate', 'gupdatem'"),
+      "bootstrap.ps1 must disable the hosted Windows update/telemetry service subset")
+
+    let taskPaths =
+      #"foreach ($taskPath in @('\Microsoft\Windows\UpdateOrchestrator\', '\Microsoft\Windows\WindowsUpdate\'))"#
+    XCTAssertNotNil(
+      script.range(of: taskPaths),
+      "bootstrap.ps1 must only disable Windows Update scheduled-task paths")
+    XCTAssertNil(
+      script.range(of: #"foreach ($taskPath in @('\',"#),
+      "bootstrap.ps1 must not disable the root scheduled-task path; MactionsRunOnce lives there")
+    XCTAssertNil(
+      script.range(of: #"Get-ScheduledTask -TaskPath '\'"#),
+      "bootstrap.ps1 must not disable root scheduled tasks")
+
+    guard
+      let sentinelRange = script.range(
+        of: "New-Item -ItemType File -Force -Path (Join-Path $RunnerRoot '.mactions-provisioned')")
+    else {
+      return XCTFail("could not locate the provisioning sentinel write in bootstrap.ps1")
+    }
+    XCTAssertLessThan(
+      policyRange.lowerBound.utf16Offset(in: script),
+      sentinelRange.lowerBound.utf16Offset(in: script),
+      "Windows Update policy must be applied before the base is stamped provisioned")
+
+    let verifyNoAutoUpdate = "NoAutoUpdate is '$noAutoUpdate' after policy write (expected 1)"
+    guard let verifyRange = script.range(of: verifyNoAutoUpdate) else {
+      return XCTFail("bootstrap.ps1 must verify NoAutoUpdate before writing the sentinel")
+    }
+    XCTAssertLessThan(
+      verifyRange.lowerBound.utf16Offset(in: script),
+      sentinelRange.lowerBound.utf16Offset(in: script),
+      "Windows Update policy verification must happen before the provisioning sentinel")
+    XCTAssertNotNil(
+      script.range(of: "DisableWindowsUpdateAccess is '$disableWUAccess' after policy write (expected 1)"),
+      "bootstrap.ps1 must verify DisableWindowsUpdateAccess after writing it")
+    XCTAssertNotNil(
+      script.range(of: "wuauserv Start is '$wuStart' after service disable (expected 4)"),
+      "bootstrap.ps1 must verify wuauserv is disabled after writing it")
+    XCTAssertNotNil(
+      script.range(of: "AllowTelemetry is '$telemetry' after policy write (expected 0)"),
+      "bootstrap.ps1 must verify telemetry policy after writing it")
+  }
+
   // MARK: Base health stamp (informational; written by fusion-windows-base)
 
   func testBaseHealthFileLivesAtMactionsRootNotUnderRuns() {
