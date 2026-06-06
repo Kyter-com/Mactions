@@ -148,6 +148,7 @@ rm -f "${FUSION_DIR}"/vmware*.log "${FUSION_DIR}"/mksSandbox*.log 2>/dev/null ||
 # Drop a PRIOR build's captured guest log so a failed copy this run can't leave
 # the health stamp pointing at a stale transcript from a different base.
 rm -f "${MACTIONS_ROOT}/logs/base-build-bootstrap.log" 2>/dev/null || true
+rm -f "${MACTIONS_ROOT}/logs/base-build-bootstrap-timeout.log" 2>/dev/null || true
 rm -rf "${FUSION_DIR}/caches" 2>/dev/null || true
 mkdir -p "$FUSION_DIR"
 
@@ -248,21 +249,29 @@ echo "    power-off removes it from \`vmrun list\`. Hard timeout: $((INSTALL_TIM
 GUEST_USER="runner"
 GUEST_PW="${MACTIONS_GUEST_PW:-P@ssw0rd-throwaway}"   # matches autounattend.xml (throwaway)
 SENTINEL='C:\actions-runner\.mactions-provisioned'
+GUEST_BOOTSTRAP_LOG="${MACTIONS_ROOT}/logs/base-build-bootstrap.log"
+GUEST_BOOTSTRAP_TIMEOUT_LOG="${MACTIONS_ROOT}/logs/base-build-bootstrap-timeout.log"
 PROVISIONED=0
 TOOLS_UP=0   # set once a guest-ops call succeeds (VMware Tools running → guest reached bootstrap)
 
+copy_guest_bootstrap_log() {
+  local dest="$1"
+  mkdir -p "${MACTIONS_ROOT}/logs"
+  "$VMRUN" -T fusion -gu "$GUEST_USER" -gp "$GUEST_PW" copyFileFromGuestToHost "$VMX" \
+    'C:\setup\logs\bootstrap.log' "$dest" >/dev/null 2>&1
+}
+
 START="$(date +%s)"
 LAST=0
+LAST_GUEST_LOG_COPY=0
 while vmrun_list_contains "$VMX"; do
   NOW="$(date +%s)"; ELAPSED=$((NOW - START))
   if [[ $ELAPSED -ge $INSTALL_TIMEOUT_SECS ]]; then
     # The VM is still running here, so guest-ops work — pull the build transcript
     # out for diagnosis BEFORE killing it.
-    mkdir -p "${MACTIONS_ROOT}/logs"
-    "$VMRUN" -T fusion -gu "$GUEST_USER" -gp "$GUEST_PW" copyFileFromGuestToHost "$VMX" \
-      'C:\setup\logs\bootstrap.log' "${MACTIONS_ROOT}/logs/base-build-bootstrap-timeout.log" >/dev/null 2>&1 || true
+    copy_guest_bootstrap_log "$GUEST_BOOTSTRAP_TIMEOUT_LOG" || true
     "$VMRUN" -T fusion stop "$VMX" hard >/dev/null 2>&1 || true
-    die "install timeout (${INSTALL_TIMEOUT_SECS}s) — never reached the provisioning sentinel. Guest log (if captured): ${MACTIONS_ROOT}/logs/base-build-bootstrap-timeout.log; else boot the VM in Fusion or read $FUSION_DIR/vmware.log."
+    die "install timeout (${INSTALL_TIMEOUT_SECS}s) — never reached the provisioning sentinel. Guest log (if captured): ${GUEST_BOOTSTRAP_TIMEOUT_LOG}; else boot the VM in Fusion or read $FUSION_DIR/vmware.log."
   fi
   if [[ $PROVISIONED -eq 0 ]]; then
     # One guest-ops probe serves two purposes: detect the sentinel, AND detect that
@@ -279,12 +288,17 @@ while vmrun_list_contains "$VMX"; do
         # power-off guest-ops are gone). Best-effort: the build doesn't depend
         # on it, but with it a "succeeded but something's odd" base is
         # diagnosable without booting the VM or offline-mounting the disk.
-        mkdir -p "${MACTIONS_ROOT}/logs"
-        "$VMRUN" -T fusion -gu "$GUEST_USER" -gp "$GUEST_PW" copyFileFromGuestToHost "$VMX" \
-          'C:\setup\logs\bootstrap.log' "${MACTIONS_ROOT}/logs/base-build-bootstrap.log" >/dev/null 2>&1 || true
+        copy_guest_bootstrap_log "$GUEST_BOOTSTRAP_LOG" || true
         ;;
       *exist*)         TOOLS_UP=1 ;;   # Tools answered (sentinel not there yet) — bootstrap is running
     esac
+  fi
+  if [[ $PROVISIONED -eq 0 && $TOOLS_UP -eq 1 && $((NOW - LAST_GUEST_LOG_COPY)) -ge 30 ]]; then
+    # A bootstrap script can fail and power off before the sentinel is ever
+    # observed. Copy its live transcript periodically while Tools are available;
+    # after power-off guest-ops are gone and the only fallback is offline mount.
+    copy_guest_bootstrap_log "$GUEST_BOOTSTRAP_LOG" || true
+    LAST_GUEST_LOG_COPY="$NOW"
   fi
   # Fast-fail when VMware Tools never come up: bootstrap.ps1 (which installs Tools) never
   # ran. Note this is NOT necessarily an OOBE stall — on 24H2/25H2 OOBE often COMPLETES
@@ -308,7 +322,7 @@ while vmrun_list_contains "$VMX"; do
 done
 
 if [[ $PROVISIONED -eq 0 ]]; then
-  die "guest powered off WITHOUT the provisioning sentinel ($SENTINEL) — Setup/bootstrap did NOT complete. Refusing to snapshot a broken base. Boot the VM in Fusion or read $FUSION_DIR/vmware.log to diagnose, then re-run."
+  die "guest powered off WITHOUT the provisioning sentinel ($SENTINEL) — Setup/bootstrap did NOT complete. Refusing to snapshot a broken base. Guest log (if captured): ${GUEST_BOOTSTRAP_LOG}; else boot the VM in Fusion or read $FUSION_DIR/vmware.log to diagnose, then re-run."
 fi
 echo "==> Guest powered off after $(( $(date +%s) - START ))s — provisioning verified, install + bootstrap done"
 

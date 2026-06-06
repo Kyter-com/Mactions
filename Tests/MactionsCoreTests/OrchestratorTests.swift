@@ -53,13 +53,21 @@ final class RecordCollector {
 
 @MainActor
 final class OrchestratorTests: XCTestCase {
-  private func makeOrchestrator(count: Int) -> (RunnerOrchestrator, FakeControlPlane, FakeFactory) {
+  private func makeOrchestrator(
+    count: Int,
+    reconcileInterval: UInt64 = 30_000_000_000,
+    remoteRegistrationGraceInterval: TimeInterval = 5 * 60,
+    idleJITRefreshInterval: TimeInterval? = 8 * 60
+  ) -> (RunnerOrchestrator, FakeControlPlane, FakeFactory) {
     let cp = FakeControlPlane()
     let factory = FakeFactory()
     let config = FleetConfig(owner: "o", repo: "r", labels: ["self-hosted"], desiredCount: count)
     // Fixed machine prefix so teardown scoping is deterministic (not host-dependent).
     let orch = RunnerOrchestrator(
-      controlPlane: cp, factory: factory, config: config, machinePrefix: "mactions-testmac")
+      controlPlane: cp, factory: factory, config: config, machinePrefix: "mactions-testmac",
+      reconcileInterval: reconcileInterval,
+      remoteRegistrationGraceInterval: remoteRegistrationGraceInterval,
+      idleJITRefreshInterval: idleJITRefreshInterval)
     return (orch, cp, factory)
   }
 
@@ -91,6 +99,59 @@ final class OrchestratorTests: XCTestCase {
     XCTAssertEqual(orch.runners.count, 2)
     XCTAssertEqual(factory.made.count, 3)
     XCTAssertEqual(orch.state, .online)
+  }
+
+  func testReconcileReplacesRunnerMissingFromGitHubAfterGrace() async {
+    let (orch, cp, factory) = makeOrchestrator(
+      count: 1, reconcileInterval: 100_000_000, remoteRegistrationGraceInterval: 0,
+      idleJITRefreshInterval: nil)
+    await orch.start()
+    XCTAssertEqual(cp.jitCount, 1)
+
+    try? await Task.sleep(nanoseconds: 160_000_000)
+
+    XCTAssertGreaterThanOrEqual(cp.jitCount, 2)
+    XCTAssertTrue(factory.made[0].stopped)
+    XCTAssertEqual(orch.runners.count, 1)
+    await orch.stop()
+  }
+
+  func testReconcileKeepsBusyRunnerPastIdleRefreshWindow() async {
+    let (orch, cp, factory) = makeOrchestrator(
+      count: 1, reconcileInterval: 100_000_000, remoteRegistrationGraceInterval: 0,
+      idleJITRefreshInterval: 0)
+    await orch.start()
+    let runner = try! XCTUnwrap(orch.runners.first)
+    cp.remote = [
+      RemoteRunner(id: runner.remoteId!, name: runner.id, status: "online", busy: true),
+    ]
+
+    try? await Task.sleep(nanoseconds: 160_000_000)
+
+    XCTAssertEqual(cp.jitCount, 1)
+    XCTAssertFalse(factory.made[0].stopped)
+    XCTAssertEqual(orch.runners.first?.id, runner.id)
+    await orch.stop()
+  }
+
+  func testReconcileRefreshesIdleOnlineRunnerBeforeJITExpires() async {
+    let (orch, cp, factory) = makeOrchestrator(
+      count: 1, reconcileInterval: 100_000_000, remoteRegistrationGraceInterval: 0,
+      idleJITRefreshInterval: 0)
+    await orch.start()
+    let runner = try! XCTUnwrap(orch.runners.first)
+    cp.remote = [
+      RemoteRunner(id: runner.remoteId!, name: runner.id, status: "online", busy: false),
+    ]
+
+    try? await Task.sleep(nanoseconds: 160_000_000)
+
+    XCTAssertGreaterThanOrEqual(cp.jitCount, 2)
+    XCTAssertTrue(factory.made[0].stopped)
+    XCTAssertTrue(cp.deleted.contains(runner.remoteId!))
+    XCTAssertEqual(orch.runners.count, 1)
+    XCTAssertNotEqual(orch.runners.first?.id, runner.id)
+    await orch.stop()
   }
 
   func testStopTearsDownAndDeregisters() async {

@@ -78,6 +78,14 @@ public final class RunnerOrchestrator {
   private let os: RunnerOS
   private let machinePrefix: String
   private let reconcileInterval: UInt64
+  /// A just-launched VM/local agent can take a short time to register with
+  /// GitHub. Do not treat a missing remote runner as stale until this grace has
+  /// elapsed.
+  private let remoteRegistrationGraceInterval: TimeInterval
+  /// JIT runner credentials are short-lived. An idle runner can look locally
+  /// healthy while GitHub can no longer assign it useful work, so refresh idle
+  /// slots before that window closes. `nil` disables age-based refresh.
+  private let idleJITRefreshInterval: TimeInterval?
 
   public private(set) var state: FleetState = .offline
   public private(set) var lastError: String?
@@ -119,7 +127,9 @@ public final class RunnerOrchestrator {
     config: FleetConfig,
     os: RunnerOS = .macOS,
     machinePrefix: String = machineRunnerPrefix(),
-    reconcileInterval: UInt64 = 30_000_000_000
+    reconcileInterval: UInt64 = 30_000_000_000,
+    remoteRegistrationGraceInterval: TimeInterval = 5 * 60,
+    idleJITRefreshInterval: TimeInterval? = 8 * 60
   ) {
     self.controlPlane = controlPlane
     self.factory = factory
@@ -127,6 +137,8 @@ public final class RunnerOrchestrator {
     self.os = os
     self.machinePrefix = machinePrefix
     self.reconcileInterval = reconcileInterval
+    self.remoteRegistrationGraceInterval = remoteRegistrationGraceInterval
+    self.idleJITRefreshInterval = idleJITRefreshInterval
   }
 
   public var runners: [ManagedRunner] {
@@ -171,12 +183,76 @@ public final class RunnerOrchestrator {
     reconciling = true
     defer { reconciling = false }
     let myEpoch = epoch
+    if state == .online {
+      await pruneUnusableSlots(epoch: myEpoch)
+      guard epoch == myEpoch, state == .online else { return }
+    }
     while slots.count < config.desiredCount {
       let ok = await provisionOne(epoch: myEpoch)
       // Bail if we were stopped mid-flight, or on a transient failure (the
       // periodic loop / next exit retries — we never spin).
       guard epoch == myEpoch, state == .starting || state == .online else { return }
       if !ok { break }
+    }
+  }
+
+  /// Reconcile local slots with GitHub's authoritative runner state. The
+  /// provider can only know "process/VM is alive"; GitHub decides whether a
+  /// runner is online and assignable. This catches stale JIT registrations that
+  /// expired while an idle provider kept running locally.
+  private func pruneUnusableSlots(epoch myEpoch: Int) async {
+    guard !slots.isEmpty else { return }
+    let remote: [RemoteRunner]
+    do {
+      remote = try await controlPlane.listRunners()
+    } catch {
+      lastError = String(describing: error)
+      notify()
+      return
+    }
+    guard epoch == myEpoch, state == .online else { return }
+
+    let byId = Dictionary(remote.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    let byName = Dictionary(remote.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+    let now = Date()
+    var stale: [(slot: Slot, remote: RemoteRunner?)] = []
+
+    for slot in slots {
+      let remoteRunner = slot.remoteId.flatMap { byId[$0] } ?? byName[slot.name]
+      let age = now.timeIntervalSince(slot.startedAt)
+      guard let remoteRunner else {
+        if age >= remoteRegistrationGraceInterval {
+          stale.append((slot, nil))
+        }
+        continue
+      }
+
+      if remoteRunner.status.lowercased() != "online" {
+        if age >= remoteRegistrationGraceInterval {
+          stale.append((slot, remoteRunner))
+        }
+        continue
+      }
+
+      if let idleJITRefreshInterval, idleJITRefreshInterval >= 0,
+        !remoteRunner.busy, age >= idleJITRefreshInterval
+      {
+        stale.append((slot, remoteRunner))
+      }
+    }
+
+    guard !stale.isEmpty else { return }
+    for item in stale {
+      item.slot.provider.stop()
+    }
+    let staleIds = Set(stale.map { ObjectIdentifier($0.slot) })
+    slots.removeAll { staleIds.contains(ObjectIdentifier($0)) }
+    notify()
+
+    for item in stale {
+      if let id = item.remote?.id ?? item.slot.remoteId {
+        try? await controlPlane.deleteRunner(id: id)
+      }
     }
   }
 

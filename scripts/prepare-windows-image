@@ -144,6 +144,10 @@ RECORDED_BUILD=""
 # ~/.mactions/windows-base.recipe on a successful build, and MUST stay equal to
 # WindowsImage.currentProvisioningRecipeVersion (a unit test enforces that), which
 # the app reads to decide whether a built base needs a rebuild.
+# v10: bootstrap.ps1 keeps hosted Windows Defender parity best-effort so Win11
+# ARM builds do not fail when Defender immediately remediates/verifies some
+# preferences as unchanged; PortableGit temp SFX files use unique names to avoid
+# stale lock failures.
 # v9: bootstrap.ps1 mirrors hosted Windows Defender scan/monitoring disablement,
 # C:/D: exclusions, and the Win11-ARM BlockAtFirstSeen exception from
 # actions/runner-images' Configure-WindowsDefender.ps1.
@@ -159,7 +163,7 @@ RECORDED_BUILD=""
 # v4: bootstrap.ps1 verifies git/bash/pwsh before the sentinel (+ retries their
 # downloads). v3 bases can be silently missing those tools (a swallowed transient
 # download failure still snapshotted), so they warrant a rebuild to a verified v4.
-PROVISIONING_RECIPE_VERSION=9
+PROVISIONING_RECIPE_VERSION=10
 
 # Fetch a UUP dump URL with backoff, writing the body to OUTFILE. Retries on
 # network errors, HTTP 429 (UUP dump's ~20-25s per-IP throttle), and 5xx; fails

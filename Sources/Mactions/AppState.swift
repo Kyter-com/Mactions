@@ -673,6 +673,7 @@ final class AppState: ObservableObject {
             "Windows prep finished. Complete the one-time install per the printed steps, shut the VM down, then run \"Set up Windows runner\" again to confirm."
         }
       } else {
+        refreshWindowsBaseInfo()
         // The script tags its own failures via die(): `error: <msg>`. Surface the
         // first such line (a concise human summary); never echo a raw Python
         // traceback or set -e abort into the one-line status — the full transcript
@@ -759,6 +760,18 @@ final class AppState: ObservableObject {
       .map { dir.appendingPathComponent($0).path }
   }
 
+  /// Fixed guest-provisioning transcript paths written by `fusion-windows-base`.
+  /// These are removed at the start of each build and re-copied while VMware
+  /// Tools is up, so if they exist they describe the latest attempt.
+  private static func latestGuestBuildLogPath() -> String? {
+    let dir = HostCleanup.logsRoot()
+    for name in ["base-build-bootstrap.log", "base-build-bootstrap-timeout.log"] {
+      let path = dir.appendingPathComponent(name).path
+      if FileManager.default.fileExists(atPath: path) { return path }
+    }
+    return nil
+  }
+
   /// Recompose the base summary line + guest-log pointer from the recorded
   /// build/recipe/health files. Cheap (three tiny file reads); called on launch,
   /// when the Setup pane appears, and after a successful build.
@@ -773,9 +786,9 @@ final class AppState: ObservableObject {
       // Only surface the guest log while it actually exists (purge-able).
       windowsGuestLogPath = health.guestLogPath.flatMap {
         FileManager.default.fileExists(atPath: $0) ? $0 : nil
-      }
+      } ?? Self.latestGuestBuildLogPath()
     } else {
-      windowsGuestLogPath = nil
+      windowsGuestLogPath = Self.latestGuestBuildLogPath()
     }
     windowsBaseSummary = parts.isEmpty ? nil : parts.joined(separator: " · ")
   }

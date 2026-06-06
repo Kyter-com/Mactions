@@ -599,10 +599,10 @@ final class WindowsImageTests: XCTestCase {
 
   /// Hosted Configure-WindowsDefender.ps1 disables Defender scan/monitoring
   /// settings and excludes the job disks. Mactions mirrors that deterministic
-  /// CI behavior, but keeps the upstream Win11-ARM exception: do not set the
-  /// BlockAtFirstSeen preference because Defender remediates it during image
-  /// build on that platform.
-  func testBootstrapMirrorsHostedWindowsDefenderBeforeSentinel() {
+  /// CI behavior best-effort, but keeps the upstream Win11-ARM exception: do not
+  /// set the BlockAtFirstSeen preference because Defender remediates it during
+  /// image build on that platform.
+  func testBootstrapAppliesHostedWindowsDefenderBestEffortBeforeSentinel() {
     let repoRoot = URL(fileURLWithPath: #filePath)
       .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
     let bootstrapURL = repoRoot.appendingPathComponent("scripts/bootstrap.ps1")
@@ -648,7 +648,8 @@ final class WindowsImageTests: XCTestCase {
       "@{ EnableNetworkProtection = 'Disabled' }",
       "ForceDefenderPassiveMode",
       "$defenderPreference = Get-MpPreference",
-      "Hosted-parity Defender policy did NOT persist",
+      "Hosted-parity Defender policy did not fully persist",
+      "Defender parity is best-effort like actions/runner-images",
     ] {
       XCTAssertNotNil(
         script.range(of: required),
@@ -656,8 +657,52 @@ final class WindowsImageTests: XCTestCase {
     }
 
     XCTAssertNil(
+      script.range(of: "throw \"Hosted-parity Defender policy"),
+      "Defender preference persistence must not block the provisioning sentinel")
+    XCTAssertNil(
+      script.range(of: "throw \"Set-MpPreference failed"),
+      "Set-MpPreference failures must be warnings, matching actions/runner-images' best-effort behavior")
+    XCTAssertNil(
+      script.range(of: "throw 'Set-MpPreference is not available"),
+      "Missing Set-MpPreference should not block an otherwise usable runner base")
+
+    XCTAssertNil(
       script.range(of: "@{ DisableBlockAtFirstSeen"),
       "bootstrap.ps1 must keep the official Win11-ARM exception and not set DisableBlockAtFirstSeen")
+  }
+
+  func testFusionBaseCopiesGuestBootstrapLogBeforeNoSentinelFailure() {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let scriptURL = repoRoot.appendingPathComponent("scripts/fusion-windows-base")
+    guard let script = try? String(contentsOf: scriptURL, encoding: .utf8) else {
+      return XCTFail("could not read \(scriptURL.path) to check guest-log capture")
+    }
+
+    for required in [
+      "GUEST_BOOTSTRAP_LOG=\"${MACTIONS_ROOT}/logs/base-build-bootstrap.log\"",
+      "copy_guest_bootstrap_log()",
+      "copy_guest_bootstrap_log \"$GUEST_BOOTSTRAP_LOG\" || true",
+      "Guest log (if captured): ${GUEST_BOOTSTRAP_LOG}",
+      "rm -f \"${MACTIONS_ROOT}/logs/base-build-bootstrap.log\"",
+      "rm -f \"${MACTIONS_ROOT}/logs/base-build-bootstrap-timeout.log\"",
+    ] {
+      XCTAssertNotNil(
+        script.range(of: required),
+        "fusion-windows-base is missing guest-log capture fragment: \(required)")
+    }
+
+    guard
+      let liveCopyRange = script.range(
+        of: "A bootstrap script can fail and power off before the sentinel"),
+      let noSentinelFailureRange = script.range(of: "guest powered off WITHOUT the provisioning sentinel")
+    else {
+      return XCTFail("could not locate live guest-log copy or no-sentinel failure")
+    }
+    XCTAssertLessThan(
+      liveCopyRange.lowerBound.utf16Offset(in: script),
+      noSentinelFailureRange.lowerBound.utf16Offset(in: script),
+      "fusion-windows-base must copy bootstrap.log while the VM is still running, before guest-ops disappear")
   }
 
   // MARK: Base health stamp (informational; written by fusion-windows-base)

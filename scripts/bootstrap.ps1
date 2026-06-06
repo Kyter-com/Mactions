@@ -208,8 +208,7 @@ try {
     Write-Warning "No PortableGit ARM64 asset in release $($gitRel.tag_name); skipping Git install."
   } else {
     $gitDir = 'C:\Git'
-    $gitSfx = Join-Path $env:TEMP 'portablegit-arm64.7z.exe'
-    if (Test-Path $gitSfx) { Remove-Item $gitSfx -Force }
+    $gitSfx = Join-Path $env:TEMP ("portablegit-arm64-{0}.7z.exe" -f ([guid]::NewGuid().ToString('N')))
     # Retry the download - git+bash are REQUIRED (verified before the sentinel below),
     # so a transient blip here must not silently skip Git and produce a base that fails
     # `actions/checkout` (falls back to a slow REST tarball) and every `shell: bash` step.
@@ -221,7 +220,9 @@ try {
     # extraction target (no space after -o). PortableGit then runs its own
     # non-interactive post-install to wire up the MSYS environment bash needs.
     $proc = Start-Process $gitSfx -ArgumentList '-y', "-o$gitDir" -Wait -PassThru
-    Remove-Item $gitSfx -Force
+    try { Remove-Item $gitSfx -Force -ErrorAction Stop } catch {
+      Write-Warning "Could not remove temporary PortableGit SFX $gitSfx (continuing): $_"
+    }
     if ($proc.ExitCode -ne 0) { throw "PortableGit SFX failed with exit code $($proc.ExitCode)" }
     $gitCmd = Join-Path $gitDir 'cmd'
     $gitBin = Join-Path $gitDir 'bin'
@@ -636,87 +637,92 @@ Write-Host 'Windows Update disabled by policy/service and telemetry policy verif
 # - Only force Defender passive mode if the Windows Advanced Threat Protection
 #   policy key exists.
 if (-not (Get-Command -Name Set-MpPreference -ErrorAction SilentlyContinue)) {
-  throw 'Set-MpPreference is not available; cannot apply hosted-parity Defender policy before stamping the base.'
-}
+  Write-Warning 'Set-MpPreference is not available; skipping hosted-parity Defender policy.'
+} else {
+  $hostedDefenderPreference = @(
+    @{ DisableArchiveScanning = $true }
+    @{ DisableAutoExclusions = $true }
+    @{ DisableBehaviorMonitoring = $true }
+    @{ DisableCatchupFullScan = $true }
+    @{ DisableCatchupQuickScan = $true }
+    @{ DisableIntrusionPreventionSystem = $true }
+    @{ DisableIOAVProtection = $true }
+    @{ DisablePrivacyMode = $true }
+    @{ DisableScanningNetworkFiles = $true }
+    @{ DisableScriptScanning = $true }
+    @{ MAPSReporting = 0 }
+    @{ PUAProtection = 0 }
+    @{ SignatureDisableUpdateOnStartupWithoutEngine = $true }
+    @{ SubmitSamplesConsent = 2 }
+    @{ ScanAvgCPULoadFactor = 5; ExclusionPath = @('D:\', 'C:\') }
+    @{ DisableRealtimeMonitoring = $true }
+    @{ ScanScheduleDay = 8 }
+    @{ EnableControlledFolderAccess = 'Disable' }
+    @{ EnableNetworkProtection = 'Disabled' }
+  )
 
-$hostedDefenderPreference = @(
-  @{ DisableArchiveScanning = $true }
-  @{ DisableAutoExclusions = $true }
-  @{ DisableBehaviorMonitoring = $true }
-  @{ DisableCatchupFullScan = $true }
-  @{ DisableCatchupQuickScan = $true }
-  @{ DisableIntrusionPreventionSystem = $true }
-  @{ DisableIOAVProtection = $true }
-  @{ DisablePrivacyMode = $true }
-  @{ DisableScanningNetworkFiles = $true }
-  @{ DisableScriptScanning = $true }
-  @{ MAPSReporting = 0 }
-  @{ PUAProtection = 0 }
-  @{ SignatureDisableUpdateOnStartupWithoutEngine = $true }
-  @{ SubmitSamplesConsent = 2 }
-  @{ ScanAvgCPULoadFactor = 5; ExclusionPath = @('D:\', 'C:\') }
-  @{ DisableRealtimeMonitoring = $true }
-  @{ ScanScheduleDay = 8 }
-  @{ EnableControlledFolderAccess = 'Disable' }
-  @{ EnableNetworkProtection = 'Disabled' }
-)
+  foreach ($preference in $hostedDefenderPreference) {
+    try {
+      Set-MpPreference @preference -ErrorAction Stop
+    } catch {
+      $names = ($preference.Keys | Sort-Object) -join ','
+      Write-Warning "Set-MpPreference failed for $names (continuing; Defender parity is best-effort like actions/runner-images): $_"
+    }
+  }
 
-foreach ($preference in $hostedDefenderPreference) {
-  try {
-    Set-MpPreference @preference -ErrorAction Stop
-  } catch {
-    $names = ($preference.Keys | Sort-Object) -join ','
-    throw "Set-MpPreference failed for $names - hosted-parity Defender policy did NOT persist; failing the build before the sentinel: $_"
+  $atpRegPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Advanced Threat Protection'
+  if (Test-Path $atpRegPath) {
+    Write-Host 'Set Microsoft Defender Antivirus to passive mode.'
+    try {
+      Set-ItemProperty -Path $atpRegPath -Name 'ForceDefenderPassiveMode' -Value 1 -Type DWord -ErrorAction Stop
+      $atpPassiveMode = Get-ItemPropertyValue -Path $atpRegPath -Name 'ForceDefenderPassiveMode'
+      if ([int]$atpPassiveMode -ne 1) {
+        Write-Warning "ForceDefenderPassiveMode is '$atpPassiveMode' after policy write (expected 1); continuing."
+      }
+    } catch {
+      Write-Warning "Could not set ForceDefenderPassiveMode (continuing): $_"
+    }
+  }
+
+  $defenderPreference = Get-MpPreference
+  $missingDefenderPreference = @()
+  foreach ($name in @(
+    'DisableArchiveScanning',
+    'DisableAutoExclusions',
+    'DisableBehaviorMonitoring',
+    'DisableCatchupFullScan',
+    'DisableCatchupQuickScan',
+    'DisableIntrusionPreventionSystem',
+    'DisableIOAVProtection',
+    'DisablePrivacyMode',
+    'DisableScanningNetworkFiles',
+    'DisableScriptScanning',
+    'SignatureDisableUpdateOnStartupWithoutEngine',
+    'DisableRealtimeMonitoring'
+  )) {
+    $value = $defenderPreference.PSObject.Properties[$name].Value
+    if ($value -ne $true) { $missingDefenderPreference += "$name=$value" }
+  }
+
+  $exclusions = @($defenderPreference.ExclusionPath)
+  foreach ($path in @('C:\', 'D:\')) {
+    if ($exclusions -notcontains $path) { $missingDefenderPreference += "ExclusionPath missing $path" }
+  }
+  if ([int]$defenderPreference.ScanAvgCPULoadFactor -ne 5) {
+    $missingDefenderPreference += "ScanAvgCPULoadFactor=$($defenderPreference.ScanAvgCPULoadFactor)"
+  }
+  if ([int]$defenderPreference.MAPSReporting -ne 0) {
+    $missingDefenderPreference += "MAPSReporting=$($defenderPreference.MAPSReporting)"
+  }
+  if ([int]$defenderPreference.PUAProtection -ne 0) {
+    $missingDefenderPreference += "PUAProtection=$($defenderPreference.PUAProtection)"
+  }
+  if ($missingDefenderPreference.Count) {
+    Write-Warning "Hosted-parity Defender policy did not fully persist (continuing; actions/runner-images does not verify persistence): $($missingDefenderPreference -join '; ')"
+  } else {
+    Write-Host 'Windows Defender scanning/monitoring disabled and disk exclusions verified (hosted-parity).'
   }
 }
-
-$atpRegPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Advanced Threat Protection'
-if (Test-Path $atpRegPath) {
-  Write-Host 'Set Microsoft Defender Antivirus to passive mode.'
-  Set-ItemProperty -Path $atpRegPath -Name 'ForceDefenderPassiveMode' -Value 1 -Type DWord
-  $atpPassiveMode = Get-ItemPropertyValue -Path $atpRegPath -Name 'ForceDefenderPassiveMode'
-  if ([int]$atpPassiveMode -ne 1) {
-    throw "ForceDefenderPassiveMode is '$atpPassiveMode' after policy write (expected 1) - hosted-parity Defender passive mode did NOT persist; failing the build before the sentinel."
-  }
-}
-
-$defenderPreference = Get-MpPreference
-$missingDefenderPreference = @()
-foreach ($name in @(
-  'DisableArchiveScanning',
-  'DisableAutoExclusions',
-  'DisableBehaviorMonitoring',
-  'DisableCatchupFullScan',
-  'DisableCatchupQuickScan',
-  'DisableIntrusionPreventionSystem',
-  'DisableIOAVProtection',
-  'DisablePrivacyMode',
-  'DisableScanningNetworkFiles',
-  'DisableScriptScanning',
-  'SignatureDisableUpdateOnStartupWithoutEngine',
-  'DisableRealtimeMonitoring'
-)) {
-  $value = $defenderPreference.PSObject.Properties[$name].Value
-  if ($value -ne $true) { $missingDefenderPreference += "$name=$value" }
-}
-
-$exclusions = @($defenderPreference.ExclusionPath)
-foreach ($path in @('C:\', 'D:\')) {
-  if ($exclusions -notcontains $path) { $missingDefenderPreference += "ExclusionPath missing $path" }
-}
-if ([int]$defenderPreference.ScanAvgCPULoadFactor -ne 5) {
-  $missingDefenderPreference += "ScanAvgCPULoadFactor=$($defenderPreference.ScanAvgCPULoadFactor)"
-}
-if ([int]$defenderPreference.MAPSReporting -ne 0) {
-  $missingDefenderPreference += "MAPSReporting=$($defenderPreference.MAPSReporting)"
-}
-if ([int]$defenderPreference.PUAProtection -ne 0) {
-  $missingDefenderPreference += "PUAProtection=$($defenderPreference.PUAProtection)"
-}
-if ($missingDefenderPreference.Count) {
-  throw "Hosted-parity Defender policy did NOT persist: $($missingDefenderPreference -join '; '). Failing the build before the sentinel."
-}
-Write-Host 'Windows Defender scanning/monitoring disabled and disk exclusions verified (hosted-parity).'
 
 # --- 7. Disable UAC for the disposable guest --------------------------------
 # `runner` is a local admin; with UAC on, the task could get a filtered token,
