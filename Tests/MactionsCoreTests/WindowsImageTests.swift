@@ -597,6 +597,69 @@ final class WindowsImageTests: XCTestCase {
       "bootstrap.ps1 must verify telemetry policy after writing it")
   }
 
+  /// Hosted Configure-WindowsDefender.ps1 disables Defender scan/monitoring
+  /// settings and excludes the job disks. Mactions mirrors that deterministic
+  /// CI behavior, but keeps the upstream Win11-ARM exception: do not set the
+  /// BlockAtFirstSeen preference because Defender remediates it during image
+  /// build on that platform.
+  func testBootstrapMirrorsHostedWindowsDefenderBeforeSentinel() {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let bootstrapURL = repoRoot.appendingPathComponent("scripts/bootstrap.ps1")
+    guard let script = try? String(contentsOf: bootstrapURL, encoding: .utf8) else {
+      return XCTFail("could not read \(bootstrapURL.path) to check Defender parity")
+    }
+
+    guard let defenderRange = script.range(of: "Set-MpPreference @preference -ErrorAction Stop")
+    else {
+      return XCTFail("bootstrap.ps1 must apply hosted Windows Defender preferences")
+    }
+    guard
+      let sentinelRange = script.range(
+        of: "New-Item -ItemType File -Force -Path (Join-Path $RunnerRoot '.mactions-provisioned')")
+    else {
+      return XCTFail("could not locate the provisioning sentinel write in bootstrap.ps1")
+    }
+
+    XCTAssertLessThan(
+      defenderRange.lowerBound.utf16Offset(in: script),
+      sentinelRange.lowerBound.utf16Offset(in: script),
+      "Defender parity must be applied before the base is stamped provisioned")
+
+    for required in [
+      "@{ DisableArchiveScanning = $true }",
+      "@{ DisableAutoExclusions = $true }",
+      "@{ DisableBehaviorMonitoring = $true }",
+      "@{ DisableCatchupFullScan = $true }",
+      "@{ DisableCatchupQuickScan = $true }",
+      "@{ DisableIntrusionPreventionSystem = $true }",
+      "@{ DisableRealtimeMonitoring = $true }",
+      "@{ DisableScriptScanning = $true }",
+      "@{ DisableIOAVProtection = $true }",
+      "@{ DisablePrivacyMode = $true }",
+      "@{ DisableScanningNetworkFiles = $true }",
+      "@{ MAPSReporting = 0 }",
+      "@{ PUAProtection = 0 }",
+      "@{ SignatureDisableUpdateOnStartupWithoutEngine = $true }",
+      "@{ SubmitSamplesConsent = 2 }",
+      "@{ ScanAvgCPULoadFactor = 5; ExclusionPath = @('D:\\', 'C:\\') }",
+      "@{ ScanScheduleDay = 8 }",
+      "@{ EnableControlledFolderAccess = 'Disable' }",
+      "@{ EnableNetworkProtection = 'Disabled' }",
+      "ForceDefenderPassiveMode",
+      "$defenderPreference = Get-MpPreference",
+      "Hosted-parity Defender policy did NOT persist",
+    ] {
+      XCTAssertNotNil(
+        script.range(of: required),
+        "bootstrap.ps1 is missing hosted Defender parity fragment: \(required)")
+    }
+
+    XCTAssertNil(
+      script.range(of: "@{ DisableBlockAtFirstSeen"),
+      "bootstrap.ps1 must keep the official Win11-ARM exception and not set DisableBlockAtFirstSeen")
+  }
+
   // MARK: Base health stamp (informational; written by fusion-windows-base)
 
   func testBaseHealthFileLivesAtMactionsRootNotUnderRuns() {

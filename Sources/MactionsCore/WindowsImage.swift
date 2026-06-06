@@ -234,6 +234,9 @@ public enum WindowsImage {
   /// the authority that gets stamped into `windows-base.recipe` at build time —
   /// and a unit test asserts they match.
   ///
+  /// v9: bootstrap.ps1 mirrors hosted Windows Defender scan/monitoring
+  /// disablement, C:/D: exclusions, and the Win11-ARM BlockAtFirstSeen exception
+  /// from actions/runner-images' Configure-WindowsDefender.ps1.
   /// v8: bootstrap.ps1 disables Windows Update by policy/service and telemetry
   /// policy, matching hosted-image determinism without disabling the root
   /// scheduled-task path that MactionsRunOnce needs.
@@ -250,7 +253,7 @@ public enum WindowsImage {
   /// still snapshotted, shipping a base where `actions/checkout` falls back to a REST
   /// tarball and every `shell: bash`/`shell: pwsh` step dies. So v3 bases are
   /// untrustworthy and warrant a rebuild to a verified v4.
-  public static let currentProvisioningRecipeVersion = 8
+  public static let currentProvisioningRecipeVersion = 9
 
   /// Where `prepare-windows-image` records the provisioning-recipe version the
   /// base was built with. A sibling of `windows-base.build`; must survive run

@@ -15,7 +15,7 @@
        node_modules trees).
     2. Drop C:\setup\run-job.ps1 (the PER-CLONE runtime) and register a recurring
        logon Scheduled Task that runs it on EVERY boot.
-    3. Apply minimal GitHub-hosted Windows shell policy parity.
+    3. Apply minimal GitHub-hosted Windows OS policy parity.
     4. Disable UAC for this disposable guest so the task gets a full admin token.
 
   Per job, the host clones this base, injects a tiny config ISO carrying the JIT
@@ -623,7 +623,102 @@ if ([int]$telemetry -ne 0) {
 }
 Write-Host 'Windows Update disabled by policy/service and telemetry policy verified (hosted-parity).'
 
-# --- 6. Disable UAC for the disposable guest --------------------------------
+# --- 6. GitHub-hosted Windows Defender determinism --------------------------
+# GitHub-hosted Windows images disable Defender scanning/monitoring and exclude
+# the whole job disk. Mirror that CI determinism here: a Mactions Windows guest
+# is a one-job throwaway VM, so broad C:\ / D:\ exclusions do not create
+# cross-job persistence, and they avoid Defender scanning every dependency
+# extraction, checkout write, and compiler output file.
+#
+# Edge cases from actions/runner-images' Configure-WindowsDefender.ps1:
+# - DO NOT set the BlockAtFirstSeen preference on Win11 ARM. Upstream skips it
+#   because Defender remediates that setting as a threat during image build.
+# - Only force Defender passive mode if the Windows Advanced Threat Protection
+#   policy key exists.
+if (-not (Get-Command -Name Set-MpPreference -ErrorAction SilentlyContinue)) {
+  throw 'Set-MpPreference is not available; cannot apply hosted-parity Defender policy before stamping the base.'
+}
+
+$hostedDefenderPreference = @(
+  @{ DisableArchiveScanning = $true }
+  @{ DisableAutoExclusions = $true }
+  @{ DisableBehaviorMonitoring = $true }
+  @{ DisableCatchupFullScan = $true }
+  @{ DisableCatchupQuickScan = $true }
+  @{ DisableIntrusionPreventionSystem = $true }
+  @{ DisableIOAVProtection = $true }
+  @{ DisablePrivacyMode = $true }
+  @{ DisableScanningNetworkFiles = $true }
+  @{ DisableScriptScanning = $true }
+  @{ MAPSReporting = 0 }
+  @{ PUAProtection = 0 }
+  @{ SignatureDisableUpdateOnStartupWithoutEngine = $true }
+  @{ SubmitSamplesConsent = 2 }
+  @{ ScanAvgCPULoadFactor = 5; ExclusionPath = @('D:\', 'C:\') }
+  @{ DisableRealtimeMonitoring = $true }
+  @{ ScanScheduleDay = 8 }
+  @{ EnableControlledFolderAccess = 'Disable' }
+  @{ EnableNetworkProtection = 'Disabled' }
+)
+
+foreach ($preference in $hostedDefenderPreference) {
+  try {
+    Set-MpPreference @preference -ErrorAction Stop
+  } catch {
+    $names = ($preference.Keys | Sort-Object) -join ','
+    throw "Set-MpPreference failed for $names - hosted-parity Defender policy did NOT persist; failing the build before the sentinel: $_"
+  }
+}
+
+$atpRegPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Advanced Threat Protection'
+if (Test-Path $atpRegPath) {
+  Write-Host 'Set Microsoft Defender Antivirus to passive mode.'
+  Set-ItemProperty -Path $atpRegPath -Name 'ForceDefenderPassiveMode' -Value 1 -Type DWord
+  $atpPassiveMode = Get-ItemPropertyValue -Path $atpRegPath -Name 'ForceDefenderPassiveMode'
+  if ([int]$atpPassiveMode -ne 1) {
+    throw "ForceDefenderPassiveMode is '$atpPassiveMode' after policy write (expected 1) - hosted-parity Defender passive mode did NOT persist; failing the build before the sentinel."
+  }
+}
+
+$defenderPreference = Get-MpPreference
+$missingDefenderPreference = @()
+foreach ($name in @(
+  'DisableArchiveScanning',
+  'DisableAutoExclusions',
+  'DisableBehaviorMonitoring',
+  'DisableCatchupFullScan',
+  'DisableCatchupQuickScan',
+  'DisableIntrusionPreventionSystem',
+  'DisableIOAVProtection',
+  'DisablePrivacyMode',
+  'DisableScanningNetworkFiles',
+  'DisableScriptScanning',
+  'SignatureDisableUpdateOnStartupWithoutEngine',
+  'DisableRealtimeMonitoring'
+)) {
+  $value = $defenderPreference.PSObject.Properties[$name].Value
+  if ($value -ne $true) { $missingDefenderPreference += "$name=$value" }
+}
+
+$exclusions = @($defenderPreference.ExclusionPath)
+foreach ($path in @('C:\', 'D:\')) {
+  if ($exclusions -notcontains $path) { $missingDefenderPreference += "ExclusionPath missing $path" }
+}
+if ([int]$defenderPreference.ScanAvgCPULoadFactor -ne 5) {
+  $missingDefenderPreference += "ScanAvgCPULoadFactor=$($defenderPreference.ScanAvgCPULoadFactor)"
+}
+if ([int]$defenderPreference.MAPSReporting -ne 0) {
+  $missingDefenderPreference += "MAPSReporting=$($defenderPreference.MAPSReporting)"
+}
+if ([int]$defenderPreference.PUAProtection -ne 0) {
+  $missingDefenderPreference += "PUAProtection=$($defenderPreference.PUAProtection)"
+}
+if ($missingDefenderPreference.Count) {
+  throw "Hosted-parity Defender policy did NOT persist: $($missingDefenderPreference -join '; '). Failing the build before the sentinel."
+}
+Write-Host 'Windows Defender scanning/monitoring disabled and disk exclusions verified (hosted-parity).'
+
+# --- 7. Disable UAC for the disposable guest --------------------------------
 # `runner` is a local admin; with UAC on, the task could get a filtered token,
 # breaking job steps that need admin. This guest is destroyed after one job.
 # Reboot-gated - applied on the first clone boot for a job.
