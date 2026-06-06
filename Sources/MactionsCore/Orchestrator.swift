@@ -46,16 +46,35 @@ public func machineRunnerPrefix(host: String = ProcessInfo.processInfo.hostName)
 /// "ghost" registration (an agent killed before it could self-deregister) that
 /// GitHub only auto-prunes much later. Reaping it at go-online — before any new
 /// runner is provisioned — keeps the runner list clean without waiting on
-/// GitHub. Scoped to our `mactions-<host>` prefix, so it never touches another
-/// Mac's runners. Best-effort: a list/delete failure is swallowed (GitHub's own
-/// ephemeral cleanup is the backstop).
+/// GitHub. By default this is scoped to our `mactions-<host>` prefix, so stop()
+/// never touches another Mac's runners. The launch/go-online sweep can opt into
+/// broader stale cleanup for offline/non-busy `mactions-*` registrations left by
+/// old host-name generations; online or busy runners from another Mac are kept.
+/// Best-effort: a list/delete failure is swallowed (GitHub's own ephemeral
+/// cleanup is the backstop).
 public func deregisterOrphanRunners(
-  _ controlPlane: RunnerControlPlane, prefix: String = machineRunnerPrefix()
+  _ controlPlane: RunnerControlPlane,
+  prefix: String = machineRunnerPrefix(),
+  includeOfflineMactionsRunners: Bool = false
 ) async {
   guard let remote = try? await controlPlane.listRunners() else { return }
-  for runner in remote where runner.name.hasPrefix(prefix) {
+  for runner in remote where shouldDeregisterOrphanRunner(
+    runner, prefix: prefix, includeOfflineMactionsRunners: includeOfflineMactionsRunners)
+  {
     try? await controlPlane.deleteRunner(id: runner.id)
   }
+}
+
+func shouldDeregisterOrphanRunner(
+  _ runner: RemoteRunner,
+  prefix: String,
+  includeOfflineMactionsRunners: Bool
+) -> Bool {
+  if runner.name.hasPrefix(prefix) { return true }
+  guard includeOfflineMactionsRunners else { return false }
+  return runner.name.hasPrefix("mactions-")
+    && runner.status.lowercased() == "offline"
+    && !runner.busy
 }
 
 /// Owns the lifecycle of N ephemeral runners for one repo.

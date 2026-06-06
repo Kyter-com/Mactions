@@ -80,10 +80,15 @@ vmrun_list_contains() {
 }
 
 # True iff the base .vmx has a snapshot named "$SNAPSHOT" (the linked-clone
-# parent). listSnapshots prints "Total snapshots: N" then one name per line.
+# parent). Prefer vmrun listSnapshots, but fall back to the .vmsd metadata:
+# vmrun can refuse listSnapshots while a linked clone is running and holding
+# parent-disk locks, even though the snapshot remains valid for more clones.
 base_has_snapshot() {
   local vmx="$1"
-  "$VMRUN" -T fusion listSnapshots "$vmx" 2>/dev/null | grep -Fxq -- "$SNAPSHOT"
+  "$VMRUN" -T fusion listSnapshots "$vmx" 2>/dev/null | grep -Fxq -- "$SNAPSHOT" && return 0
+  local vmsd="${vmx%.vmx}.vmsd"
+  [[ -f "$vmsd" ]] || return 1
+  grep -Eq '^[[:space:]]*snapshot[0-9]+\.displayName[[:space:]]*=[[:space:]]*"'"${SNAPSHOT//\"/\\\"}"'"[[:space:]]*$' "$vmsd"
 }
 
 # Set (or replace) a single `key = "value"` assignment in a .vmx file. Removes

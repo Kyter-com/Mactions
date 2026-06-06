@@ -328,12 +328,15 @@ final class AppState: ObservableObject {
       // but not the *remote* GitHub registration. A clean go-offline runs
       // stop()'s deregister, but a crash/force-quit skips it, leaving ghost
       // runners that GitHub only auto-prunes much later. Reap them now — before
-      // provisioning, so every match under this machine's prefix is provably a
-      // prior-session orphan, never a runner from this generation. Per-repo,
-      // best-effort; scoped to our prefix so another Mac's runners are untouched.
+      // provisioning, so this machine's prefix is provably a prior-session
+      // orphan. Also delete offline/non-busy `mactions-*` ghosts from older
+      // host-name generations; online or busy runners from another Mac are kept.
+      // Per-repo, best-effort.
       for repo in repos {
         guard fleetEpoch == myEpoch else { return }
-        await deregisterOrphanRunners(GitHubClient(owner: repo.owner, repo: repo.name, token: token))
+        await deregisterOrphanRunners(
+          GitHubClient(owner: repo.owner, repo: repo.name, token: token),
+          includeOfflineMactionsRunners: true)
       }
       guard fleetEpoch == myEpoch else { return }
       var created: [RunnerOrchestrator] = []
@@ -664,8 +667,13 @@ final class AppState: ObservableObject {
           // available" nudge and reset the throttle so the next popover open
           // re-checks against the freshly recorded build rather than waiting 6h.
           clearWindowsUpdateNudge()
+          let purgedBackups = await Task.detached { HostCleanup.purgeWindowsBaseBackups() }.value
           refreshWindowsBaseInfo()  // pick up the fresh build/recipe/health stamps
-          statusMessage = "Windows base image '\(image)' is ready."
+          statusMessage =
+            "Windows base image '\(image)' is ready."
+            + (purgedBackups > 0
+              ? " Cleaned up \(purgedBackups) old base backup\(purgedBackups == 1 ? "" : "s")."
+              : "")
         } else {
           windowsImageReady = false  // never persist a stale-true
           saveConfig()

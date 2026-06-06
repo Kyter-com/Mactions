@@ -67,6 +67,25 @@ final class WindowsVMProviderTests: XCTestCase {
     XCTAssertFalse(cli.parseIsStopped(from: ""))
   }
 
+  func testFusionHelperFallsBackToVMSDForSnapshotDetection() {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let helperURL = repoRoot.appendingPathComponent("scripts/mactions-fusion-vm")
+    guard let helper = try? String(contentsOf: helperURL, encoding: .utf8) else {
+      return XCTFail("could not read \(helperURL.path)")
+    }
+
+    for required in [
+      "vmrun can refuse listSnapshots while a linked clone is running",
+      "local vmsd=\"${vmx%.vmx}.vmsd\"",
+      "snapshot[0-9]+\\.displayName",
+    ] {
+      XCTAssertNotNil(
+        helper.range(of: required),
+        "mactions-fusion-vm is missing snapshot fallback fragment: \(required)")
+    }
+  }
+
   // MARK: Power-state completion classifier
 
   func testPhaseClassifierRequiresRunningBeforeStopped() {

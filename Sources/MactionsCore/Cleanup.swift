@@ -9,6 +9,9 @@ import Foundation
 ///     `.credentials` never accumulate.
 ///   - Per launch / go-online: `purgeRuns()` + `purgeStrayTartClones()` sweep
 ///     anything a crash or force-quit orphaned last time.
+///   - After a successful Windows base rebuild: old `.win11-runner-base.bak.*`
+///     rescue copies are removed, reclaiming the multi-GB failed-build backups
+///     that `MACTIONS_KEEP_FAILED=1` intentionally preserved for post-mortem.
 ///   - On demand: `purgeAll()` removes everything Mactions ever wrote to disk
 ///     (including the cached agent) for a clean uninstall.
 ///
@@ -54,6 +57,12 @@ public enum HostCleanup {
   /// a full uninstall (`purgeAll`) reclaims it.
   public static func cacheRoot() -> URL {
     mactionsRoot().appendingPathComponent("cache", isDirectory: true)
+  }
+
+  /// VMware Fusion state root. The pristine base lives flat here; per-job clones
+  /// and failed-build base backups live in subdirectories.
+  public static func fusionRoot() -> URL {
+    mactionsRoot().appendingPathComponent("fusion", isDirectory: true)
   }
 
   /// Remove the cached agent + all run dirs (the big/transient stuff). Leaves
@@ -139,6 +148,31 @@ public enum HostCleanup {
         try? fm.removeItem(atPath: tmp + entry)
       }
     }
+  }
+
+  /// Old rescue copies produced by `fusion-windows-base` when a rebuild fails
+  /// with `MACTIONS_KEEP_FAILED=1`. Once a later rebuild succeeds, these are just
+  /// stale multi-GB diagnostics and should be reclaimed automatically.
+  public static func windowsBaseBackupDirectories(in fusionRoot: URL) -> [URL] {
+    let fm = FileManager.default
+    guard let entries = try? fm.contentsOfDirectory(
+      at: fusionRoot, includingPropertiesForKeys: [.isDirectoryKey])
+    else { return [] }
+    return entries.filter { url in
+      guard url.lastPathComponent.hasPrefix(".win11-runner-base.bak.") else { return false }
+      let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
+      return values?.isDirectory == true
+    }
+    .sorted { $0.lastPathComponent < $1.lastPathComponent }
+  }
+
+  @discardableResult
+  public static func purgeWindowsBaseBackups() -> Int {
+    let backups = windowsBaseBackupDirectories(in: fusionRoot())
+    for backup in backups {
+      try? FileManager.default.removeItem(at: backup)
+    }
+    return backups.count
   }
 
   /// Pull our `mactions-…` clone names out of a VM-CLI listing (pure → testable).
