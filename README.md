@@ -38,7 +38,7 @@ xcodegen generate        # writes Mactions.xcodeproj (gitignored)
 open Mactions.xcodeproj   # pick the "MactionsApp" scheme, then Run (⌘R)
 ```
 
-The app target compiles the same `Sources/Mactions` and links the `MactionsCore` package library; `actool` composes `Mactions.icon` (Icon Composer) into the AppIcon. To change the icon, re-export from Icon Composer into `Sources/Mactions/Mactions.icon`.
+The app target compiles the same `Sources/Mactions` and links a native `MactionsCore` framework target (the same sources as the SwiftPM library); `actool` composes `Mactions.icon` (Icon Composer) into the AppIcon. To change the icon, re-export from Icon Composer into `Sources/Mactions/Mactions.icon`.
 
 ## Security
 
