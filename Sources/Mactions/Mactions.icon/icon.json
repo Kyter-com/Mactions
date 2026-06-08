@@ -1,8 +1,8 @@
 {
   "fill" : {
     "linear-gradient" : [
-      "extended-gray:0.00000,1.00000",
-      "extended-gray:0.25000,1.00000"
+      "display-p3:0.14355,0.15576,0.18811,1.00000",
+      "display-p3:0.22803,0.23901,0.26831,1.00000"
     ],
     "orientation" : {
       "start" : {
@@ -19,16 +19,8 @@
     {
       "layers" : [
         {
-          "fill" : "automatic",
-          "image-name" : "SVG Image.svg",
-          "name" : "SVG Image",
-          "position" : {
-            "scale" : 23,
-            "translation-in-points" : [
-              0,
-              0
-            ]
-          }
+          "image-name" : "Group.svg",
+          "name" : "Group"
         }
       ],
       "shadow" : {

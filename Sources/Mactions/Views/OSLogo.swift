@@ -24,7 +24,7 @@ struct OSLogo: View {
   var body: some View {
     Group {
       if Self.bundledSymbolAvailable(symbolName) {
-        Image(symbolName, bundle: .module).resizable().scaledToFit()
+        Image(symbolName, bundle: AppResources.bundle).resizable().scaledToFit()
       } else {
         SVGSymbol(pathData: glyphPath)
       }
@@ -58,7 +58,7 @@ struct OSLogo: View {
   @MainActor private static var availability: [String: Bool] = [:]
   @MainActor private static func bundledSymbolAvailable(_ name: String) -> Bool {
     if let cached = availability[name] { return cached }
-    let exists = Bundle.module.image(forResource: NSImage.Name(name)) != nil
+    let exists = AppResources.bundle.image(forResource: NSImage.Name(name)) != nil
     availability[name] = exists
     return exists
   }

@@ -28,6 +28,18 @@ swift test       # unit tests (no network)
 
 No external dependencies. The orchestration logic lives in the `MactionsCore` library (pure Foundation, fully unit-tested); the SwiftUI menubar app is a thin shell over it.
 
+### Run in Xcode (real app icon)
+
+`swift run` can't assign an app icon (it shows a runtime approximation). To get the **real Liquid Glass icon** and a proper `.app` bundle, build the Xcode app target — generated from [`project.yml`](project.yml) with [XcodeGen](https://github.com/yonaskolb/XcodeGen):
+
+```bash
+brew install xcodegen    # one-time
+xcodegen generate        # writes Mactions.xcodeproj (gitignored)
+open Mactions.xcodeproj   # pick the "MactionsApp" scheme, then Run (⌘R)
+```
+
+The app target compiles the same `Sources/Mactions` and links the `MactionsCore` package library; `actool` composes `Mactions.icon` (Icon Composer) into the AppIcon. To change the icon, re-export from Icon Composer into `Sources/Mactions/Mactions.icon`.
+
 ## Security
 
 The default **local-process** runner has no isolation — only point it at **trusted / private** repos. VM-isolated runners (Tart for macOS/Linux, `WindowsVMProvider` for Windows) are the path for untrusted code and are still experimental. The GitHub token is stored in a `0600` file under `~/.mactions` (not the keychain — an unsigned dev build re-prompts on every keychain access; a signed build could use the keychain).

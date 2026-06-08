@@ -1,0 +1,55 @@
+# XcodeGen spec for the Mactions macOS app target.
+#
+# Why this exists: SwiftPM can't assign an AppIcon, so `swift run` only shows the
+# runtime approximation (AppLogo). This app target compiles the same app sources,
+# links the MactionsCore SwiftPM library, and sets `Mactions.icon` as the AppIcon
+# so Xcode/actool produces the real Liquid Glass icon. The generated
+# `Mactions.xcodeproj` is gitignored — this YAML is the source of truth.
+#
+#   brew install xcodegen   # one-time
+#   xcodegen generate       # regenerate the .xcodeproj after editing this file
+#   open Mactions.xcodeproj # then Run (⌘R) in Xcode
+name: Mactions
+
+options:
+  bundleIdPrefix: com.kyter
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "13.0"
+
+# Reuse the existing SwiftPM package for the orchestration library so there's a
+# single source of truth (no duplicated MactionsCore target).
+packages:
+  Mactions:
+    path: .
+
+# The target is named MactionsApp (not Mactions) to avoid colliding with the
+# SwiftPM package's own `Mactions` executable product — the collision made the
+# scheme build the package's CLI executable instead of this .app. PRODUCT_NAME
+# is still Mactions, so the built bundle is `Mactions.app`.
+targets:
+  MactionsApp:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/Mactions
+    dependencies:
+      - package: Mactions
+        product: MactionsCore
+    settings:
+      base:
+        PRODUCT_NAME: Mactions
+        PRODUCT_BUNDLE_IDENTIFIER: com.kyter.mactions
+        # The Icon Composer icon → real AppIcon (compiled by actool).
+        ASSETCATALOG_COMPILER_APPICON_NAME: Mactions
+        SWIFT_VERSION: "6.0"
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: xcode/Info.plist
+        # Local-run signing: ad-hoc is fine to launch from Xcode. For a
+        # distributable build set your team + Developer ID (see AGENTS.md roadmap).
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "-"
+        ENABLE_HARDENED_RUNTIME: NO
+        COMBINE_HIDPI_IMAGES: YES
