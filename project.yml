@@ -1,14 +1,15 @@
-# XcodeGen spec for the Mactions macOS app target.
-#
-# Why this exists: SwiftPM can't assign an AppIcon, so `swift run` only shows the
-# runtime approximation (AppLogo). This app target compiles the same app sources,
-# links the MactionsCore SwiftPM library, and sets `Mactions.icon` as the AppIcon
-# so Xcode/actool produces the real Liquid Glass icon. The generated
-# `Mactions.xcodeproj` is gitignored — this YAML is the source of truth.
+# XcodeGen spec for the Mactions macOS app — used only to get the real Liquid
+# Glass AppIcon (compiled from Mactions.icon by actool) and a runnable .app.
+# `swift build`/`run`/`test` remain the primary dev path; this is the Xcode path.
 #
 #   brew install xcodegen   # one-time
-#   xcodegen generate       # regenerate the .xcodeproj after editing this file
-#   open Mactions.xcodeproj # then Run (⌘R) in Xcode
+#   xcodegen generate       # regenerate Mactions.xcodeproj (gitignored) after edits
+#   open Mactions.xcodeproj # pick the "MactionsApp" scheme, then Run (⌘R)
+#
+# MactionsCore is compiled as a NATIVE Xcode framework target (not a SwiftPM
+# package dependency) so the Xcode build has no package graph to resolve — the
+# local-package-in-the-same-directory setup was fragile (stale "Missing package
+# product" resolutions). Both this and Package.swift compile the same sources.
 name: Mactions
 
 options:
@@ -17,25 +18,16 @@ options:
   deploymentTarget:
     macOS: "13.0"
 
-# Reuse the existing SwiftPM package for the orchestration library so there's a
-# single source of truth (no duplicated MactionsCore target).
-packages:
-  Mactions:
-    path: .
-
-# The target is named MactionsApp (not Mactions) to avoid colliding with the
-# SwiftPM package's own `Mactions` executable product — the collision made the
-# scheme build the package's CLI executable instead of this .app. PRODUCT_NAME
-# is still Mactions, so the built bundle is `Mactions.app`.
 targets:
+  # The app target is named MactionsApp (not Mactions) so its scheme is
+  # unambiguous; PRODUCT_NAME is Mactions, so the bundle is still Mactions.app.
   MactionsApp:
     type: application
     platform: macOS
     sources:
       - path: Sources/Mactions
     dependencies:
-      - package: Mactions
-        product: MactionsCore
+      - target: MactionsCore
     settings:
       base:
         PRODUCT_NAME: Mactions
@@ -47,9 +39,20 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: xcode/Info.plist
-        # Local-run signing: ad-hoc is fine to launch from Xcode. For a
-        # distributable build set your team + Developer ID (see AGENTS.md roadmap).
         CODE_SIGN_STYLE: Automatic
-        CODE_SIGN_IDENTITY: "-"
         ENABLE_HARDENED_RUNTIME: NO
         COMBINE_HIDPI_IMAGES: YES
+
+  # The pure-Foundation control plane, compiled directly (same sources as the
+  # SwiftPM `MactionsCore` target). A STATIC library so it's linked straight into
+  # the app binary — no framework bundle to sign/embed (a framework needs its own
+  # Info.plist or codesign rejects it as "bundle format unrecognized").
+  MactionsCore:
+    type: library.static
+    platform: macOS
+    sources:
+      - path: Sources/MactionsCore
+    settings:
+      base:
+        PRODUCT_NAME: MactionsCore
+        SWIFT_VERSION: "6.0"
