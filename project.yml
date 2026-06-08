@@ -28,6 +28,20 @@ targets:
       - path: Sources/Mactions
     dependencies:
       - target: MactionsCore
+    # Bundle the repo's scripts/ into the app's Resources (with +x preserved) so
+    # script-driven setup (the Windows base build / Fusion helper) is found in the
+    # .app, not just under `swift run`. AppState already probes
+    # Contents/Resources/scripts/…; cp -R preserves the executable bit (a folder-
+    # reference resource can strip it). Runs before the implicit code-sign, so the
+    # scripts are covered by the signature.
+    postBuildScripts:
+      - name: Bundle scripts/ into Resources
+        basedOnDependencyAnalysis: false
+        script: |
+          set -e
+          DEST="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/scripts"
+          rm -rf "$DEST"
+          cp -R "${SRCROOT}/scripts" "$DEST"
     settings:
       base:
         PRODUCT_NAME: Mactions
