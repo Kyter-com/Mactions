@@ -18,10 +18,11 @@ import Foundation
 /// completion from the foreground process's **exit code** — no power-state
 /// polling (that was only needed for Fusion's decoupled VM shutdown).
 ///
-/// NOTE: the `container` (Apple) verb spellings below are taken from its
-/// published command reference and have NOT been validated against a live
-/// `container --help` on a macOS 26 host; the pure-builder + unit-test split
-/// means a flag fix is a one-line change. Validate before the first real run.
+/// NOTE: the Apple `container` verb spellings below were validated live against
+/// `container` 0.12.3 on macOS 26.5.1 (run/stop/delete/inspect, image
+/// pull+inspect, system status/start, and the fact that `container list` has no
+/// `--filter`). The pure-builder + unit-test split keeps any future flag change
+/// a one-line edit.
 public protocol LinuxContainerCLI: Sendable {
   /// Absolute path to the CLI binary (e.g. `/opt/homebrew/bin/docker`).
   var executable: String { get }
@@ -130,10 +131,12 @@ public struct DockerCLI: LinuxContainerCLI {
   public func pullArgs(image: String) -> [String] { ["pull", "--platform", "linux/arm64", image] }
   public func imageInspectArgs(image: String) -> [String] { ["image", "inspect", image] }
   public func daemonStatusArgs() -> [String] { ["info"] }
-  /// Colima is the daemon manager; a plain `docker` has no "start the engine"
-  /// verb, so this is the Colima start. Harmless/idempotent when already up; a
-  /// no-Colima docker (Desktop/OrbStack) ignores it (we run it best-effort).
-  public func daemonStartArgs() -> [String] { ["start"] }
+  /// The `docker` binary has NO daemon-start verb — `docker start` starts a
+  /// *container* (and errors without a name), not the engine. Return empty so
+  /// the app starts the actual daemon manager itself (`colima start` when Colima
+  /// is installed; Docker Desktop / OrbStack must be started by the user). See
+  /// `AppState.setUpLinuxRunner`.
+  public func daemonStartArgs() -> [String] { [] }
   // sweepListArgs/sweepRefs + daemonPrepare* use the protocol defaults (label
   // filter, non-empty lines, no prep) — docker needs nothing backend-specific.
 }

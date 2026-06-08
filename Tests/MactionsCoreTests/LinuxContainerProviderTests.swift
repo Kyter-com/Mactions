@@ -47,6 +47,9 @@ final class LinuxContainerProviderTests: XCTestCase {
     // docker/colima need no one-time daemon prep.
     XCTAssertEqual(cli.daemonPrepareArgs(), [])
     XCTAssertFalse(cli.daemonPrepareNeeded())
+    // The docker binary has no daemon-start verb (`docker start` starts a
+    // container) — empty, so AppState starts the actual daemon manager (Colima).
+    XCTAssertEqual(cli.daemonStartArgs(), [])
     XCTAssertEqual(cli.jitEnvName, "ACTIONS_RUNNER_INPUT_JITCONFIG")
     XCTAssertTrue(cli.displayName.contains("Docker"))
   }

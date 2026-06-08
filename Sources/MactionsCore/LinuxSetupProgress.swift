@@ -79,6 +79,16 @@ public enum LinuxSetupProgress {
   /// banner. Conservative so a real local failure isn't mislabeled.
   public static func isLikelyTransientFailure(_ output: String) -> Bool {
     let s = output.lowercased()
+    // LOCAL daemon/runtime misconfig is NOT transient — the user has to fix it,
+    // so don't frame "your daemon is down" as "retry, it's the network".
+    // Checked FIRST because a dead docker socket reads as
+    // "…/docker.sock: connect: connection refused", which would otherwise match
+    // the transient list below.
+    let localFailure = [
+      "cannot connect to the docker daemon", "is the docker daemon running",
+      "docker.sock", "command not found", "daemon is not running",
+    ]
+    if localFailure.contains(where: { s.contains($0) }) { return false }
     let transient = [
       "timeout", "timed out", "temporary failure", "connection reset",
       "connection refused", "could not resolve host", "network is unreachable",

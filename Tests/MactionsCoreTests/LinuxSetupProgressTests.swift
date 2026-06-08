@@ -48,5 +48,11 @@ final class LinuxSetupProgressTests: XCTestCase {
     // A genuine local failure is NOT mislabeled as transient.
     XCTAssertFalse(LinuxSetupProgress.isLikelyTransientFailure("Cannot connect to the Docker daemon. Is the docker daemon running?"))
     XCTAssertFalse(LinuxSetupProgress.isLikelyTransientFailure("docker: command not found"))
+    // A dead docker socket reads as "connection refused" but is LOCAL, not a
+    // transient network blip — must be classified local (the bug Copilot caught).
+    XCTAssertFalse(LinuxSetupProgress.isLikelyTransientFailure(
+      "error during connect: Get \"http://docker/info\": dial unix /var/run/docker.sock: connect: connection refused"))
+    // …but a real registry-side "connection refused" (no local-daemon markers) is still transient.
+    XCTAssertTrue(LinuxSetupProgress.isLikelyTransientFailure("ghcr.io: connection refused"))
   }
 }

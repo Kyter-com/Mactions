@@ -406,15 +406,26 @@ final class AppState: ObservableObject {
           : WindowsVMBudget.maxConcurrentVMs(
             physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory, perVMGB: perVMGB)
         var windowsVMsStamped = 0
-        // Linux fleet: only when the Linux tile is selected AND the runner image
-        // is pulled AND a container runtime is installed. Never spun up
-        // automatically. Each ephemeral runner is a throwaway container.
-        let linuxFactory: LinuxContainerProviderFactory? =
+        // Linux fleet: only when the Linux tile is selected, a container runtime
+        // is installed, AND it's actually ready right now. Re-verify ready()
+        // (daemon up + image present) here because the persisted linuxImageReady
+        // can be stale (image pruned / daemon stopped) — and a dead-daemon
+        // `<cli> run` fails ASYNC (not a throw from start()), so without this
+        // gate the orchestrator would churn JIT configs retrying a failing
+        // container. The probe shells out, so run it off the main actor.
+        let linuxImg = linuxRunnerImage
+        let linuxCLI =
           (selectedOSes.contains(.linux) && linuxImageReady)
-          ? LinuxContainerProviderFactory.detectInstalledCLI().map {
-            LinuxContainerProviderFactory(image: linuxRunnerImage, cli: $0)
-          }
-          : nil
+          ? LinuxContainerProviderFactory.detectInstalledCLI() : nil
+        var linuxReady = false
+        if let lxCLI = linuxCLI {
+          linuxReady = await Task.detached { [lxCLI, linuxImg] in
+            LinuxContainerProviderFactory.ready(image: linuxImg, cli: lxCLI)
+          }.value
+        }
+        guard fleetEpoch == myEpoch else { return }  // went offline during the probe
+        let linuxFactory: LinuxContainerProviderFactory? =
+          linuxReady ? linuxCLI.map { LinuxContainerProviderFactory(image: linuxImg, cli: $0) } : nil
         // Containers are far lighter than a Fusion VM (sub-second start, shared
         // kernel), so the cap is CPU/RAM-driven and looser than the Windows VM
         // budget. 0 => host can't fit even one safely (skip Linux + say so).
@@ -503,6 +514,14 @@ final class AppState: ObservableObject {
           statusMessage =
             (statusMessage ?? "")
             + " Linux runners limited to \(linuxStamped)/\(repos.count) repos (\(why))."
+        }
+        // Linux was selected + marked ready, but the runtime/image isn't actually
+        // ready now (daemon stopped or image pruned since setup) — say so instead
+        // of silently skipping Linux.
+        if selectedOSes.contains(.linux), linuxImageReady, linuxCLI != nil, !linuxReady {
+          statusMessage =
+            (statusMessage ?? "")
+            + " Linux skipped — the container runtime/image isn't ready (start the daemon or re-run Linux setup)."
         }
       } catch {
         guard fleetEpoch == myEpoch else { return }
@@ -1067,14 +1086,24 @@ final class AppState: ObservableObject {
     linuxSetupFailure = nil
     statusMessage = "Setting up the Linux runner…"
     Task {
-      // 1) Ensure the daemon is up (idempotent start — `colima start` /
-      //    `container system start`). Off the main actor; it can block briefly.
+      // 1) Ensure the daemon is up; start it if down. Apple `container` starts
+      //    via its own `system start` (daemonStartArgs); the docker CLI has NO
+      //    daemon-start verb (its daemonStartArgs is empty), so start Colima if
+      //    installed — Docker Desktop / OrbStack must be started by the user.
+      //    Off the main actor; these can block briefly.
       var daemonUp = await Task.detached {
         (try? Shell.run(cli.executable, cli.daemonStatusArgs()))?.ok ?? false
       }.value
       if !daemonUp {
         linuxSetupDetail = "Starting the container daemon…"
-        _ = await Task.detached { try? Shell.run(cli.executable, cli.daemonStartArgs()) }.value
+        let startArgs = cli.daemonStartArgs()
+        await Task.detached {
+          if !startArgs.isEmpty {
+            _ = try? Shell.run(cli.executable, startArgs)
+          } else if let colima = Shell.which("colima") {
+            _ = try? Shell.run(colima, ["start"])
+          }
+        }.value
         daemonUp = await Task.detached {
           (try? Shell.run(cli.executable, cli.daemonStatusArgs()))?.ok ?? false
         }.value
