@@ -12,6 +12,13 @@ import PackageDescription
 let package = Package(
   name: "Mactions",
   platforms: [.macOS(.v13)], // MenuBarExtra is macOS 13+
+  // Expose MactionsCore as a library product so the Xcode app target (XcodeGen /
+  // project.yml) can link it. `swift build`/`run`/`test` don't need this — they
+  // build the targets directly — but an external consumer can only depend on a
+  // product, not a bare target.
+  products: [
+    .library(name: "MactionsCore", targets: ["MactionsCore"])
+  ],
   targets: [
     .target(name: "MactionsCore"),
     .executableTarget(

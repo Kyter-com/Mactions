@@ -1,0 +1,81 @@
+# XcodeGen spec for the Mactions macOS app — used to get the real Liquid Glass
+# AppIcon (compiled from Mactions.icon by actool) and a runnable .app.
+# `swift build`/`run`/`test` remain the primary dev path.
+#
+#   brew install xcodegen   # one-time
+#   xcodegen generate       # regenerate Mactions.xcodeproj (gitignored) after edits
+#   open Mactions.xcodeproj # pick the "MactionsApp" scheme, then Run (⌘R)
+#
+# MactionsCore is a native Xcode FRAMEWORK target (not a SwiftPM package dep — that
+# was fragile: stale "Missing package product" resolutions). It needs a generated
+# Info.plist (else codesign rejects the bundle) and is a framework rather than a
+# static library (a static lib exports module headers to .../include/<name>/, which
+# tripped the build sandbox). Both this and Package.swift compile the same sources.
+name: Mactions
+
+options:
+  bundleIdPrefix: com.kyter
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "13.0"
+
+settings:
+  base:
+    # Our scripts-copy Run Script writes into the build's Resources; the user
+    # script sandbox would deny that.
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+targets:
+  # App target named MactionsApp (not Mactions) so the scheme is unambiguous;
+  # PRODUCT_NAME is Mactions, so the bundle is still Mactions.app.
+  MactionsApp:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/Mactions
+    dependencies:
+      - target: MactionsCore
+    # Bundle the repo's scripts/ into the app's Resources (with +x preserved) so
+    # script-driven setup (the Windows base build / Fusion helper) is found in the
+    # .app, not just under `swift run`. AppState already probes
+    # Contents/Resources/scripts/…; cp -R preserves the executable bit. Runs before
+    # the implicit code-sign, so the scripts are covered by the signature.
+    postBuildScripts:
+      - name: Bundle scripts/ into Resources
+        basedOnDependencyAnalysis: false
+        script: |
+          set -e
+          DEST="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/scripts"
+          rm -rf "$DEST"
+          cp -R "${SRCROOT}/scripts" "$DEST"
+    settings:
+      base:
+        PRODUCT_NAME: Mactions
+        PRODUCT_BUNDLE_IDENTIFIER: com.kyter.mactions
+        # The Icon Composer icon → real AppIcon (compiled by actool).
+        ASSETCATALOG_COMPILER_APPICON_NAME: Mactions
+        SWIFT_VERSION: "6.0"
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: xcode/Info.plist
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: NO
+        COMBINE_HIDPI_IMAGES: YES
+
+  # The pure-Foundation control plane (same sources as the SwiftPM MactionsCore
+  # target), built as an embedded framework so the app gets a real `MactionsCore`
+  # module to import.
+  MactionsCore:
+    type: framework
+    platform: macOS
+    sources:
+      - path: Sources/MactionsCore
+    settings:
+      base:
+        PRODUCT_NAME: MactionsCore
+        PRODUCT_BUNDLE_IDENTIFIER: com.kyter.mactions.core
+        GENERATE_INFOPLIST_FILE: YES
+        DEFINES_MODULE: YES
+        SWIFT_VERSION: "6.0"
+        CODE_SIGN_STYLE: Automatic
