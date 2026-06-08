@@ -623,7 +623,7 @@ struct SetupPane: View {
           .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
       } else {
         Text(
-          "Install a container runtime (free), then tap Linux: `brew install --cask container` (macOS 26+) or `brew install colima docker`."
+          "Install a container runtime (free), then tap Linux: Apple container from github.com/apple/container/releases (macOS 26+) or `brew install colima docker`."
         )
         .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
       }

@@ -192,21 +192,12 @@ public enum HostCleanup {
     guard let cli = LinuxContainerProviderFactory.detectInstalledCLI() else { return }
     // Don't spin up a daemon during a cleanup sweep — only reap if it's already up.
     guard let info = try? Shell.run(cli.executable, cli.daemonStatusArgs()), info.ok else { return }
-    guard let list = try? Shell.run(cli.executable, cli.listByLabelArgs(label: "mactions")), list.ok
-    else { return }
-    for ref in linuxContainerRefs(in: list.stdout) {
+    guard let list = try? Shell.run(cli.executable, cli.sweepListArgs()), list.ok else { return }
+    // The CLI scopes refs to our own containers (docker by `--label`, Apple
+    // `container` by the `mactions-` name prefix) — never touches others'.
+    for ref in cli.sweepRefs(from: list.stdout) {
       _ = try? Shell.run(cli.executable, cli.rmArgs(name: ref))
     }
-  }
-
-  /// Pull container refs (ids/names, one per line) out of a `ps -aq` / `list -q`
-  /// listing (pure → testable). The `label=mactions` filter already scoped the
-  /// listing to our own containers, so we just take every non-empty line.
-  static func linuxContainerRefs(in listing: String) -> [String] {
-    listing
-      .split(whereSeparator: \.isNewline)
-      .map { $0.trimmingCharacters(in: .whitespaces) }
-      .filter { !$0.isEmpty }
   }
 
   /// Best-effort: kill leftover runner-agent processes (run.sh / Runner.Listener

@@ -1047,7 +1047,7 @@ final class AppState: ObservableObject {
     guard !linuxSetupBusy else { return }
     guard let cli = LinuxContainerProviderFactory.detectInstalledCLI() else {
       statusMessage =
-        "No container runtime found. Install one (free): `brew install --cask container` on macOS 26+, or `brew install colima docker`. Then tap Linux again."
+        "No container runtime found. Install one (free): Apple container from github.com/apple/container/releases (macOS 26+), or `brew install colima docker`. Then tap Linux again."
       return
     }
     let image = linuxRunnerImage
@@ -1086,6 +1086,15 @@ final class AppState: ObservableObject {
         statusMessage = "Linux setup failed: container daemon not running."
         endLinuxSetup()
         return
+      }
+
+      // 1b) One-time backend prep: Apple `container` needs a default Linux kernel
+      // installed before any container can run (`system start` only prompts for
+      // it). Runs only when needed (gated so the non-idempotent kernel download
+      // isn't repeated). Docker/Colima need nothing here. Slow (~one download).
+      if cli.daemonPrepareNeeded() {
+        linuxSetupDetail = "Installing the container runtime kernel (one-time)…"
+        _ = await Task.detached { try? Shell.run(cli.executable, cli.daemonPrepareArgs()) }.value
       }
 
       // 2) Pull the runner image, streaming progress into the live stepper.

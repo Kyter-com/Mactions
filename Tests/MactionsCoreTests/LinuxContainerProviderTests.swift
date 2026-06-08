@@ -41,7 +41,12 @@ final class LinuxContainerProviderTests: XCTestCase {
     XCTAssertEqual(cli.pullArgs(image: "img:1"), ["pull", "--platform", "linux/arm64", "img:1"])
     XCTAssertEqual(cli.imageInspectArgs(image: "img:1"), ["image", "inspect", "img:1"])
     XCTAssertEqual(cli.daemonStatusArgs(), ["info"])
-    XCTAssertEqual(cli.listByLabelArgs(label: "mactions"), ["ps", "-aq", "--filter", "label=mactions"])
+    // Sweep scopes by the mactions label; output is already ours → every line a ref.
+    XCTAssertEqual(cli.sweepListArgs(), ["ps", "-aq", "--filter", "label=mactions"])
+    XCTAssertEqual(cli.sweepRefs(from: "abc123\n\ndef456\n  "), ["abc123", "def456"])
+    // docker/colima need no one-time daemon prep.
+    XCTAssertEqual(cli.daemonPrepareArgs(), [])
+    XCTAssertFalse(cli.daemonPrepareNeeded())
     XCTAssertEqual(cli.jitEnvName, "ACTIONS_RUNNER_INPUT_JITCONFIG")
     XCTAssertTrue(cli.displayName.contains("Docker"))
   }
@@ -74,7 +79,14 @@ final class LinuxContainerProviderTests: XCTestCase {
     XCTAssertEqual(cli.imageInspectArgs(image: "img:2"), ["image", "inspect", "img:2"])
     XCTAssertEqual(cli.daemonStatusArgs(), ["system", "status"])
     XCTAssertEqual(cli.daemonStartArgs(), ["system", "start"])
-    XCTAssertEqual(cli.listByLabelArgs(label: "mactions"), ["list", "--all", "--quiet", "--filter", "label=mactions"])
+    // `container list` has NO --filter, so list all + scope by the mactions- name
+    // prefix (the --name we set IS the container ID).
+    XCTAssertEqual(cli.sweepListArgs(), ["list", "--all", "--quiet"])
+    XCTAssertEqual(
+      cli.sweepRefs(from: "mactions-abc\nsomeones-db\nmactions-xyz\n"),
+      ["mactions-abc", "mactions-xyz"])
+    // One-time default-kernel install (system start only prompts for it).
+    XCTAssertEqual(cli.daemonPrepareArgs(), ["system", "kernel", "set", "--recommended"])
     XCTAssertTrue(cli.displayName.contains("Apple"))
   }
 

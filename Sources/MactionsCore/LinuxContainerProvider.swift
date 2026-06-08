@@ -51,8 +51,22 @@ public protocol LinuxContainerCLI: Sendable {
   /// Idempotently bring the daemon/VM up (e.g. `colima start` /
   /// `container system start`). Safe to run when already up.
   func daemonStartArgs() -> [String]
-  /// List our own container refs (ids) by label, for the orphan sweep.
-  func listByLabelArgs(label: String) -> [String]
+  /// One-time daemon preparation needed before the FIRST container can run
+  /// (Apple `container` must install a default Linux kernel — `system start`
+  /// only PROMPTS for it, which fails non-interactively). `[]` when nothing is
+  /// needed (docker). Run only when `daemonPrepareNeeded()` is true — it's not
+  /// idempotent (re-installing re-downloads and errors).
+  func daemonPrepareArgs() -> [String]
+  /// Whether `daemonPrepareArgs()` still needs to run (e.g. no default kernel is
+  /// installed yet). `false` for backends that need no prep.
+  func daemonPrepareNeeded() -> Bool
+  /// List candidate container refs for the orphan sweep. Scoped to OUR
+  /// containers by the backend: docker filters by `--label`, while Apple
+  /// `container` (no label filter) lists all and the parser scopes by the
+  /// `mactions-` name prefix (the `--name` we set IS the container ID).
+  func sweepListArgs() -> [String]
+  /// Parse the refs to force-remove from `sweepListArgs()` output.
+  func sweepRefs(from output: String) -> [String]
   /// `true` when the inspect output shows the container alive/running.
   func parseIsRunning(from output: String) -> Bool
 }
@@ -61,6 +75,19 @@ extension LinuxContainerCLI {
   /// The env-var the actions/runner consumes as `--jitconfig`. Shared by every
   /// backend (it's a property of the agent, not the container engine).
   public var jitEnvName: String { "ACTIONS_RUNNER_INPUT_JITCONFIG" }
+
+  /// Default: no extra daemon prep (docker/colima just need the daemon up).
+  public func daemonPrepareArgs() -> [String] { [] }
+  public func daemonPrepareNeeded() -> Bool { false }
+
+  /// Default sweep listing: filter by our `mactions` label (docker). The output
+  /// is already scoped to our containers, so every non-empty line is a ref.
+  public func sweepListArgs() -> [String] { ["ps", "-aq", "--filter", "label=mactions"] }
+  public func sweepRefs(from output: String) -> [String] {
+    output.split(whereSeparator: \.isNewline)
+      .map { $0.trimmingCharacters(in: .whitespaces) }
+      .filter { !$0.isEmpty }
+  }
 
   /// Default: a running container reports "running" in its inspected state.
   public func parseIsRunning(from output: String) -> Bool {
@@ -107,9 +134,8 @@ public struct DockerCLI: LinuxContainerCLI {
   /// verb, so this is the Colima start. Harmless/idempotent when already up; a
   /// no-Colima docker (Desktop/OrbStack) ignores it (we run it best-effort).
   public func daemonStartArgs() -> [String] { ["start"] }
-  public func listByLabelArgs(label: String) -> [String] {
-    ["ps", "-aq", "--filter", "label=\(label)"]
-  }
+  // sweepListArgs/sweepRefs + daemonPrepare* use the protocol defaults (label
+  // filter, non-empty lines, no prep) — docker needs nothing backend-specific.
 }
 
 // MARK: - Apple `container` backend (macOS 26+, per-container lightweight VM)
@@ -141,8 +167,28 @@ public struct ContainerCLI: LinuxContainerCLI {
   public func imageInspectArgs(image: String) -> [String] { ["image", "inspect", image] }
   public func daemonStatusArgs() -> [String] { ["system", "status"] }
   public func daemonStartArgs() -> [String] { ["system", "start"] }
-  public func listByLabelArgs(label: String) -> [String] {
-    ["list", "--all", "--quiet", "--filter", "label=\(label)"]
+
+  /// Apple `container` runs each container in a VM and needs a default Linux
+  /// kernel installed once. `system start` only PROMPTS for it (and so fails
+  /// non-interactively), so we install it explicitly.
+  public func daemonPrepareArgs() -> [String] { ["system", "kernel", "set", "--recommended"] }
+  /// Only when no kernel is installed yet — `set --recommended` is NOT idempotent
+  /// (it re-downloads the kata tarball and then errors with "File exists"), so we
+  /// gate on the presence of a `vmlinux*` in container's kernels dir.
+  public func daemonPrepareNeeded() -> Bool {
+    let kernels = NSString(string: "~/Library/Application Support/com.apple.container/kernels")
+      .expandingTildeInPath
+    let entries = (try? FileManager.default.contentsOfDirectory(atPath: kernels)) ?? []
+    return !entries.contains { $0.hasPrefix("vmlinux") }
+  }
+
+  /// `container list` has NO `--filter`, so list all (the `--quiet` ID is the
+  /// `--name` we set) and scope to ours by the `mactions-` name prefix.
+  public func sweepListArgs() -> [String] { ["list", "--all", "--quiet"] }
+  public func sweepRefs(from output: String) -> [String] {
+    output.split(whereSeparator: \.isNewline)
+      .map { $0.trimmingCharacters(in: .whitespaces) }
+      .filter { $0.hasPrefix("mactions-") }
   }
 }
 
