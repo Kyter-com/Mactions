@@ -102,6 +102,31 @@ final class AppState: ObservableObject {
   /// re-hitting the network (the recipe check itself is local + unthrottled).
   private var lastKnownLatestBuild: String?
 
+  // Linux runner (OPT-IN — like Windows, nothing heavy happens until the user
+  // taps the Linux tile to set it up). Each ephemeral runner is a throwaway
+  // container; "setup" is just pulling the official runner image (seconds), not a
+  // 30–40 min base build. All persisted to UserDefaults.
+  /// Set once the runner image is pulled AND a container daemon is up. Gates the
+  /// Linux OS tile: Linux isn't selectable until the image is ready.
+  @Published var linuxImageReady = false
+  /// The runner container image (official `ghcr.io/actions/actions-runner`,
+  /// multi-arch; the native arm64 variant runs on Apple Silicon). Persisted;
+  /// defaults to the `:latest` tag.
+  @Published var linuxRunnerImage = LinuxRunnerImage.imageRef()
+  /// True while the image pull is running. Disables the tile so it can't double-fire.
+  @Published var linuxSetupBusy = false
+  /// The current phase of Linux setup (verify daemon → pull image), driven by
+  /// streaming the pull output (`LinuxSetupProgress`). `nil` when none is running.
+  @Published var linuxSetupStep: LinuxSetupStep?
+  @Published var linuxSetupDetail: String?
+  /// After a FAILED setup: a user-facing explanation that persists until the next
+  /// attempt. `linuxSetupFailureIsExternal` flags a transient registry/network
+  /// blip ("not your setup — retry") vs a local cause (no daemon / no runtime).
+  @Published var linuxSetupFailure: String?
+  @Published var linuxSetupFailureIsExternal = false
+  /// Durable transcript of the last image pull (drives a "View pull log" button).
+  @Published var linuxBuildLogPath: String?
+
   // Repo discovery (for the searchable picker).
   @Published var availableRepos: [RepoRef] = []
   @Published var reposLoading = false
@@ -145,6 +170,9 @@ final class AppState: ObservableObject {
     windowsBaseImage = defaults.string(forKey: "windowsBaseImage") ?? windowsBaseImage
     windowsBuildShowsWindow = defaults.bool(forKey: "windowsBuildShowsWindow")
     windowsKeepFailedDisk = defaults.bool(forKey: "windowsKeepFailedDisk")
+    linuxImageReady = defaults.bool(forKey: "linuxImageReady")
+    linuxRunnerImage = defaults.string(forKey: "linuxRunnerImage") ?? linuxRunnerImage
+    linuxBuildLogPath = Self.latestLinuxPullLogPath()
     // Re-point "View build log" at the newest transcript on disk (cheap dir
     // listing) and recompose the base summary — both survive restarts.
     windowsBuildLogPath = Self.latestBuildLogPath()
@@ -181,6 +209,8 @@ final class AppState: ObservableObject {
     defaults.set(windowsBaseImage, forKey: "windowsBaseImage")
     defaults.set(windowsBuildShowsWindow, forKey: "windowsBuildShowsWindow")
     defaults.set(windowsKeepFailedDisk, forKey: "windowsKeepFailedDisk")
+    defaults.set(linuxImageReady, forKey: "linuxImageReady")
+    defaults.set(linuxRunnerImage, forKey: "linuxRunnerImage")
   }
 
   var labels: [String] {
@@ -376,6 +406,25 @@ final class AppState: ObservableObject {
           : WindowsVMBudget.maxConcurrentVMs(
             physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory, perVMGB: perVMGB)
         var windowsVMsStamped = 0
+        // Linux fleet: only when the Linux tile is selected AND the runner image
+        // is pulled AND a container runtime is installed. Never spun up
+        // automatically. Each ephemeral runner is a throwaway container.
+        let linuxFactory: LinuxContainerProviderFactory? =
+          (selectedOSes.contains(.linux) && linuxImageReady)
+          ? LinuxContainerProviderFactory.detectInstalledCLI().map {
+            LinuxContainerProviderFactory(image: linuxRunnerImage, cli: $0)
+          }
+          : nil
+        // Containers are far lighter than a Fusion VM (sub-second start, shared
+        // kernel), so the cap is CPU/RAM-driven and looser than the Windows VM
+        // budget. 0 => host can't fit even one safely (skip Linux + say so).
+        let maxLinux =
+          linuxFactory == nil
+          ? 0
+          : LinuxContainerBudget.maxConcurrentContainers(
+            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+            activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount)
+        var linuxStamped = 0
         for repo in repos {
           guard fleetEpoch == myEpoch else { break }
           if wantsMac, let factory {
@@ -407,6 +456,22 @@ final class AppState: ObservableObject {
             windowsVMsStamped += 1
             await winOrch.start()
           }
+
+          if let linuxFactory, linuxStamped < maxLinux {
+            let lxClient = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
+            let lxFleet = FleetConfig(
+              owner: repo.owner, repo: repo.name, labels: linuxLabels, desiredCount: 1)
+            let lxOrch = RunnerOrchestrator(
+              controlPlane: lxClient, factory: linuxFactory, config: lxFleet, os: .linux)
+            lxOrch.onChange = { [weak self] in self?.sync() }
+            lxOrch.onRunFinished = { [weak self] record in self?.recordRun(record) }
+            let lxKey = "\(repo.fullName) (Linux)"
+            orchestrators[lxKey] = lxOrch
+            fleetOS[lxKey] = .linux
+            created.append(lxOrch)
+            linuxStamped += 1
+            await lxOrch.start()
+          }
         }
         guard fleetEpoch == myEpoch else {
           for orch in created { await orch.stop() } // user went offline; undo
@@ -429,6 +494,15 @@ final class AppState: ObservableObject {
           statusMessage =
             (statusMessage ?? "")
             + " Windows runners limited to \(windowsVMsStamped)/\(repos.count) repos (\(why))."
+        }
+        if linuxFactory != nil, linuxStamped < repos.count {
+          let why =
+            maxLinux == 0
+            ? "this Mac can't safely run a Linux container"
+            : "capacity allows \(maxLinux) at once"
+          statusMessage =
+            (statusMessage ?? "")
+            + " Linux runners limited to \(linuxStamped)/\(repos.count) repos (\(why))."
         }
       } catch {
         guard fleetEpoch == myEpoch else { return }
@@ -849,6 +923,7 @@ final class AppState: ObservableObject {
   func toggleOS(_ os: RunnerOS) {
     guard state == .offline, os.isImplemented else { return }
     if os == .windows && !windowsImageReady { return }
+    if os == .linux && !linuxImageReady { return }
     if selectedOSes.contains(os) {
       selectedOSes.remove(os)
     } else {
@@ -942,6 +1017,167 @@ final class AppState: ObservableObject {
       Bundle.main.bundlePath + "/Contents/Resources/scripts/prepare-windows-image",
     ]
     return candidates.first { !$0.isEmpty && FileManager.default.isExecutableFile(atPath: $0) }
+  }
+
+  // MARK: Linux runner (opt-in)
+
+  /// Labels a Linux fleet registers with: `[self-hosted, Linux, ARM64, mactions]`.
+  /// Sourced from the model (not a duplicated literal) so it can't drift. The
+  /// ARM64 label is deliberate — the host is Apple Silicon but `ubuntu-latest` is
+  /// x64, so workflows must opt into this arm64 runner by label.
+  private let linuxLabels = RunnerOS.linux.defaultLabels
+
+  /// True if a container runtime — Apple `container` (macOS 26+) or a `docker`
+  /// CLI (typically Colima-managed) — is installed. Linux runners aren't
+  /// offerable without one. Presence-only, like `windowsBackendAvailable`.
+  var linuxBackendAvailable: Bool { LinuxContainerProviderFactory.detectInstalledCLI() != nil }
+
+  /// Human name of the detected container backend (for the preflight line), or
+  /// `nil` if none is installed.
+  var linuxBackendName: String? { LinuxContainerProviderFactory.detectInstalledCLI()?.displayName }
+
+  /// Set up the Linux runner: confirm a container daemon is up (starting it
+  /// idempotently if needed), then pull the official runner image. FAST — the
+  /// pull is seconds, not the Windows base build's 30–40 min, so the stepper is
+  /// just verify-daemon → pull-image. `force: true` (the "Re-pull / update image"
+  /// button) re-pulls even if the image is already recorded; `force: false` (the
+  /// initial tile tap) fast-paths when the image is already present + daemon up.
+  func setUpLinuxRunner(force: Bool = false) {
+    guard state == .offline else { statusMessage = "Go offline first."; return }
+    guard !linuxSetupBusy else { return }
+    guard let cli = LinuxContainerProviderFactory.detectInstalledCLI() else {
+      statusMessage =
+        "No container runtime found. Install one (free): `brew install --cask container` on macOS 26+, or `brew install colima docker`. Then tap Linux again."
+      return
+    }
+    let image = linuxRunnerImage
+    // FAST PATH (non-forced): image already present + daemon up → flip ready
+    // directly, so a stray re-tap doesn't re-pull. A forced "update image"
+    // deliberately re-pulls.
+    if !force, LinuxContainerProviderFactory.ready(image: image, cli: cli) {
+      linuxImageReady = true
+      saveConfig()
+      linuxSetupFailure = nil
+      statusMessage = "Linux runner image '\(image)' is ready (\(cli.displayName))."
+      return
+    }
+    linuxSetupBusy = true
+    linuxSetupStep = .verifyDaemon
+    linuxSetupDetail = nil
+    linuxSetupFailure = nil
+    statusMessage = "Setting up the Linux runner…"
+    Task {
+      // 1) Ensure the daemon is up (idempotent start — `colima start` /
+      //    `container system start`). Off the main actor; it can block briefly.
+      var daemonUp = await Task.detached {
+        (try? Shell.run(cli.executable, cli.daemonStatusArgs()))?.ok ?? false
+      }.value
+      if !daemonUp {
+        linuxSetupDetail = "Starting the container daemon…"
+        _ = await Task.detached { try? Shell.run(cli.executable, cli.daemonStartArgs()) }.value
+        daemonUp = await Task.detached {
+          (try? Shell.run(cli.executable, cli.daemonStatusArgs()))?.ok ?? false
+        }.value
+      }
+      guard daemonUp else {
+        linuxSetupFailureIsExternal = false
+        linuxSetupFailure =
+          "The container daemon (\(cli.displayName)) isn't running and couldn't be started. Start it manually, then retry."
+        statusMessage = "Linux setup failed: container daemon not running."
+        endLinuxSetup()
+        return
+      }
+
+      // 2) Pull the runner image, streaming progress into the live stepper.
+      linuxSetupStep = .pullImage
+      let (lines, continuation) = AsyncStream<String>.makeStream()
+      let progress = Task { @MainActor in
+        for await line in lines { self.applyLinuxSetupProgress(line) }
+      }
+      let result = await Self.runLinuxImagePull(cli, image: image) { continuation.yield($0) }
+      continuation.finish()
+      _ = await progress.value
+
+      // Persist the pull transcript so a failure is diagnosable from disk.
+      let pullLog = HostCleanup.writeLog(
+        name: "linux-image-pull", stamp: Self.logStamp(),
+        contents:
+          "image=\(image)\nexit=\(result.map { String($0.status) } ?? "nil (could not launch)")\n\n"
+          + "=== stdout ===\n\(result?.stdout ?? "")\n\n=== stderr ===\n\(result?.stderr ?? "")\n")
+      linuxBuildLogPath = pullLog ?? linuxBuildLogPath
+      endLinuxSetup()
+
+      let isReady = await Task.detached {
+        LinuxContainerProviderFactory.ready(image: image, cli: cli)
+      }.value
+      if let result, result.ok, isReady {
+        LinuxRunnerImage.recordImageRef(image)
+        linuxImageReady = true
+        saveConfig()
+        linuxSetupFailure = nil
+        statusMessage = "Linux runner image '\(image)' is ready (\(cli.displayName))."
+      } else {
+        linuxImageReady = false  // never persist a stale-true
+        saveConfig()
+        // Classify: a registry/network blip isn't the user's setup and is safe to
+        // retry; a local cause (daemon/runtime) is theirs to fix.
+        let transient = LinuxSetupProgress.isLikelyTransientFailure(result?.stderr ?? "")
+        linuxSetupFailureIsExternal = transient
+        linuxSetupFailure =
+          transient
+          ? "The image pull hit a transient registry/network issue — not a problem with your Mac or setup. It's safe to retry."
+          : "Couldn't pull the runner image '\(image)'. Check the container runtime and try again."
+        statusMessage =
+          (transient
+            ? "Linux image pull hit a transient issue — safe to retry."
+            : "Linux setup failed — see the pull log.")
+          + (pullLog.map { " Log: \($0)" } ?? "")
+      }
+    }
+  }
+
+  /// Tear down the live Linux setup indicator. Paired with every exit from
+  /// `setUpLinuxRunner` so the stepper never lingers.
+  private func endLinuxSetup() {
+    linuxSetupBusy = false
+    linuxSetupStep = nil
+    linuxSetupDetail = nil
+  }
+
+  /// Advance the Linux setup stepper from a line of pull output (FORWARD-ONLY) and
+  /// refresh the sub-status. Called on the MainActor as the pull streams.
+  private func applyLinuxSetupProgress(_ line: String) {
+    if let step = LinuxSetupProgress.step(for: line) {
+      linuxSetupStep = max(linuxSetupStep ?? step, step)
+    }
+    if let detail = LinuxSetupProgress.detail(for: line) {
+      linuxSetupDetail = detail
+    }
+  }
+
+  /// Run the image pull off the main actor, streaming combined output to `onLine`
+  /// (for the live stepper) while capturing the full transcript for the log.
+  private nonisolated static func runLinuxImagePull(
+    _ cli: LinuxContainerCLI, image: String, onLine: @escaping @Sendable (String) -> Void
+  ) async -> Shell.Result? {
+    await Task.detached {
+      try? Shell.runStreaming(cli.executable, cli.pullArgs(image: image), onLine: onLine)
+    }.value
+  }
+
+  /// Newest persisted `linux-image-pull-*.log`, so "View pull log" still works
+  /// after an app restart (the @Published path only covers the current session).
+  private static func latestLinuxPullLogPath() -> String? {
+    let dir = HostCleanup.logsRoot()
+    let files =
+      (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+    return
+      files
+      .map(\.lastPathComponent)
+      .filter { $0.hasPrefix("linux-image-pull-") && $0.hasSuffix(".log") }
+      .sorted()
+      .last
+      .map { dir.appendingPathComponent($0).path }
   }
 
   // MARK: Run history + capacity (dashboard window)

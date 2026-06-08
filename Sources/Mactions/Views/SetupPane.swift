@@ -157,6 +157,7 @@ struct SetupPane: View {
       card {
         osSelector
         windowsArea
+        linuxArea
       }
       card {
         repoSelector
@@ -192,9 +193,13 @@ struct SetupPane: View {
     // windowsImageReady — and this avoids a contradictory border+badge state for a
     // migrated user.
     let selected =
-      app.isOSSelected(os) && os.isImplemented && (os != .windows || app.windowsImageReady)
-    let building = (os == .windows && app.windowsSetupBusy)
-    let needsSetup = (os == .windows && !app.windowsImageReady && !building)
+      app.isOSSelected(os) && os.isImplemented
+      && (os != .windows || app.windowsImageReady)
+      && (os != .linux || app.linuxImageReady)
+    let building = (os == .windows && app.windowsSetupBusy) || (os == .linux && app.linuxSetupBusy)
+    let needsSetup =
+      (os == .windows && !app.windowsImageReady && !building)
+      || (os == .linux && !app.linuxImageReady && !building)
     let disabled = !os.isImplemented
     return Button {
       handleOSTap(os)
@@ -229,7 +234,7 @@ struct SetupPane: View {
         Text(os.displayName)
           .font(.system(size: 9, weight: selected ? .semibold : .regular))
           .foregroundStyle(disabled ? .tertiary : (selected ? .primary : .secondary))
-        Text(os == .linux ? "soon" : " ")
+        Text(" ")
           .font(.system(size: 8)).foregroundStyle(.tertiary)
       }
       .contentShape(Rectangle())
@@ -246,7 +251,7 @@ struct SetupPane: View {
     case .windows:
       if app.windowsImageReady { app.toggleOS(.windows) } else { app.setUpWindowsRunner() }
     case .linux:
-      break
+      if app.linuxImageReady { app.toggleOS(.linux) } else { app.setUpLinuxRunner() }
     }
   }
 
@@ -257,7 +262,10 @@ struct SetupPane: View {
       return app.windowsImageReady
         ? "Run a Windows runner fleet (throwaway Win11-ARM VM per job)."
         : "Tap to build the one-time Win11-ARM base image, then Windows fleets become available."
-    case .linux: return "Linux runners are coming soon."
+    case .linux:
+      return app.linuxImageReady
+        ? "Run a Linux runner fleet (throwaway arm64 container per job)."
+        : "Tap to pull the runner image, then Linux fleets become available."
     }
   }
 
@@ -497,8 +505,10 @@ struct SetupPane: View {
       DisclosureGroup {
         LabeledField("macOS labels", text: $app.labelsText, prompt: "self-hosted,macOS,mactions")
           .disabled(app.state != .offline)
-        Text("Windows fleets always register [self-hosted, Windows, mactions].")
-          .font(.system(size: 9)).foregroundStyle(.tertiary)
+        Text(
+          "Windows fleets always register [self-hosted, Windows, mactions]; Linux fleets register [self-hosted, Linux, ARM64, mactions] (arm64 — opt in by label)."
+        )
+        .font(.system(size: 9)).foregroundStyle(.tertiary)
       } label: {
         Text("Advanced").font(.caption2).foregroundStyle(.secondary)
       }
@@ -554,6 +564,130 @@ struct SetupPane: View {
 
   @ViewBuilder
   private func stepIcon(_ step: WindowsSetupStep, current: WindowsSetupStep) -> some View {
+    if step < current {
+      Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption2)
+    } else if step == current {
+      ProgressView().controlSize(.mini)
+    } else {
+      Image(systemName: "circle").foregroundStyle(.secondary).font(.caption2)
+    }
+  }
+
+  // MARK: Linux setup/management (shown contextually below the OS tiles)
+
+  /// The Linux analog of `windowsArea`, but far lighter: setup is just pulling the
+  /// runner image (seconds), so there's a 2-step stepper, a failure banner, and —
+  /// once ready — an image summary + a "re-pull / update" button. When not set up,
+  /// a compact hint points at `brew` (mirrors the "install VMware Fusion" guidance).
+  @ViewBuilder
+  private var linuxArea: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      if !app.linuxSetupBusy, let failure = app.linuxSetupFailure {
+        linuxFailureBanner(failure, external: app.linuxSetupFailureIsExternal)
+      }
+      linuxAreaContent
+    }
+  }
+
+  @ViewBuilder
+  private var linuxAreaContent: some View {
+    if app.linuxSetupBusy {
+      linuxSetupStepper
+    } else if app.linuxImageReady {
+      VStack(alignment: .leading, spacing: 6) {
+        Text(linuxBaseSummary)
+          .font(.system(size: 9)).foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+        if let log = app.linuxBuildLogPath {
+          viewLogButton("Pull log", path: log)
+        }
+        Button { app.setUpLinuxRunner(force: true) } label: {
+          Label("Re-pull / update image", systemImage: "arrow.clockwise")
+        }
+        .glassButton()
+        .controlSize(.regular)
+        .disabled(app.state != .offline || !app.linuxBackendAvailable)
+        if !app.linuxBackendAvailable {
+          Text("Install a container runtime to re-pull.")
+            .font(.system(size: 9)).foregroundStyle(.tertiary)
+        } else if app.state != .offline {
+          Text("Go offline to re-pull.")
+            .font(.system(size: 9)).foregroundStyle(.tertiary)
+        }
+      }
+    } else {
+      // Not set up yet: a compact hint, with a brew pointer when no runtime is
+      // present (the analog of the Windows "install VMware Fusion" guidance).
+      if let backend = app.linuxBackendName {
+        Text("Tap the Linux tile to pull the runner image (~seconds). Runtime: \(backend).")
+          .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+      } else {
+        Text(
+          "Install a container runtime (free), then tap Linux: `brew install --cask container` (macOS 26+) or `brew install colima docker`."
+        )
+        .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+      }
+    }
+  }
+
+  /// "Image · ghcr.io/actions/actions-runner:latest · arm64 · <backend>".
+  private var linuxBaseSummary: String {
+    var parts = ["Image · \(app.linuxRunnerImage)", "arm64"]
+    if let backend = app.linuxBackendName { parts.append(backend) }
+    return parts.joined(separator: " · ")
+  }
+
+  private func linuxFailureBanner(_ message: String, external: Bool) -> some View {
+    VStack(alignment: .leading, spacing: 6) {
+      HStack(alignment: .top, spacing: 6) {
+        Image(systemName: external ? "wifi.exclamationmark" : "exclamationmark.octagon.fill")
+          .font(.caption)
+        Text(message).fixedSize(horizontal: false, vertical: true)
+      }
+      .foregroundStyle(external ? Color.orange : Color.red)
+      if let log = app.linuxBuildLogPath {
+        viewLogButton("View pull log", path: log)
+      }
+    }
+    .font(.caption2)
+    .padding(8)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(RoundedRectangle(cornerRadius: 8).fill((external ? Color.orange : Color.red).opacity(0.12)))
+  }
+
+  /// The 2-step Linux setup stepper (verify daemon → pull image). No cancel button
+  /// (a pull is seconds, not the long Windows build).
+  @ViewBuilder
+  private var linuxSetupStepper: some View {
+    if app.linuxSetupBusy, let current = app.linuxSetupStep {
+      VStack(alignment: .leading, spacing: 5) {
+        ForEach(LinuxSetupStep.allCases, id: \.self) { step in
+          HStack(alignment: .top, spacing: 6) {
+            linuxStepIcon(step, current: current)
+              .frame(width: 14, alignment: .center)
+            VStack(alignment: .leading, spacing: 1) {
+              Text(step.title)
+                .font(.caption2)
+                .fontWeight(step == current ? .semibold : .regular)
+                .foregroundStyle(step <= current ? Color.primary : Color.secondary)
+              if step == current {
+                Text(app.linuxSetupDetail ?? step.hint)
+                  .font(.system(size: 9))
+                  .foregroundStyle(.secondary)
+                  .fixedSize(horizontal: false, vertical: true)
+              }
+            }
+            Spacer(minLength: 0)
+          }
+        }
+      }
+      .padding(8)
+      .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
+    }
+  }
+
+  @ViewBuilder
+  private func linuxStepIcon(_ step: LinuxSetupStep, current: LinuxSetupStep) -> some View {
     if step < current {
       Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption2)
     } else if step == current {

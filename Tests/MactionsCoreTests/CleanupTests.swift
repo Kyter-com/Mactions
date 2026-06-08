@@ -37,6 +37,22 @@ final class CleanupTests: XCTestCase {
       [".win11-runner-base.bak.1", ".win11-runner-base.bak.2"])
   }
 
+  func testLinuxContainerRefsTakesEveryNonEmptyLine() {
+    // `<cli> ps -aq --filter label=mactions` already scoped the listing to our
+    // own containers, so the parser just takes each non-empty (trimmed) line.
+    let listing = """
+      9f2ab3c1d4e5
+
+      a1b2c3d4e5f6
+        7g8h9i0j1k2l
+      """
+    XCTAssertEqual(
+      HostCleanup.linuxContainerRefs(in: listing),
+      ["9f2ab3c1d4e5", "a1b2c3d4e5f6", "7g8h9i0j1k2l"])
+    XCTAssertEqual(HostCleanup.linuxContainerRefs(in: ""), [])
+    XCTAssertEqual(HostCleanup.linuxContainerRefs(in: "\n  \n"), [])
+  }
+
   // NOTE: we deliberately do NOT call purgeRuns()/purgeAll() from tests. They
   // operate on the real ~/.mactions and, when the suite runs *inside* a
   // Mactions-managed runner, the job itself lives in ~/.mactions/runs — so a

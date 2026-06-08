@@ -181,6 +181,34 @@ public enum HostCleanup {
     return Set(tokens.filter { $0.hasPrefix("mactions-") })
   }
 
+  /// Best-effort: force-remove leftover ephemeral Linux runner **containers** from
+  /// a crashed/force-quit session. The provider runs each job in a `--rm`
+  /// container labeled `mactions` and named `mactions-…`, so `--rm` reaps it on a
+  /// normal exit — but a hard crash (or a daemon killed mid-job) can leave one
+  /// behind, holding its `_work` checkout and its GitHub registration. We list by
+  /// the `mactions` label and `rm -f` each. No-op if no container CLI is installed
+  /// or the daemon is down (we never START a daemon just to clean up).
+  public static func purgeStrayLinuxContainers() {
+    guard let cli = LinuxContainerProviderFactory.detectInstalledCLI() else { return }
+    // Don't spin up a daemon during a cleanup sweep — only reap if it's already up.
+    guard let info = try? Shell.run(cli.executable, cli.daemonStatusArgs()), info.ok else { return }
+    guard let list = try? Shell.run(cli.executable, cli.listByLabelArgs(label: "mactions")), list.ok
+    else { return }
+    for ref in linuxContainerRefs(in: list.stdout) {
+      _ = try? Shell.run(cli.executable, cli.rmArgs(name: ref))
+    }
+  }
+
+  /// Pull container refs (ids/names, one per line) out of a `ps -aq` / `list -q`
+  /// listing (pure → testable). The `label=mactions` filter already scoped the
+  /// listing to our own containers, so we just take every non-empty line.
+  static func linuxContainerRefs(in listing: String) -> [String] {
+    listing
+      .split(whereSeparator: \.isNewline)
+      .map { $0.trimmingCharacters(in: .whitespaces) }
+      .filter { !$0.isEmpty }
+  }
+
   /// Best-effort: kill leftover runner-agent processes (run.sh / Runner.Listener
   /// and their job children) from a crashed/force-quit session. On a hard exit
   /// the agents reparent to launchd and keep running (and holding their GitHub
@@ -198,5 +226,6 @@ public enum HostCleanup {
     purgeRuns()
     purgeStrayTartClones()
     purgeStrayWindowsClones()
+    purgeStrayLinuxContainers()
   }
 }
