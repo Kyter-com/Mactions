@@ -1,15 +1,16 @@
-# XcodeGen spec for the Mactions macOS app — used only to get the real Liquid
-# Glass AppIcon (compiled from Mactions.icon by actool) and a runnable .app.
-# `swift build`/`run`/`test` remain the primary dev path; this is the Xcode path.
+# XcodeGen spec for the Mactions macOS app — used to get the real Liquid Glass
+# AppIcon (compiled from Mactions.icon by actool) and a runnable .app.
+# `swift build`/`run`/`test` remain the primary dev path.
 #
 #   brew install xcodegen   # one-time
 #   xcodegen generate       # regenerate Mactions.xcodeproj (gitignored) after edits
 #   open Mactions.xcodeproj # pick the "MactionsApp" scheme, then Run (⌘R)
 #
-# MactionsCore is compiled as a NATIVE Xcode framework target (not a SwiftPM
-# package dependency) so the Xcode build has no package graph to resolve — the
-# local-package-in-the-same-directory setup was fragile (stale "Missing package
-# product" resolutions). Both this and Package.swift compile the same sources.
+# MactionsCore is a native Xcode FRAMEWORK target (not a SwiftPM package dep — that
+# was fragile: stale "Missing package product" resolutions). It needs a generated
+# Info.plist (else codesign rejects the bundle) and is a framework rather than a
+# static library (a static lib exports module headers to .../include/<name>/, which
+# tripped the build sandbox). Both this and Package.swift compile the same sources.
 name: Mactions
 
 options:
@@ -18,9 +19,15 @@ options:
   deploymentTarget:
     macOS: "13.0"
 
+settings:
+  base:
+    # Our scripts-copy Run Script writes into the build's Resources; the user
+    # script sandbox would deny that.
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+
 targets:
-  # The app target is named MactionsApp (not Mactions) so its scheme is
-  # unambiguous; PRODUCT_NAME is Mactions, so the bundle is still Mactions.app.
+  # App target named MactionsApp (not Mactions) so the scheme is unambiguous;
+  # PRODUCT_NAME is Mactions, so the bundle is still Mactions.app.
   MactionsApp:
     type: application
     platform: macOS
@@ -31,9 +38,8 @@ targets:
     # Bundle the repo's scripts/ into the app's Resources (with +x preserved) so
     # script-driven setup (the Windows base build / Fusion helper) is found in the
     # .app, not just under `swift run`. AppState already probes
-    # Contents/Resources/scripts/…; cp -R preserves the executable bit (a folder-
-    # reference resource can strip it). Runs before the implicit code-sign, so the
-    # scripts are covered by the signature.
+    # Contents/Resources/scripts/…; cp -R preserves the executable bit. Runs before
+    # the implicit code-sign, so the scripts are covered by the signature.
     postBuildScripts:
       - name: Bundle scripts/ into Resources
         basedOnDependencyAnalysis: false
@@ -57,16 +63,19 @@ targets:
         ENABLE_HARDENED_RUNTIME: NO
         COMBINE_HIDPI_IMAGES: YES
 
-  # The pure-Foundation control plane, compiled directly (same sources as the
-  # SwiftPM `MactionsCore` target). A STATIC library so it's linked straight into
-  # the app binary — no framework bundle to sign/embed (a framework needs its own
-  # Info.plist or codesign rejects it as "bundle format unrecognized").
+  # The pure-Foundation control plane (same sources as the SwiftPM MactionsCore
+  # target), built as an embedded framework so the app gets a real `MactionsCore`
+  # module to import.
   MactionsCore:
-    type: library.static
+    type: framework
     platform: macOS
     sources:
       - path: Sources/MactionsCore
     settings:
       base:
         PRODUCT_NAME: MactionsCore
+        PRODUCT_BUNDLE_IDENTIFIER: com.kyter.mactions.core
+        GENERATE_INFOPLIST_FILE: YES
+        DEFINES_MODULE: YES
         SWIFT_VERSION: "6.0"
+        CODE_SIGN_STYLE: Automatic
