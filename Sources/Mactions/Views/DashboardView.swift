@@ -2,21 +2,27 @@ import AppKit
 import MactionsCore
 import SwiftUI
 
-/// The dashboard window: a Pulse-style console for the runner fleet. A header
-/// (state + online toggle), a capacity strip, and three tabs — **Runners** and
-/// **History** are master/detail (a list on the left, an inline detail + log
-/// console on the right), **Memory** is a live gauge + sparkline. Binds to the
-/// shared `AppState`, so it's a live mirror of the menubar app.
+/// The dashboard window — now LIVE-FIRST: the primary surface is the runner
+/// fleet (repo-grouped), with **History** and **Memory** alongside it in the
+/// sidebar. Configuration is no longer a tab: per-(repo,platform) combos are
+/// edited in the trailing **Configure** panel (bound to the selected repo), and
+/// global set-once setup lives in the ⌘, Settings window. A slim header carries
+/// the live state + the controls; a bottom strip carries contextual capacity.
 ///
 /// Performance contract: everything slow (GitHub fetches, `ps`, VMX reads) runs
 /// off the main actor — the views only ever read already-published state, so the
 /// Mac UI never stutters while logs load or memory samples.
 struct DashboardView: View {
   @EnvironmentObject private var app: AppState
-  @State private var tab: Tab? = .setup
+  @State private var tab: Tab? = .runners
+  /// The Runners grid selection — a repo header id (`owner/name`) or a runner
+  /// child id (`owner/name#runner`). Lifted here so the Configure panel can bind
+  /// to whichever repo is in focus.
+  @State private var selection: String?
+  /// Whether the trailing Configure (inspector) panel is showing.
+  @State private var showInspector = false
 
   enum Tab: String, CaseIterable, Identifiable {
-    case setup = "Setup"
     case runners = "Runners"
     case history = "History"
     case memory = "Memory"
@@ -24,7 +30,6 @@ struct DashboardView: View {
 
     var systemImage: String {
       switch self {
-      case .setup: return "gearshape"
       case .runners: return "bolt.horizontal"
       case .history: return "clock.arrow.circlepath"
       case .memory: return "memorychip"
@@ -32,11 +37,16 @@ struct DashboardView: View {
     }
   }
 
+  /// The repo the Configure panel edits — derived from the grid selection
+  /// (everything before the first `#`, so a runner child resolves to its repo).
+  private var selectedRepoID: String? {
+    selection?.split(separator: "#", maxSplits: 1).first.map(String.init)
+  }
+
   var body: some View {
     VStack(spacing: 0) {
-      DashboardHeader()
+      headerBar
       Divider()
-      // Rune-style left sidebar: pick a pane on the left, it fills the detail.
       NavigationSplitView {
         List(Tab.allCases, selection: $tab) { item in
           Label(item.rawValue, systemImage: item.systemImage).tag(item)
@@ -45,46 +55,47 @@ struct DashboardView: View {
         .navigationSplitViewColumnWidth(min: 160, ideal: 180, max: 240)
       } detail: {
         Group {
-          switch tab ?? .setup {
-          case .setup: SetupPane()
-          case .runners: RunnersPane()
+          switch tab ?? .runners {
+          case .runners:
+            RunnersPane(
+              selection: $selection, showInspector: $showInspector,
+              selectedRepoID: selectedRepoID)
           case .history: HistoryPane()
           case .memory: MemoryPane()
           }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
       }
+      Divider()
+      StatusStrip(message: statusText, capNote: capNote)
     }
-    .frame(minWidth: 820, minHeight: 560)
+    .frame(minWidth: 900, minHeight: 560)
     .onAppear { app.refreshWindowsPerVMGB() }
-    // Live memory sampling is started/stopped by DashboardWindowController as the
-    // window opens/closes — deterministic across the reused window, unlike a
-    // view-anchored .task that wouldn't reliably cancel on close.
   }
-}
 
-// MARK: - Header
+  // MARK: Header bar (slim, native — no logo / status-dot-only / capacity chips)
 
-private struct DashboardHeader: View {
-  @EnvironmentObject private var app: AppState
-
-  var body: some View {
-    HStack(spacing: 12) {
-      AppLogoView(size: 30)
-        .padding(4)
-        .liquidGlass(in: RoundedRectangle(cornerRadius: 10))
-        .help("Mactions")
-      Circle().fill(statusColor).frame(width: 10, height: 10)
+  private var headerBar: some View {
+    HStack(spacing: MactionsTheme.Spacing.control) {
+      Circle().fill(statusColor).frame(width: 9, height: 9)
       Text(stateSubtitle).font(.callout.weight(.medium)).fixedSize()
-      Divider().frame(height: 20)
-      capacityChips
-      Spacer(minLength: 8)
-      if let message = app.statusMessage {
-        Text(message)
-          .font(.caption).foregroundStyle(.secondary)
-          .lineLimit(2).frame(maxWidth: 280, alignment: .trailing)
-          .fixedSize(horizontal: false, vertical: true)
+      Spacer(minLength: MactionsTheme.Spacing.control)
+
+      Button {
+        if tab != .runners { tab = .runners }
+        showInspector.toggle()
+      } label: {
+        Label("Configure", systemImage: "slider.horizontal.3")
       }
+      .help("Edit the selected repo's platforms, runner count, and labels.")
+
+      Button {
+        openSettings()
+      } label: {
+        Label("Settings", systemImage: "gearshape")
+      }
+      .help("GitHub account, Windows/Linux base setup, and defaults (⌘,).")
+
       Button {
         app.toggleOnline()
       } label: {
@@ -94,18 +105,18 @@ private struct DashboardHeader: View {
       }
       .glassProminentButton()
       .disabled(
-        app.selectedRepos.isEmpty
-          || !app.selectedOSes.contains(where: { $0.isImplemented })
+        app.plan.enabledCombos().isEmpty
           || app.windowsSetupBusy  // can't clone the base while it's being (re)built
           || app.state == .starting || app.state == .stopping)
       .help(
         app.windowsSetupBusy
           ? "Wait for the Windows base image to finish building before going online."
-          : app.selectedRepos.isEmpty
-            ? "Pick at least one repository in Setup first."
+          : app.plan.enabledCombos().isEmpty
+            ? "Add a repo and enable a platform (Configure) first."
             : "Bring the configured runner fleet online / offline.")
     }
-    .padding(.horizontal, 16).padding(.vertical, 12)
+    .padding(.horizontal, MactionsTheme.Spacing.section)
+    .padding(.vertical, MactionsTheme.Spacing.control)
   }
 
   private var statusColor: Color {
@@ -127,85 +138,172 @@ private struct DashboardHeader: View {
     }
   }
 
-  /// The capacity chips (Host RAM / live runners / Windows budget), folded into
-  /// the header bar to save vertical space — a row of glass pills in the control
-  /// layer, grouped so they batch-render + blend (Apple's guidance).
-  private var capacityChips: some View {
-    let cap = app.capacity
-    return GlassGroup(spacing: 8) {
-      HStack(spacing: 8) {
-        chip("Host RAM", formatBytes(cap.hostRAMBytes), systemImage: "memorychip",
-          help: "Total physical memory on this Mac.")
-        chip("Live runners", "\(cap.liveMacRunners) macOS · \(cap.liveWindowsRunners) Win",
-          systemImage: "bolt.fill", help: "Runners currently online.")
-        chip("Windows budget",
-          cap.windowsMaxConcurrentVMs > 0 ? "\(cap.windowsMaxConcurrentVMs) × \(cap.windowsPerVMGB) GB" : "—",
-          systemImage: "cube.box",
-          help: cap.windowsMaxConcurrentVMs > 0
-            ? "Max concurrent Win11-ARM VMs this Mac's RAM allows (each ~\(cap.windowsPerVMGB) GB). The cap go-online enforces — not live usage (see the Memory tab)."
-            : "No Windows base image yet, or not enough RAM to run one VM.")
-      }
-    }
+  /// Bottom-strip left text: the detailed status line if present, else a terse
+  /// configured-repos summary.
+  private var statusText: String {
+    if let message = app.statusMessage { return message }
+    let repoCount = app.plan.repos.count
+    let comboCount = app.plan.enabledCombos().count
+    if repoCount == 0 { return "No repositories configured — add one to begin." }
+    return "\(repoCount) repo\(repoCount == 1 ? "" : "s") · \(comboCount) platform combo\(comboCount == 1 ? "" : "s") configured."
   }
 
-  private func chip(_ label: String, _ value: String, systemImage: String, help: String) -> some View {
-    HStack(spacing: 6) {
-      Image(systemName: systemImage).font(.caption).foregroundStyle(.secondary)
-      VStack(alignment: .leading, spacing: 0) {
-        Text(label).font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary).tracking(0.4).lineLimit(1)
-        Text(value).font(.caption.weight(.medium)).monospacedDigit().lineLimit(1)
-      }
+  /// Bottom-strip right note: shown ONLY when Windows VMs are actually capped
+  /// below what the plan requests (the contextual home for the old budget chip).
+  private var capNote: String? {
+    guard app.state == .online, app.windowsImageReady else { return nil }
+    let windowsCombos = app.plan.enabledCombos().filter { $0.os == .windows }.count
+    let budget = app.capacity.windowsMaxConcurrentVMs
+    guard windowsCombos > budget else { return nil }
+    return budget == 0
+      ? "Windows paused — not enough RAM for a VM"
+      : "Windows VMs capped at \(budget) (RAM budget)"
+  }
+
+  /// Open the ⌘, Settings scene without spawning a duplicate window (the
+  /// selector differs by macOS version).
+  private func openSettings() {
+    if #available(macOS 14.0, *) {
+      NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+    } else {
+      NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
     }
-    .fixedSize()  // keep each chip one line → uniform height (no "1 macOS · 1 Win" wrap)
-    .padding(.horizontal, 10).padding(.vertical, 6)
-    .liquidGlass(in: RoundedRectangle(cornerRadius: 8))
-    .help(help)
   }
 }
 
-// MARK: - Runners (master/detail)
+// MARK: - Runners (repo-grouped outline + Configure/detail panel)
 
 private struct RunnersPane: View {
   @EnvironmentObject private var app: AppState
-  @State private var selected: String?
+  @Binding var selection: String?
+  @Binding var showInspector: Bool
+  let selectedRepoID: String?
+  /// Repos whose runner children are collapsed in the outline (default: expanded).
+  @State private var collapsed: Set<String> = []
+  @State private var showAddRepo = false
+
+  /// One repo's row in the outline: its plan summary + its live runners.
+  private struct RepoGroup: Identifiable {
+    let repo: RepoRef
+    let summary: String
+    let runners: [FleetRunnerRow]
+    let activeCount: Int
+    var id: String { repo.fullName }
+  }
+
+  private var groups: [RepoGroup] {
+    let byRepo = Dictionary(grouping: app.runners, by: { $0.repoFullName })
+    return app.plan.repos.map { plan in
+      let rs = byRepo[plan.repo.fullName] ?? []
+      let active = rs.filter { app.busyRunnerNames.contains($0.runner.id) }.count
+      return RepoGroup(repo: plan.repo, summary: plan.summary(), runners: rs, activeCount: active)
+    }
+  }
 
   var body: some View {
-    content.task {
-      // Poll which of our runners GitHub reports as executing a job (`busy`) so
-      // the activity ring spins only during a real job. Runs while this pane shows.
+    HStack(spacing: 0) {
+      gridColumn.frame(width: 340)
+      Divider()
+      rightPanel.frame(maxWidth: .infinity)
+    }
+    // Poll which of our runners GitHub reports as executing a job (`busy`) so the
+    // activity ring spins only during a real job. Runs while this pane shows.
+    .task {
       while !Task.isCancelled {
         await app.refreshRunnerBusy()
         try? await Task.sleep(nanoseconds: 6_000_000_000)
       }
     }
+    .sheet(isPresented: $showAddRepo) { AddRepoSheet() }
   }
 
-  @ViewBuilder private var content: some View {
-    if app.runners.isEmpty {
-      DashboardEmptyState(
-        systemImage: "bolt.slash",
-        title: app.state == .online ? "No runners up yet" : "No runners online",
-        message: app.state == .online
-          ? "Runners are being provisioned, or none came up — check repo permissions / labels."
-          : "Go online to bring ephemeral runners up.")
-    } else {
-      HStack(spacing: 0) {
-        List(selection: $selected) {
-          ForEach(app.runners) { row in
-            RunnerRow(row: row, busy: app.busyRunnerNames.contains(row.runner.id)).tag(row.id)
+  // MARK: Left — the repo-grouped outline
+
+  @ViewBuilder private var gridColumn: some View {
+    VStack(spacing: 0) {
+      if app.plan.repos.isEmpty {
+        DashboardEmptyState(
+          systemImage: "tray", title: "No repositories",
+          message: "Add a repository, then enable platforms for it in Configure.")
+      } else {
+        List(selection: $selection) {
+          ForEach(groups) { group in
+            repoHeader(group).tag(group.repo.fullName)
+            if !collapsed.contains(group.id) {
+              ForEach(group.runners) { row in
+                RunnerRow(row: row, busy: app.busyRunnerNames.contains(row.runner.id))
+                  .tag(row.id)
+                  .padding(.leading, 16)
+              }
+            }
           }
         }
         .listStyle(.inset)
-        .frame(width: 280)
-        Divider()
-        if let row = app.runners.first(where: { $0.id == selected }) {
-          RunnerDetailView(row: row)
-        } else {
-          DashboardEmptyState(
-            systemImage: "sidebar.right", title: "Select a runner",
-            message: "Pick a live runner to see its current job and step progress.")
-        }
       }
+      Divider()
+      gutter
+    }
+  }
+
+  /// The source-list bottom gutter: add/remove repositories.
+  private var gutter: some View {
+    HStack(spacing: MactionsTheme.Spacing.tight) {
+      Button {
+        showAddRepo = true
+      } label: {
+        Image(systemName: "plus")
+      }
+      .buttonStyle(.borderless)
+      .disabled(app.state != .offline)
+      .help(app.state == .offline ? "Add or remove repositories" : "Go offline to change repositories")
+      Spacer(minLength: 0)
+    }
+    .padding(.horizontal, MactionsTheme.Spacing.control)
+    .padding(.vertical, MactionsTheme.Spacing.tight)
+  }
+
+  /// A selectable, collapsible repo header: chevron, status dot, name + combo
+  /// summary, and an aggregate runner badge.
+  private func repoHeader(_ group: RepoGroup) -> some View {
+    HStack(spacing: MactionsTheme.Spacing.tight) {
+      Button {
+        if collapsed.contains(group.id) { collapsed.remove(group.id) } else { collapsed.insert(group.id) }
+      } label: {
+        Image(systemName: collapsed.contains(group.id) ? "chevron.right" : "chevron.down")
+          .font(.caption2).foregroundStyle(.secondary).frame(width: 12)
+      }
+      .buttonStyle(.borderless)
+      Circle().fill(group.runners.isEmpty ? Color.secondary : Color.green).frame(width: 7, height: 7)
+      VStack(alignment: .leading, spacing: 1) {
+        Text(group.repo.name).font(.callout.weight(.medium)).lineLimit(1).truncationMode(.middle)
+        Text(group.summary).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+      }
+      Spacer(minLength: 0)
+      Text(badge(group)).font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+    }
+    .padding(.vertical, 2)
+    .contentShape(Rectangle())
+  }
+
+  private func badge(_ group: RepoGroup) -> String {
+    let n = group.runners.count
+    if n == 0 { return app.state == .online ? "starting…" : "" }
+    return group.activeCount > 0 ? "\(n) · \(group.activeCount) active" : "\(n)"
+  }
+
+  // MARK: Right — Configure (inspector) OR the selected runner's live detail
+
+  @ViewBuilder private var rightPanel: some View {
+    if showInspector {
+      RepoInspector(repoID: selectedRepoID)
+    } else if let id = selection, id.contains("#"),
+      let row = app.runners.first(where: { $0.id == id })
+    {
+      RunnerDetailView(row: row)
+    } else {
+      DashboardEmptyState(
+        systemImage: "sidebar.right", title: "Select a runner",
+        message: "Pick a live runner to see its job and step progress — or hit Configure to edit a repo's platforms.")
     }
   }
 }
@@ -793,7 +891,7 @@ private struct ConclusionBadge: View {
   }
 }
 
-private struct DashboardEmptyState: View {
+struct DashboardEmptyState: View {
   let systemImage: String
   let title: String
   let message: String

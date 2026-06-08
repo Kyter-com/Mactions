@@ -2,21 +2,25 @@ import AppKit
 import MactionsCore
 import SwiftUI
 
-/// App entry point. The real UI is an AppKit-owned window (`DashboardView`,
+/// App entry point. The PRIMARY UI is an AppKit-owned window (`DashboardView`,
 /// managed by `DashboardWindowController`) that the delegate opens on launch —
-/// not a SwiftUI `WindowGroup`, which would create a second, duplicate window
-/// competing with the AppKit one. SwiftPM `@main App` still needs *a* Scene, so
-/// this declares an empty `Settings` scene as a placeholder. Quitting the app is
-/// the "go offline" signal — the delegate deregisters runners before letting
-/// termination complete.
+/// deliberately a `Settings` scene below, NOT a `WindowGroup`, which would
+/// auto-open a second window competing with the AppKit one. The `Settings` scene
+/// is the real ⌘, preferences window (`SettingsRootView`: GitHub account,
+/// Windows/Linux base setup, new-repo defaults), opened from the toolbar gear.
+/// Quitting the app is the "go offline" signal — the delegate deregisters runners
+/// before letting termination complete.
 @main
 struct MactionsApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
   var body: some Scene {
-    // Placeholder scene only; the primary window is AppKit-owned (see
-    // DashboardWindowController, shown from AppDelegate.applicationDidFinishLaunching).
-    Settings { EmptyView() }
+    // The primary window is AppKit-owned (see DashboardWindowController, shown
+    // from AppDelegate.applicationDidFinishLaunching). The Settings scene is the
+    // real ⌘, preferences window — GitHub account, Windows/Linux base setup, and
+    // new-repo defaults. Opened via the toolbar gear / ⌘, (showSettingsWindow:),
+    // never a hand-rolled second NSWindow.
+    Settings { SettingsRootView().environmentObject(AppState.shared) }
   }
 }
 

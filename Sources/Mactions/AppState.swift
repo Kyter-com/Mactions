@@ -17,10 +17,14 @@ struct FleetRunnerRow: Identifiable {
 final class AppState: ObservableObject {
   static let shared = AppState()
 
-  // Config (persisted to UserDefaults).
-  @Published var selectedRepos: [RepoRef] = []
-  @Published var labelsText = "self-hosted,macOS,mactions"
-  @Published var runnersPerRepo = 1
+  // Config. The whole per-(repo,platform) plan is ONE published value, persisted
+  // as JSON under `fleetPlanV2`; `selectedRepos` is derived from it. This replaces
+  // the old flat globals (selectedRepos/selectedOSes/labelsText/runnersPerRepo),
+  // which only ever applied one uniform combo to every repo.
+  @Published var plan = FleetPlan()
+  /// The configured repos (derived from the plan) — for call sites that just need
+  /// the repo list (orphan reaping, busy polling, the add-repo picker's checkmarks).
+  var selectedRepos: [RepoRef] { plan.repos.map(\.repo) }
   /// OAuth App client id for device-flow sign-in. Optional.
   @Published var clientId = ""
 
@@ -29,11 +33,6 @@ final class AppState: ObservableObject {
   /// Set once the one-time base-image build has succeeded. Gates the Windows OS
   /// tile: Windows isn't selectable until an image exists.
   @Published var windowsImageReady = false
-  /// Which OSes the user picked to run fleets for (the OS tiles). macOS is the
-  /// default; Windows is selectable only once `windowsImageReady`; Linux is not
-  /// implemented yet. On go-online each SELECTED + implemented OS gets a fleet per
-  /// repo (macOS via the local provider, Windows via the VM provider).
-  @Published var selectedOSes: Set<RunnerOS> = [.macOS]
   /// Name of the base VM `prepare-windows-image` built (what we clone per job).
   @Published var windowsBaseImage = "win11-runner-base"
   /// True while the (long, multi-GB) image-prep flow is running. Disables the
@@ -149,12 +148,14 @@ final class AppState: ObservableObject {
   /// the main actor. "Past runs since turning on" — and across restarts.
   @Published var runHistory: [RunRecord] = []
 
-  /// One orchestrator per repo×OS, keyed by `owner/name` (macOS) or
-  /// `owner/name (Windows)`.
+  /// One orchestrator per combo, keyed `<owner/name>#<RunnerOS.rawValue>`.
   private var orchestrators: [String: RunnerOrchestrator] = [:]
   /// The OS each orchestrator key belongs to, so the live runner list can show
   /// the right logo. Same keys as `orchestrators`; cleared together.
   private var fleetOS: [String: RunnerOS] = [:]
+  /// The bare `owner/name` each orchestrator key belongs to, so `sync()` maps a
+  /// runner back to its repo without parsing the key. Same keys; cleared together.
+  private var fleetRepo: [String: String] = [:]
   /// Bumped on every goOnline/goOffline so a slow goOnline Task (e.g. blocked
   /// on the agent download) can detect that the user went offline meanwhile and
   /// abort instead of reviving a dead fleet.
@@ -162,9 +163,6 @@ final class AppState: ObservableObject {
   private let defaults = UserDefaults.standard
 
   init() {
-    selectedRepos = (defaults.stringArray(forKey: "selectedRepos") ?? []).compactMap(RepoRef.init(fullName:))
-    labelsText = defaults.string(forKey: "labels") ?? labelsText
-    runnersPerRepo = max(1, defaults.integer(forKey: "runnersPerRepo"))
     clientId = defaults.string(forKey: "clientId") ?? ""
     windowsImageReady = defaults.bool(forKey: "windowsImageReady")
     windowsBaseImage = defaults.string(forKey: "windowsBaseImage") ?? windowsBaseImage
@@ -177,13 +175,28 @@ final class AppState: ObservableObject {
     // listing) and recompose the base summary — both survive restarts.
     windowsBuildLogPath = Self.latestBuildLogPath()
     refreshWindowsBaseInfo()
-    // Restore the OS selection (pure logic in RunnerOS.restoreSelection, tested).
-    // Back-compat: migrates a pre-OS-selection install from the legacy
-    // `windowsEnabled` flag, seeding Windows only when its image is actually ready.
-    selectedOSes = RunnerOS.restoreSelection(
-      savedRawValues: defaults.stringArray(forKey: "selectedOSes"),
-      legacyWindowsEnabled: defaults.bool(forKey: "windowsEnabled"),
-      windowsImageReady: windowsImageReady)
+    // Load the per-(repo,platform) plan. New key `fleetPlanV2` (JSON); if absent
+    // (upgrade from the flat model), migrate the four legacy flat keys into one
+    // FleetPlan that reproduces today's exact go-online fleet, then persist it
+    // once. The legacy keys are LEFT in place for one release (downgrade-safe).
+    if let data = defaults.data(forKey: "fleetPlanV2"),
+      let decoded = try? JSONDecoder().decode(FleetPlan.self, from: data)
+    {
+      plan = decoded
+    } else {
+      let oses = RunnerOS.restoreSelection(
+        savedRawValues: defaults.stringArray(forKey: "selectedOSes"),
+        legacyWindowsEnabled: defaults.bool(forKey: "windowsEnabled"),
+        windowsImageReady: windowsImageReady)
+      plan = FleetPlan.migrate(
+        repoFullNames: defaults.stringArray(forKey: "selectedRepos") ?? [],
+        oses: oses,
+        labels: Self.parseLabels(defaults.string(forKey: "labels") ?? ""),
+        runnersPerRepo: max(1, defaults.integer(forKey: "runnersPerRepo")),
+        windowsImageReady: windowsImageReady,
+        linuxImageReady: linuxImageReady)
+      defaults.set(try? JSONEncoder().encode(plan), forKey: "fleetPlanV2")
+    }
     isSignedIn = TokenStore.load() != nil
     // Restore past-run history (small JSON; cheap synchronous read like the
     // token/config loads above) so the dashboard has it immediately on open.
@@ -200,12 +213,9 @@ final class AppState: ObservableObject {
   }
 
   func saveConfig() {
-    defaults.set(selectedRepos.map(\.fullName), forKey: "selectedRepos")
-    defaults.set(labelsText, forKey: "labels")
-    defaults.set(runnersPerRepo, forKey: "runnersPerRepo")
+    defaults.set(try? JSONEncoder().encode(plan), forKey: "fleetPlanV2")
     defaults.set(clientId, forKey: "clientId")
     defaults.set(windowsImageReady, forKey: "windowsImageReady")
-    defaults.set(selectedOSes.map(\.rawValue), forKey: "selectedOSes")
     defaults.set(windowsBaseImage, forKey: "windowsBaseImage")
     defaults.set(windowsBuildShowsWindow, forKey: "windowsBuildShowsWindow")
     defaults.set(windowsKeepFailedDisk, forKey: "windowsKeepFailedDisk")
@@ -213,19 +223,76 @@ final class AppState: ObservableObject {
     defaults.set(linuxRunnerImage, forKey: "linuxRunnerImage")
   }
 
-  var labels: [String] {
-    labelsText.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+  /// Parse a comma-separated label string into a trimmed, non-empty token list.
+  static func parseLabels(_ text: String) -> [String] {
+    text.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
   }
 
-  func isSelected(_ repo: RepoRef) -> Bool { selectedRepos.contains(repo) }
+  // MARK: Plan mutation (the per-(repo,platform) config — offline-gated, persisted)
 
+  func isSelected(_ repo: RepoRef) -> Bool { plan.repos.contains { $0.repo == repo } }
+
+  /// Add (with default platforms) or remove a repo. Used by the add-repo picker.
   func toggleRepo(_ repo: RepoRef) {
     guard state == .offline else { return }
-    if let index = selectedRepos.firstIndex(of: repo) {
-      selectedRepos.remove(at: index)
-    } else {
-      selectedRepos.append(repo)
-    }
+    if isSelected(repo) { plan.removeRepo(id: repo.fullName) } else { plan.addRepo(repo) }
+    saveConfig()
+  }
+
+  func addRepo(_ repo: RepoRef) {
+    guard state == .offline else { return }
+    plan.addRepo(repo)
+    saveConfig()
+  }
+
+  func removeRepo(id: String) {
+    guard state == .offline else { return }
+    plan.removeRepo(id: id)
+    saveConfig()
+  }
+
+  /// Enable/disable a `(repo, platform)` combo (the inspector's platform toggle).
+  func setPlatform(_ os: RunnerOS, enabled: Bool, repoID: String) {
+    guard state == .offline else { return }
+    plan.setPlatform(os, enabled: enabled, in: repoID)
+    saveConfig()
+  }
+
+  /// Set a combo's runner count (macOS only in the UI).
+  func setCount(_ count: Int, os: RunnerOS, repoID: String) {
+    guard state == .offline else { return }
+    plan.setCount(count, os: os, in: repoID)
+    saveConfig()
+  }
+
+  /// Set a combo's labels from a comma-separated string.
+  func setLabels(_ text: String, os: RunnerOS, repoID: String) {
+    guard state == .offline else { return }
+    plan.setLabels(Self.parseLabels(text), os: os, in: repoID)
+    saveConfig()
+  }
+
+  // MARK: New-repo defaults (Settings → General)
+
+  var defaultMacOSLabelsText: String { plan.defaultMacOSLabels.joined(separator: ", ") }
+
+  func setDefaultMacOSLabels(_ text: String) {
+    plan.defaultMacOSLabels = Self.parseLabels(text)
+    saveConfig()
+  }
+
+  func setDefaultMacOSCount(_ count: Int) {
+    plan.defaultMacOSCount = max(1, min(5, count))
+    saveConfig()
+  }
+
+  /// Whether a platform is auto-enabled on a freshly-added repo.
+  func isDefaultPlatform(_ os: RunnerOS) -> Bool { plan.defaultPlatforms.contains(os.rawValue) }
+
+  func setDefaultPlatform(_ os: RunnerOS, on: Bool) {
+    var set = Set(plan.defaultPlatforms)
+    if on { set.insert(os.rawValue) } else { set.remove(os.rawValue) }
+    plan.defaultPlatforms = RunnerOS.allCases.map(\.rawValue).filter { set.contains($0) }
     saveConfig()
   }
 
@@ -306,9 +373,11 @@ final class AppState: ObservableObject {
     do {
       let repos = try await GitHubRepoLister(token: token).listAdminRepos()
       availableRepos = repos
-      // Drop any persisted selection the account can no longer admin.
+      // Drop any configured repo the account can no longer admin.
       let admin = Set(repos)
-      selectedRepos = selectedRepos.filter { admin.contains($0) }
+      let before = plan.repos.count
+      plan.repos.removeAll { !admin.contains($0.repo) }
+      if plan.repos.count != before { saveConfig() }
       if repos.isEmpty {
         statusMessage = "No repos you can administer were found for this account."
       }
@@ -329,9 +398,20 @@ final class AppState: ObservableObject {
 
   func goOnline() {
     guard let token = TokenStore.load() else { statusMessage = "Sign in first."; return }
-    guard !selectedRepos.isEmpty else { statusMessage = "Pick at least one repository."; return }
-    guard selectedOSes.contains(where: { $0.isImplemented }) else {
-      statusMessage = "Pick at least one runner OS."
+    guard !plan.repos.isEmpty else { statusMessage = "Add a repository first."; return }
+    let combos = plan.enabledCombos()
+    guard !combos.isEmpty else {
+      statusMessage = "Enable at least one platform for a repo (open Configure)."
+      return
+    }
+    // Per-combo editable labels are the top silent-failure risk — a combo whose
+    // labels are empty or drop `self-hosted` would register a runner no workflow
+    // can target. Hard-block here rather than let the job hang unmatched.
+    let invalid = plan.invalidCombos()
+    guard invalid.isEmpty else {
+      let names = invalid.map { "\($0.repo.name) (\($0.os.displayName))" }.joined(separator: ", ")
+      statusMessage =
+        "Fix labels for: \(names). Each combo's labels must be non-empty and include `self-hosted`."
       return
     }
     // The Windows base image is mid-(re)build — going online would clone a base
@@ -371,9 +451,11 @@ final class AppState: ObservableObject {
       guard fleetEpoch == myEpoch else { return }
       var created: [RunnerOrchestrator] = []
       do {
-        let wantsMac = selectedOSes.contains(.macOS)
-        // Only fetch the macOS agent template when a macOS fleet is actually
-        // wanted — a Windows-only selection needs no local agent.
+        let wantsMac = combos.contains { $0.os == .macOS }
+        let windowsCombos = combos.filter { $0.os == .windows }
+        let linuxCombos = combos.filter { $0.os == .linux }
+        // Only fetch the macOS agent template when a macOS combo is actually
+        // wanted — a Windows/Linux-only plan needs no local agent.
         let factory: LocalProcessProviderFactory?
         if wantsMac {
           let template = try await RunnerInstaller.ensureInstalled(token: token)
@@ -383,17 +465,17 @@ final class AppState: ObservableObject {
         } else {
           factory = nil
         }
-        // Windows fleet: only when the Windows OS tile is selected AND a base image
-        // exists AND VMware Fusion is installed. Never spun up automatically.
-        // Fusion is the sole backend (the proven Win11-ARM path).
+        // Windows fleet: only when a Windows combo exists AND a base image exists
+        // AND VMware Fusion is installed. Never spun up automatically. Fusion is
+        // the sole backend (the proven Win11-ARM path).
         let windowsFactory: WindowsVMProviderFactory? =
-          (selectedOSes.contains(.windows) && windowsImageReady)
+          (!windowsCombos.isEmpty && windowsImageReady)
           ? WindowsVMProviderFactory.detectInstalledCLI().map {
             WindowsVMProviderFactory(baseImage: windowsBaseImage, cli: $0)
           }
           : nil
         // Cap concurrent Windows VMs to what this Mac's RAM can run without
-        // thrashing — each clone is a full VM, so N repos each booting one would
+        // thrashing — each clone is a full VM, so N combos each booting one would
         // otherwise swamp the host. 0 => not enough RAM to run any safely (we then
         // skip Windows entirely and say so, rather than lag the Mac). The per-VM
         // footprint is the base VMX's real `memsize` (linked clones inherit it),
@@ -406,16 +488,16 @@ final class AppState: ObservableObject {
           : WindowsVMBudget.maxConcurrentVMs(
             physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory, perVMGB: perVMGB)
         var windowsVMsStamped = 0
-        // Linux fleet: only when the Linux tile is selected, a container runtime
-        // is installed, AND it's actually ready right now. Re-verify ready()
-        // (daemon up + image present) here because the persisted linuxImageReady
-        // can be stale (image pruned / daemon stopped) — and a dead-daemon
-        // `<cli> run` fails ASYNC (not a throw from start()), so without this
-        // gate the orchestrator would churn JIT configs retrying a failing
-        // container. The probe shells out, so run it off the main actor.
+        // Linux fleet: only when a Linux combo exists, a container runtime is
+        // installed, AND it's actually ready right now. Re-verify ready() (daemon
+        // up + image present) here because the persisted linuxImageReady can be
+        // stale (image pruned / daemon stopped) — and a dead-daemon `<cli> run`
+        // fails ASYNC (not a throw from start()), so without this gate the
+        // orchestrator would churn JIT configs retrying a failing container. The
+        // probe shells out, so run it off the main actor.
         let linuxImg = linuxRunnerImage
         let linuxCLI =
-          (selectedOSes.contains(.linux) && linuxImageReady)
+          (!linuxCombos.isEmpty && linuxImageReady)
           ? LinuxContainerProviderFactory.detectInstalledCLI() : nil
         var linuxReady = false
         if let lxCLI = linuxCLI {
@@ -436,52 +518,48 @@ final class AppState: ObservableObject {
             physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
             activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount)
         var linuxStamped = 0
-        for repo in repos {
+
+        // Stand up one orchestrator per combo, keyed `<owner/name>#<os>` so the
+        // live list maps cleanly back to repo + OS (no fragile suffix parsing).
+        @MainActor func addOrchestrator(
+          repo: RepoRef, os: RunnerOS, factory: RunnerProviderFactory,
+          labels: [String], count: Int
+        ) async {
+          let client = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
+          let fleet = FleetConfig(
+            owner: repo.owner, repo: repo.name, labels: labels, desiredCount: count)
+          let orch = RunnerOrchestrator(
+            controlPlane: client, factory: factory, config: fleet, os: os)
+          orch.onChange = { [weak self] in self?.sync() }
+          orch.onRunFinished = { [weak self] record in self?.recordRun(record) }
+          let key = "\(repo.fullName)#\(os.rawValue)"
+          orchestrators[key] = orch
+          fleetOS[key] = os
+          fleetRepo[key] = repo.fullName
+          created.append(orch)
+          await orch.start()
+        }
+
+        for combo in combos {
           guard fleetEpoch == myEpoch else { break }
-          if wantsMac, let factory {
-            let client = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
-            let fleet = FleetConfig(
-              owner: repo.owner, repo: repo.name, labels: labels, desiredCount: runnersPerRepo)
-            let orch = RunnerOrchestrator(
-              controlPlane: client, factory: factory, config: fleet, os: .macOS)
-            orch.onChange = { [weak self] in self?.sync() }
-            orch.onRunFinished = { [weak self] record in self?.recordRun(record) }
-            orchestrators[repo.fullName] = orch
-            fleetOS[repo.fullName] = .macOS
-            created.append(orch)
-            await orch.start()
-          }
-
-          if let windowsFactory, windowsVMsStamped < maxWindowsVMs {
-            let winClient = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
-            let winFleet = FleetConfig(
-              owner: repo.owner, repo: repo.name, labels: windowsLabels, desiredCount: 1)
-            let winOrch = RunnerOrchestrator(
-              controlPlane: winClient, factory: windowsFactory, config: winFleet, os: .windows)
-            winOrch.onChange = { [weak self] in self?.sync() }
-            winOrch.onRunFinished = { [weak self] record in self?.recordRun(record) }
-            let winKey = "\(repo.fullName) (Windows)"
-            orchestrators[winKey] = winOrch
-            fleetOS[winKey] = .windows
-            created.append(winOrch)
+          switch combo.os {
+          case .macOS:
+            guard wantsMac, let factory else { continue }
+            await addOrchestrator(
+              repo: combo.repo, os: .macOS, factory: factory,
+              labels: combo.config.labels, count: combo.config.count)
+          case .windows:
+            guard let windowsFactory, windowsVMsStamped < maxWindowsVMs else { continue }
             windowsVMsStamped += 1
-            await winOrch.start()
-          }
-
-          if let linuxFactory, linuxStamped < maxLinux {
-            let lxClient = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
-            let lxFleet = FleetConfig(
-              owner: repo.owner, repo: repo.name, labels: linuxLabels, desiredCount: 1)
-            let lxOrch = RunnerOrchestrator(
-              controlPlane: lxClient, factory: linuxFactory, config: lxFleet, os: .linux)
-            lxOrch.onChange = { [weak self] in self?.sync() }
-            lxOrch.onRunFinished = { [weak self] record in self?.recordRun(record) }
-            let lxKey = "\(repo.fullName) (Linux)"
-            orchestrators[lxKey] = lxOrch
-            fleetOS[lxKey] = .linux
-            created.append(lxOrch)
+            await addOrchestrator(
+              repo: combo.repo, os: .windows, factory: windowsFactory,
+              labels: combo.config.labels, count: 1)
+          case .linux:
+            guard let linuxFactory, linuxStamped < maxLinux else { continue }
             linuxStamped += 1
-            await lxOrch.start()
+            await addOrchestrator(
+              repo: combo.repo, os: .linux, factory: linuxFactory,
+              labels: combo.config.labels, count: 1)
           }
         }
         guard fleetEpoch == myEpoch else {
@@ -491,37 +569,52 @@ final class AppState: ObservableObject {
         state = .online
         sync()
         let live = orchestrators.values.reduce(0) { $0 + $1.runners.count }
+        let repoCount = Set(combos.map { $0.repo.fullName }).count
         statusMessage =
           live == 0
           ? "Online, but no runners came up — check repo permissions / labels."
-          : "Online: \(live) runner\(live == 1 ? "" : "s") across \(repos.count) repo\(repos.count == 1 ? "" : "s")."
-        // If the RAM budget kept some repos from getting a Windows runner, say so
-        // (silent under-provisioning reads as a bug).
-        if windowsFactory != nil, windowsVMsStamped < repos.count {
+          : "Online: \(live) runner\(live == 1 ? "" : "s") across \(repoCount) repo\(repoCount == 1 ? "" : "s")."
+        // If the RAM budget kept some Windows combos from getting a runner, say so
+        // (silent under-provisioning reads as a bug). Denominator = combos that
+        // ASKED for Windows, not all repos.
+        if windowsFactory != nil, windowsVMsStamped < windowsCombos.count {
           let why =
             maxWindowsVMs == 0
             ? "this Mac's RAM can't safely run a \(perVMGB) GB Windows VM"
             : "RAM budget allows \(maxWindowsVMs) at once"
           statusMessage =
             (statusMessage ?? "")
-            + " Windows runners limited to \(windowsVMsStamped)/\(repos.count) repos (\(why))."
+            + " Windows runners limited to \(windowsVMsStamped)/\(windowsCombos.count) (\(why))."
         }
-        if linuxFactory != nil, linuxStamped < repos.count {
+        if linuxFactory != nil, linuxStamped < linuxCombos.count {
           let why =
             maxLinux == 0
             ? "this Mac can't safely run a Linux container"
             : "capacity allows \(maxLinux) at once"
           statusMessage =
             (statusMessage ?? "")
-            + " Linux runners limited to \(linuxStamped)/\(repos.count) repos (\(why))."
+            + " Linux runners limited to \(linuxStamped)/\(linuxCombos.count) (\(why))."
         }
-        // Linux was selected + marked ready, but the runtime/image isn't actually
-        // ready now (daemon stopped or image pruned since setup) — say so instead
-        // of silently skipping Linux.
-        if selectedOSes.contains(.linux), linuxImageReady, linuxCLI != nil, !linuxReady {
+        // A Windows combo was enabled but no base image / Fusion → say so instead
+        // of silently skipping it.
+        if !windowsCombos.isEmpty, windowsFactory == nil {
           statusMessage =
             (statusMessage ?? "")
-            + " Linux skipped — the container runtime/image isn't ready (start the daemon or re-run Linux setup)."
+            + (windowsImageReady
+              ? " Windows skipped — install VMware Fusion (Settings → Windows)."
+              : " Windows skipped — build the base image (Settings → Windows).")
+        }
+        // A Linux combo was enabled but the runtime/image isn't ready → say which.
+        if !linuxCombos.isEmpty, linuxFactory == nil {
+          let detail: String
+          if !linuxImageReady {
+            detail = "pull the runner image (Settings → Linux)"
+          } else if linuxCLI == nil {
+            detail = "install a container runtime (Settings → Linux)"
+          } else {
+            detail = "start the container daemon or re-pull (Settings → Linux)"
+          }
+          statusMessage = (statusMessage ?? "") + " Linux skipped — \(detail)."
         }
       } catch {
         guard fleetEpoch == myEpoch else { return }
@@ -543,6 +636,7 @@ final class AppState: ObservableObject {
     for orch in orchestrators.values { await orch.stop() }
     orchestrators.removeAll()
     fleetOS.removeAll()
+    fleetRepo.removeAll()
     // Each run wipes its own working copy; sweep again defensively.
     HostCleanup.purgeRuns()
     runners = []
@@ -617,10 +711,6 @@ final class AppState: ObservableObject {
   {
     await Task.detached { WindowsPreflight.runInstall(for: report) }.value
   }
-
-  /// Labels a Windows fleet registers with: `[self-hosted, Windows, mactions]`.
-  /// Sourced from the model (not a duplicated literal) so it can't drift.
-  private let windowsLabels = RunnerOS.windows.defaultLabels
 
   /// The ONLY trigger for any Windows ISO download / base-image build. Nothing
   /// heavy ever happens automatically — this runs `scripts/prepare-windows-image`
@@ -936,23 +1026,6 @@ final class AppState: ObservableObject {
     }
   }
 
-  /// Toggle an OS tile on/off. No-op while online, for an unimplemented OS
-  /// (Linux), or for Windows before its base image is ready (the UI routes that
-  /// tap to `setUpWindowsRunner` instead).
-  func toggleOS(_ os: RunnerOS) {
-    guard state == .offline, os.isImplemented else { return }
-    if os == .windows && !windowsImageReady { return }
-    if os == .linux && !linuxImageReady { return }
-    if selectedOSes.contains(os) {
-      selectedOSes.remove(os)
-    } else {
-      selectedOSes.insert(os)
-    }
-    saveConfig()
-  }
-
-  func isOSSelected(_ os: RunnerOS) -> Bool { selectedOSes.contains(os) }
-
   /// Drop any "needs rebuild" nudge and reset the throttle. Called right after a
   /// (re)build succeeds — the base now IS the latest build AND carries the current
   /// provisioning recipe, so a leftover nudge would be stale; clearing the
@@ -1039,12 +1112,6 @@ final class AppState: ObservableObject {
   }
 
   // MARK: Linux runner (opt-in)
-
-  /// Labels a Linux fleet registers with: `[self-hosted, Linux, ARM64, mactions]`.
-  /// Sourced from the model (not a duplicated literal) so it can't drift. The
-  /// ARM64 label is deliberate — the host is Apple Silicon but `ubuntu-latest` is
-  /// x64, so workflows must opt into this arm64 runner by label.
-  private let linuxLabels = RunnerOS.linux.defaultLabels
 
   /// True if a container runtime — Apple `container` (macOS 26+) or a `docker`
   /// CLI (typically Colima-managed) — is installed. Linux runners aren't
@@ -1487,10 +1554,9 @@ final class AppState: ObservableObject {
     var rows: [FleetRunnerRow] = []
     for (key, orch) in orchestrators {
       let os = fleetOS[key] ?? .macOS
-      // The Windows fleet is keyed "<repo> (Windows)"; show just the repo (the OS
-      // is conveyed by the row's logo now).
-      let suffix = " (Windows)"
-      let repoName = key.hasSuffix(suffix) ? String(key.dropLast(suffix.count)) : key
+      // Map back to the bare repo via fleetRepo (the OS is conveyed by the row's
+      // logo) — no fragile suffix parsing, so every OS groups under its repo.
+      let repoName = fleetRepo[key] ?? key
       for runner in orch.runners {
         rows.append(FleetRunnerRow(os: os, repoFullName: repoName, runner: runner))
       }
