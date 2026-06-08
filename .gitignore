@@ -1,6 +1,9 @@
 # Build
 /.build/
 *.xcodeproj
+# Xcode / SwiftPM per-user state (created when opening in Xcode)
+.swiftpm/
+xcuserdata/
 
 # Editor / OS cruft
 .vscode/

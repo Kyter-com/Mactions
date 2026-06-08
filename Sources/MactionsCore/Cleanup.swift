@@ -181,6 +181,25 @@ public enum HostCleanup {
     return Set(tokens.filter { $0.hasPrefix("mactions-") })
   }
 
+  /// Best-effort: force-remove leftover ephemeral Linux runner **containers** from
+  /// a crashed/force-quit session. The provider runs each job in a `--rm`
+  /// container labeled `mactions` and named `mactions-…`, so `--rm` reaps it on a
+  /// normal exit — but a hard crash (or a daemon killed mid-job) can leave one
+  /// behind, holding its `_work` checkout and its GitHub registration. We list by
+  /// the `mactions` label and `rm -f` each. No-op if no container CLI is installed
+  /// or the daemon is down (we never START a daemon just to clean up).
+  public static func purgeStrayLinuxContainers() {
+    guard let cli = LinuxContainerProviderFactory.detectInstalledCLI() else { return }
+    // Don't spin up a daemon during a cleanup sweep — only reap if it's already up.
+    guard let info = try? Shell.run(cli.executable, cli.daemonStatusArgs()), info.ok else { return }
+    guard let list = try? Shell.run(cli.executable, cli.sweepListArgs()), list.ok else { return }
+    // The CLI scopes refs to our own containers (docker by `--label`, Apple
+    // `container` by the `mactions-` name prefix) — never touches others'.
+    for ref in cli.sweepRefs(from: list.stdout) {
+      _ = try? Shell.run(cli.executable, cli.rmArgs(name: ref))
+    }
+  }
+
   /// Best-effort: kill leftover runner-agent processes (run.sh / Runner.Listener
   /// and their job children) from a crashed/force-quit session. On a hard exit
   /// the agents reparent to launchd and keep running (and holding their GitHub
@@ -198,5 +217,6 @@ public enum HostCleanup {
     purgeRuns()
     purgeStrayTartClones()
     purgeStrayWindowsClones()
+    purgeStrayLinuxContainers()
   }
 }

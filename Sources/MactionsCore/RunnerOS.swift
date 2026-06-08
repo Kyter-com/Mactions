@@ -7,7 +7,9 @@ import Foundation
 /// - macOS: the `LocalProcessProvider` path (default, always available).
 /// - windows: the `WindowsVMProvider` path — available only once the Win11-ARM
 ///   base image is built (gated by `windowsImageReady`) + VMware Fusion present.
-/// - linux: not implemented yet ("soon"); shown disabled in the UI.
+/// - linux: the `LinuxContainerProvider` path — available once the runner image
+///   is pulled (gated by `linuxImageReady`) + a container daemon (Apple
+///   `container` / Colima `docker`) is installed and running.
 public enum RunnerOS: String, CaseIterable, Codable, Sendable, Identifiable {
   case macOS
   case windows
@@ -29,12 +31,25 @@ public enum RunnerOS: String, CaseIterable, Codable, Sendable, Identifiable {
   /// The OS token used in the `runs-on` label set.
   public var githubLabel: String { displayName }
 
-  /// Whether this OS can actually bring runners online today. Linux is a
-  /// placeholder ("soon") until a Linux provider is wired up.
-  public var isImplemented: Bool { self != .linux }
+  /// Whether this OS can actually bring runners online today. All three are
+  /// implemented now (macOS local-process, Windows VM, Linux container).
+  public var isImplemented: Bool { true }
 
   /// Default fleet labels for this OS: `[self-hosted, <OS>, mactions]`.
-  public var defaultLabels: [String] { ["self-hosted", githubLabel, "mactions"] }
+  ///
+  /// Linux additionally carries `ARM64`: the host is Apple Silicon, but
+  /// `ubuntu-latest` is x64, so a Mactions Linux runner is a genuinely different
+  /// architecture (`RUNNER_ARCH=ARM64`). Declaring the arch in the label set
+  /// makes workflows opt in deliberately (`runs-on: [self-hosted, Linux, ARM64,
+  /// mactions]`) instead of mis-targeting an x64-expecting job at an arm64 runner.
+  /// macOS/Windows keep their arch-less sets (their fleets aren't a hosted-runner
+  /// arch substitute the way the Linux container is).
+  public var defaultLabels: [String] {
+    switch self {
+    case .linux: return ["self-hosted", githubLabel, "ARM64", "mactions"]
+    case .macOS, .windows: return ["self-hosted", githubLabel, "mactions"]
+    }
+  }
 
   /// Reconstruct the persisted OS selection on launch (pure → unit-testable; this
   /// is the highest-regression-risk bit of the OS-selection migration).

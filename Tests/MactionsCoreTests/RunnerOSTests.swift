@@ -10,13 +10,15 @@ final class RunnerOSTests: XCTestCase {
   func testDefaultLabelsMatchTheCIMatrixArms() {
     XCTAssertEqual(RunnerOS.macOS.defaultLabels, ["self-hosted", "macOS", "mactions"])
     XCTAssertEqual(RunnerOS.windows.defaultLabels, ["self-hosted", "Windows", "mactions"])
-    XCTAssertEqual(RunnerOS.linux.defaultLabels, ["self-hosted", "Linux", "mactions"])
+    // Linux carries an explicit ARM64 arch label (host is Apple Silicon, but
+    // ubuntu-latest is x64) so workflows opt in deliberately.
+    XCTAssertEqual(RunnerOS.linux.defaultLabels, ["self-hosted", "Linux", "ARM64", "mactions"])
   }
 
-  func testOnlyLinuxIsUnimplemented() {
+  func testAllOSesAreImplemented() {
     XCTAssertTrue(RunnerOS.macOS.isImplemented)
     XCTAssertTrue(RunnerOS.windows.isImplemented)
-    XCTAssertFalse(RunnerOS.linux.isImplemented)
+    XCTAssertTrue(RunnerOS.linux.isImplemented)
   }
 
   func testRawValuesAreStableForPersistence() {
