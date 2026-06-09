@@ -38,6 +38,7 @@ struct SettingsRootView: View {
       }
       .pickerStyle(.segmented)
       .labelsHidden()
+      .accessibilityLabel("Settings category")
       .padding(.horizontal, MactionsTheme.Spacing.section)
       .padding(.vertical, MactionsTheme.Spacing.control)
       Divider()

@@ -15,6 +15,8 @@ struct RepoInspector: View {
   /// The selected repo's id (`owner/name`), or nil when nothing is selected.
   let repoID: String?
 
+  @State private var confirmRemove = false
+
   private var repoPlan: RepoPlan? {
     guard let repoID else { return nil }
     return app.plan.repos.first { $0.id == repoID }
@@ -61,7 +63,7 @@ struct RepoInspector: View {
         }
 
         if app.state != .offline {
-          Banner("Go offline to change configuration.", severity: .info)
+          Banner(MactionsTheme.Copy.offlineGate, severity: .info)
         }
       }
       .padding(MactionsTheme.Spacing.section)
@@ -79,7 +81,7 @@ struct RepoInspector: View {
       }
       Spacer(minLength: 0)
       Button(role: .destructive) {
-        app.removeRepo(id: repoPlan.id)
+        confirmRemove = true
       } label: {
         Image(systemName: "trash")
       }
@@ -87,6 +89,15 @@ struct RepoInspector: View {
       .controlSize(.small)
       .disabled(app.state != .offline)
       .help("Remove this repository")
+      .accessibilityLabel("Remove repository")
+      .confirmationDialog(
+        "Remove \(repoPlan.repo.name)?", isPresented: $confirmRemove, titleVisibility: .visible
+      ) {
+        Button("Remove", role: .destructive) { app.removeRepo(id: repoPlan.id) }
+        Button("Cancel", role: .cancel) {}
+      } message: {
+        Text("This repository and all of its platform configuration will be removed.")
+      }
     }
   }
 
@@ -146,8 +157,9 @@ struct RepoInspector: View {
           }
         }
         Text(os.displayName)
-          .font(.system(size: 10, weight: selected ? .semibold : .regular))
+          .font(.caption2.weight(selected ? .semibold : .regular))
           .foregroundStyle(selected ? .primary : .secondary)
+          .lineLimit(1)
       }
       .contentShape(Rectangle())
       .opacity(locked ? 0.5 : 1)
@@ -155,6 +167,11 @@ struct RepoInspector: View {
     .buttonStyle(.plain)
     .disabled(locked)
     .help(tileHelp(os, ready: ready, enabled: enabled))
+    // The tile is an image-only control; spell out which OS and its state for
+    // VoiceOver (otherwise just "button, image").
+    .accessibilityLabel(os.displayName)
+    .accessibilityValue(enabled ? "enabled" : (needsSetup ? "needs setup" : "off"))
+    .accessibilityHint(tileHelp(os, ready: ready, enabled: enabled))
   }
 
   /// Toggling a ready tile is offline-gated; tapping an unready tile just opens
@@ -234,12 +251,30 @@ struct RepoInspector: View {
           text: labelsBinding(repoPlan: repoPlan, os: os),
           editable: os == .macOS)
           .disabled(app.state != .offline)
+        // Surface the SAME rule goOnline() hard-blocks on (non-empty + must
+        // include `self-hosted`) right here, so a bad label set is caught while
+        // editing instead of as a cryptic blocked "Go online" later. Only macOS
+        // labels are editable; the derived Windows/Linux sets are always valid.
+        if os == .macOS, let problem = labelProblem(repoPlan) {
+          Banner(problem, severity: .error)
+        }
         if os != .macOS {
           Text("Derived from the OS (arch-explicit for Linux); not editable.")
             .font(.caption).foregroundStyle(.tertiary)
         }
       }
     }
+  }
+
+  /// The label-validity message for this repo's macOS combo, or nil when valid —
+  /// mirrors `FleetPlan.invalidCombos()` (the go-online hard block).
+  private func labelProblem(_ repoPlan: RepoPlan) -> String? {
+    let labels = repoPlan.config(for: .macOS)?.labels ?? app.plan.defaultMacOSLabels
+    if labels.isEmpty { return "Add at least one label, including `self-hosted`." }
+    if !labels.contains("self-hosted") {
+      return "Labels must include `self-hosted`, or no workflow will match these runners."
+    }
+    return nil
   }
 
   // MARK: Readiness

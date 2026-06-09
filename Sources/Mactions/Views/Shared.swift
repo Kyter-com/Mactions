@@ -11,7 +11,7 @@ struct Badge: View {
   let color: Color
   var body: some View {
     Text(label)
-      .font(.system(size: 10, weight: .semibold)).foregroundStyle(color)
+      .font(.caption2.weight(.semibold)).foregroundStyle(color)
       .padding(.horizontal, 7).padding(.vertical, 2)
       .liquidGlassTinted(color, in: Capsule())
   }
@@ -92,6 +92,12 @@ enum MactionsTheme {
   enum Radius {
     static let outer: CGFloat = 12
     static let inner: CGFloat = 8
+  }
+  /// Shared UI copy. One phrase for the pervasive offline gate, so every gated
+  /// control reinforces the same "configure offline, watch online" model instead
+  /// of six near-identical variants.
+  enum Copy {
+    static let offlineGate = "Go offline to make changes."
   }
 }
 

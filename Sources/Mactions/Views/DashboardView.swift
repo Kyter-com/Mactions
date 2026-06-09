@@ -100,6 +100,7 @@ struct DashboardView: View {
           systemImage: app.state == .offline ? "play.fill" : "stop.fill")
       }
       .glassProminentButton()
+      .keyboardShortcut("o", modifiers: .command)
       .disabled(
         app.plan.enabledCombos().isEmpty
           || app.windowsSetupBusy  // can't clone the base while it's being (re)built
@@ -109,7 +110,7 @@ struct DashboardView: View {
           ? "Wait for the Windows base image to finish building before going online."
           : app.plan.enabledCombos().isEmpty
             ? "Add a repo and select it on the left to enable a platform first."
-            : "Bring the configured runner fleet online / offline.")
+            : "Bring the configured runner fleet online / offline (⌘O).")
     }
     .padding(.horizontal, MactionsTheme.Spacing.section)
     .padding(.vertical, MactionsTheme.Spacing.control)
@@ -212,16 +213,32 @@ private struct RunnersPane: View {
     VStack(spacing: 0) {
       if app.plan.repos.isEmpty {
         VStack(spacing: MactionsTheme.Spacing.section) {
-          DashboardEmptyState(
-            systemImage: "tray", title: "No repositories",
-            message: "Add a repository to manage its self-hosted runners. Then pick a platform for it on the right.")
-          Button {
-            showAddRepo = true
-          } label: {
-            Label("Add repository…", systemImage: "plus")
+          if app.isSignedIn {
+            DashboardEmptyState(
+              systemImage: "tray", title: "No repositories",
+              message: "Add a repository to manage its self-hosted runners. Then pick a platform for it on the right.")
+            Button {
+              showAddRepo = true
+            } label: {
+              Label("Add repository…", systemImage: "plus")
+            }
+            .glassProminentButton()
+            .keyboardShortcut("n", modifiers: .command)
+            .disabled(app.state != .offline)
+          } else {
+            // Cold start: sign-in lives in Settings, so a signed-out user with no
+            // repos would otherwise hit a dead end (the add sheet shows "no admin
+            // repos"). Point them straight at the connect flow instead.
+            DashboardEmptyState(
+              systemImage: "person.crop.circle.badge.questionmark", title: "Sign in to GitHub",
+              message: "Connect your GitHub account to see the repositories you can add self-hosted runners to.")
+            Button {
+              app.presentSettings(.general)
+            } label: {
+              Label("Sign in to GitHub…", systemImage: "person.badge.key")
+            }
+            .glassProminentButton()
           }
-          .glassProminentButton()
-          .disabled(app.state != .offline)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {
@@ -260,8 +277,9 @@ private struct RunnersPane: View {
         Label("Add repository", systemImage: "plus")
       }
       .buttonStyle(.borderless)
+      .keyboardShortcut("n", modifiers: .command)
       .disabled(app.state != .offline)
-      .help(app.state == .offline ? "Add or remove repositories" : "Go offline to change repositories")
+      .help(app.state == .offline ? "Add or remove repositories (⌘N)" : MactionsTheme.Copy.offlineGate)
       Spacer(minLength: 0)
     }
     .padding(.horizontal, MactionsTheme.Spacing.control)
@@ -286,10 +304,15 @@ private struct RunnersPane: View {
             .font(.caption2).foregroundStyle(.secondary).frame(width: 12)
         }
         .buttonStyle(.borderless)
+        .accessibilityLabel("Live runners")
+        .accessibilityHint(collapsed.contains(group.id) ? "Expand" : "Collapse")
       } else {
         Color.clear.frame(width: 12, height: 1)
       }
+      // Decorative: the badge text + summary already convey runner state, so keep
+      // the color-only dot out of VoiceOver rather than announcing a bare "image".
       Circle().fill(hasRunners ? Color.green : Color.secondary).frame(width: 7, height: 7)
+        .accessibilityHidden(true)
       VStack(alignment: .leading, spacing: 1) {
         Text(group.repo.name).font(.callout.weight(.medium)).lineLimit(1).truncationMode(.middle)
         Text(group.summary).font(.caption).foregroundStyle(.secondary).lineLimit(1)
@@ -297,12 +320,15 @@ private struct RunnersPane: View {
       Spacer(minLength: MactionsTheme.Spacing.tight)
       // Configured platforms at a glance — the chips make it clear which combos
       // are selected for this repo even when offline (nothing is running yet).
+      // The summary text already names the platforms, so hide the chips from
+      // VoiceOver to avoid reading each OS twice.
       if !group.enabledPlatforms.isEmpty {
         HStack(spacing: 3) {
           ForEach(group.enabledPlatforms) { os in
             OSLogo(os: os, size: 11).frame(width: 13).help(os.displayName)
           }
         }
+        .accessibilityHidden(true)
       }
       if !badge(group).isEmpty {
         Text(badge(group)).font(.caption2).foregroundStyle(.secondary).monospacedDigit()
@@ -357,6 +383,12 @@ private struct RunnerActivityDot: View {
     }
   }
 
+  /// Spoken state — the dot conveys phase by color alone, so give VoiceOver words.
+  private var label: String {
+    let base = phase.rawValue.capitalized
+    return busy ? "\(base), running a job" : base
+  }
+
   var body: some View {
     ZStack {
       if busy {
@@ -371,6 +403,8 @@ private struct RunnerActivityDot: View {
       Circle().fill(color).frame(width: 7, height: 7)
     }
     .frame(width: 16, height: 16)
+    .accessibilityElement()
+    .accessibilityLabel(label)
   }
 }
 
@@ -379,11 +413,11 @@ private struct RunnerRow: View {
   let busy: Bool
   var body: some View {
     HStack(spacing: 9) {
-      OSLogo(os: row.os, size: 14).frame(width: 16)
+      OSLogo(os: row.os, size: 14).frame(width: 16).accessibilityLabel(row.os.displayName)
       RunnerActivityDot(phase: row.runner.phase, busy: busy)
       VStack(alignment: .leading, spacing: 1) {
         Text(row.repoFullName).font(.callout).lineLimit(1).truncationMode(.middle)
-        Text(row.runner.id).font(.system(size: 10).monospaced()).foregroundStyle(.secondary)
+        Text(row.runner.id).font(.caption2.monospaced()).foregroundStyle(.secondary)
           .lineLimit(1).truncationMode(.middle)
       }
       Spacer(minLength: 0)
@@ -466,6 +500,7 @@ private struct HistoryPane: View {
   @State private var selected: String?
   @State private var search = ""
   @State private var filter: OutcomeFilter = .all
+  @State private var confirmClear = false
 
   enum OutcomeFilter: String, CaseIterable, Identifiable {
     case all = "All", passed = "Passed", failed = "Failed"
@@ -497,8 +532,10 @@ private struct HistoryPane: View {
           Image(systemName: "magnifyingglass").font(.caption).foregroundStyle(.secondary)
           TextField("Filter runs…", text: $search).textFieldStyle(.plain).font(.callout)
           if !app.runHistory.isEmpty {
-            Button(action: app.clearRunHistory) { Image(systemName: "trash") }
-              .buttonStyle(.borderless).controlSize(.small).help("Clear run history")
+            Button { confirmClear = true } label: { Image(systemName: "trash") }
+              .buttonStyle(.borderless).controlSize(.small)
+              .help("Clear run history")
+              .accessibilityLabel("Clear run history")
           }
         }
         .padding(.horizontal, 10).padding(.vertical, 6)
@@ -537,6 +574,15 @@ private struct HistoryPane: View {
     // Back-fill the true GitHub conclusion for recent rows so their status is
     // correct without opening each one. Bounded + on-appear only (not a poller).
     .task { await app.resolveRecentConclusions() }
+    // Clearing history is irreversible and a single small-icon tap — confirm it.
+    .confirmationDialog(
+      "Clear all run history?", isPresented: $confirmClear, titleVisibility: .visible
+    ) {
+      Button("Clear", role: .destructive) { app.clearRunHistory() }
+      Button("Cancel", role: .cancel) {}
+    } message: {
+      Text("This permanently deletes all recorded runs and their cached logs. This can't be undone.")
+    }
   }
 }
 
@@ -544,12 +590,13 @@ private struct HistoryRow: View {
   let record: RunRecord
   var body: some View {
     HStack(spacing: 9) {
-      OSLogo(os: record.os, size: 13).frame(width: 16)
+      OSLogo(os: record.os, size: 13).frame(width: 16).accessibilityLabel(record.os.displayName)
       Circle().fill(statusColor(record.resolvedStatus)).frame(width: 7, height: 7)
+        .accessibilityLabel(record.statusLabel)
       VStack(alignment: .leading, spacing: 1) {
         Text(record.repo).font(.callout).lineLimit(1).truncationMode(.middle)
         Text(record.startedAt.formatted(date: .abbreviated, time: .shortened))
-          .font(.system(size: 10)).foregroundStyle(.secondary)
+          .font(.caption2).foregroundStyle(.secondary)
       }
       Spacer(minLength: 0)
       Text(durationString(record.duration)).font(.caption2).foregroundStyle(.tertiary).monospacedDigit()
@@ -604,6 +651,7 @@ private struct RunDetailView: View {
         Task { await app.loadJobLog(for: record, force: true) }
       } label: { Image(systemName: "arrow.clockwise") }
         .glassButton().controlSize(.small).help("Re-fetch the log from GitHub")
+        .accessibilityLabel("Re-fetch log from GitHub")
     }
     .padding(.horizontal, 16).padding(.vertical, 8)
   }
@@ -691,6 +739,7 @@ private struct LogConsole: View {
           .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
         Button { copyAll() } label: { Image(systemName: "doc.on.doc") }
           .buttonStyle(.borderless).controlSize(.small).help("Copy the full log")
+          .accessibilityLabel("Copy the full log")
       }
       .padding(.horizontal, 10).padding(.vertical, 6)
       .liquidGlass(in: Capsule())  // search field = control layer
@@ -735,11 +784,13 @@ private struct LogLineRow: View {
 
   var body: some View {
     HStack(alignment: .top, spacing: 8) {
+      // Line numbers are identifiers users read off — .secondary (not .tertiary)
+      // keeps them legible in dark mode; a semantic font scales with Dynamic Type.
       Text("\(number)")
-        .font(.system(size: 10).monospaced()).foregroundStyle(.tertiary)
+        .font(.caption2.monospaced()).foregroundStyle(.secondary)
         .frame(width: 44, alignment: .trailing)
       Text(line.isEmpty ? " " : line)
-        .font(.system(size: 11).monospaced()).foregroundStyle(.primary)
+        .font(.caption.monospaced()).foregroundStyle(.primary)
         .textSelection(.enabled)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -879,7 +930,7 @@ private struct DetailHeader: View {
 
   var body: some View {
     HStack(spacing: 10) {
-      OSLogo(os: os, size: 16).frame(width: 20).help(os.displayName)
+      OSLogo(os: os, size: 16).frame(width: 20).help(os.displayName).accessibilityLabel(os.displayName)
       VStack(alignment: .leading, spacing: 1) {
         Text(title).font(.headline).lineLimit(1).truncationMode(.middle)
         Text(subtitle).font(.system(size: 11).monospaced()).foregroundStyle(.secondary)

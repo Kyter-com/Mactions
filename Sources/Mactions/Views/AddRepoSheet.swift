@@ -54,6 +54,7 @@ struct AddRepoSheet: View {
         }
         .buttonStyle(.borderless)
         .help("Refresh repositories")
+        .accessibilityLabel("Refresh repositories")
       }
     }
     .padding(.horizontal, MactionsTheme.Spacing.section)
@@ -62,7 +63,15 @@ struct AddRepoSheet: View {
 
   @ViewBuilder
   private var list: some View {
-    if app.availableRepos.isEmpty && !app.reposLoading {
+    if app.reposLoading && app.availableRepos.isEmpty {
+      // Distinguish "still fetching" from "genuinely none" — the bare list used
+      // to render blank during the load, reading as an empty account.
+      VStack(spacing: MactionsTheme.Spacing.control) {
+        ProgressView()
+        Text("Loading repositories…").font(.callout).foregroundStyle(.secondary)
+      }
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+    } else if app.availableRepos.isEmpty {
       DashboardEmptyState(
         systemImage: "tray", title: "No admin repos",
         message: "No repositories you can administer were found for this account. Try Refresh.")
@@ -96,7 +105,7 @@ struct AddRepoSheet: View {
   private var footer: some View {
     HStack {
       if app.state != .offline {
-        Label("Go offline to change repositories", systemImage: "info.circle")
+        Label(MactionsTheme.Copy.offlineGate, systemImage: "info.circle")
           .font(.caption).foregroundStyle(.secondary)
       }
       Spacer()
