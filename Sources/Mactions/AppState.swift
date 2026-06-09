@@ -148,6 +148,25 @@ final class AppState: ObservableObject {
   /// the main actor. "Past runs since turning on" — and across restarts.
   @Published var runHistory: [RunRecord] = []
 
+  // In-app Settings presentation. The primary window is an AppKit-hosted
+  // NSWindow, so the SwiftUI `Settings` scene's `showSettingsWindow:` action
+  // never reaches a responder from here — the old toolbar gear was a dead button.
+  // Instead we present `SettingsRootView` as a SHEET on the dashboard, driven by
+  // this flag (pure SwiftUI state, so it's reliable regardless of the responder
+  // chain). The user also asked for settings to live IN the app, not a separate
+  // preferences window.
+  /// Whether the in-app Settings sheet is showing.
+  @Published var settingsPresented = false
+  /// Which Settings tab to open on present — lets a "needs setup" tap on a
+  /// platform tile jump straight to the Windows / Linux tab.
+  @Published var settingsTab: SettingsTab = .general
+
+  /// Open the in-app Settings sheet, optionally on a specific tab.
+  func presentSettings(_ tab: SettingsTab = .general) {
+    settingsTab = tab
+    settingsPresented = true
+  }
+
   /// One orchestrator per combo, keyed `<owner/name>#<RunnerOS.rawValue>`.
   private var orchestrators: [String: RunnerOrchestrator] = [:]
   /// The OS each orchestrator key belongs to, so the live runner list can show
@@ -401,7 +420,7 @@ final class AppState: ObservableObject {
     guard !plan.repos.isEmpty else { statusMessage = "Add a repository first."; return }
     let combos = plan.enabledCombos()
     guard !combos.isEmpty else {
-      statusMessage = "Enable at least one platform for a repo (open Configure)."
+      statusMessage = "Enable at least one platform for a repo (select it on the left to configure)."
       return
     }
     // Per-combo editable labels are the top silent-failure risk — a combo whose

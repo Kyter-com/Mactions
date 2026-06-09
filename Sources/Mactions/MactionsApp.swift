@@ -5,9 +5,16 @@ import SwiftUI
 /// App entry point. The PRIMARY UI is an AppKit-owned window (`DashboardView`,
 /// managed by `DashboardWindowController`) that the delegate opens on launch —
 /// deliberately a `Settings` scene below, NOT a `WindowGroup`, which would
-/// auto-open a second window competing with the AppKit one. The `Settings` scene
-/// is the real ⌘, preferences window (`SettingsRootView`: GitHub account,
-/// Windows/Linux base setup, new-repo defaults), opened from the toolbar gear.
+/// auto-open a second window competing with the AppKit one.
+///
+/// Settings now live IN the app: `SettingsRootView` is presented as a SHEET on
+/// the dashboard (driven by `AppState.settingsPresented`), NOT the macOS ⌘,
+/// preferences window. The old `showSettingsWindow:` action never reached a
+/// responder from the AppKit-hosted window, so the toolbar gear was dead. The
+/// `Settings { EmptyView() }` scene below is kept ONLY as the "don't auto-open a
+/// window" trick; the standard Settings menu item is replaced so ⌘, opens the
+/// in-app sheet instead of the empty scene.
+///
 /// Quitting the app is the "go offline" signal — the delegate deregisters runners
 /// before letting termination complete.
 @main
@@ -15,12 +22,22 @@ struct MactionsApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
   var body: some Scene {
-    // The primary window is AppKit-owned (see DashboardWindowController, shown
-    // from AppDelegate.applicationDidFinishLaunching). The Settings scene is the
-    // real ⌘, preferences window — GitHub account, Windows/Linux base setup, and
-    // new-repo defaults. Opened via the toolbar gear / ⌘, (showSettingsWindow:),
-    // never a hand-rolled second NSWindow.
-    Settings { SettingsRootView().environmentObject(AppState.shared) }
+    // An empty `Settings` scene purely suppresses the auto-opened WindowGroup
+    // window; it's never shown (the replaced menu item below opens the in-app
+    // sheet instead). The real primary window is AppKit-owned (see
+    // DashboardWindowController, shown from applicationDidFinishLaunching).
+    Settings { EmptyView() }
+      .commands {
+        // Route the standard "Settings… (⌘,)" menu item to the in-app sheet
+        // rather than the (empty, AppKit-unreachable) preferences scene.
+        CommandGroup(replacing: .appSettings) {
+          Button("Settings…") {
+            DashboardWindowController.shared.show()  // ensure a window to host the sheet
+            AppState.shared.presentSettings()
+          }
+          .keyboardShortcut(",", modifiers: .command)
+        }
+      }
   }
 }
 

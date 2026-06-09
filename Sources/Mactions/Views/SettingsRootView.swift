@@ -2,21 +2,66 @@ import AppKit
 import MactionsCore
 import SwiftUI
 
-/// The ⌘, Settings scene — the home for everything set ONCE (per HIG, recurring
-/// per-item config belongs on the live window's inspector, not here): the GitHub
-/// connection, new-repo defaults + capacity, and the long Windows/Linux base
-/// setup + maintenance flows that used to crowd the old Setup pane.
+/// The Settings sheet's tabs. Used both by the `TabView` selection and by
+/// `AppState.presentSettings(_:)` to deep-link a tab (e.g. a "needs setup" tap on
+/// a platform tile opens straight to Windows / Linux).
+enum SettingsTab: Hashable { case general, windows, linux }
+
+/// The Settings surface — the home for everything set ONCE (per HIG, recurring
+/// per-item config belongs on the live window's Configure panel, not here): the
+/// GitHub connection, new-repo defaults + capacity, and the long Windows/Linux
+/// base setup + maintenance flows that used to crowd the old Setup pane.
+///
+/// Presented as an IN-APP SHEET on the dashboard window (not the macOS ⌘,
+/// preferences window): the primary window is AppKit-hosted, so the standard
+/// `showSettingsWindow:` action never fired — and the user asked for settings to
+/// live in the app.
+///
+/// We deliberately do NOT use a macOS `TabView`: in a sheet it draws its own
+/// full-width tab-bar band (hairlines above AND below the pills) that read as a
+/// stray "overlap bar" under our header. Instead a single segmented `Picker` +
+/// `switch` gives the same tabbed feel with chrome we fully control: header →
+/// one hairline → segmented control → one hairline → the selected tab's Form.
+/// The selection is bound to `AppState.settingsTab` so a deep-link (e.g. a
+/// platform tile's "needs setup" tap) lands on the right tab.
 struct SettingsRootView: View {
+  @EnvironmentObject private var app: AppState
+
   var body: some View {
-    TabView {
-      GeneralSettingsTab()
-        .tabItem { Label("General", systemImage: "gearshape") }
-      WindowsSettingsTab()
-        .tabItem { Label("Windows", systemImage: "cube.box") }
-      LinuxSettingsTab()
-        .tabItem { Label("Linux", systemImage: "shippingbox") }
+    VStack(spacing: 0) {
+      header
+      Divider()
+      Picker("", selection: $app.settingsTab) {
+        Text("General").tag(SettingsTab.general)
+        Text("Windows").tag(SettingsTab.windows)
+        Text("Linux").tag(SettingsTab.linux)
+      }
+      .pickerStyle(.segmented)
+      .labelsHidden()
+      .padding(.horizontal, MactionsTheme.Spacing.section)
+      .padding(.vertical, MactionsTheme.Spacing.control)
+      Divider()
+      Group {
+        switch app.settingsTab {
+        case .general: GeneralSettingsTab()
+        case .windows: WindowsSettingsTab()
+        case .linux: LinuxSettingsTab()
+        }
+      }
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
-    .frame(width: 520, height: 560)
+    .frame(width: 540, height: 600)
+  }
+
+  private var header: some View {
+    HStack {
+      Text("Settings").font(.headline)
+      Spacer()
+      Button("Done") { app.settingsPresented = false }
+        .keyboardShortcut(.defaultAction)
+    }
+    .padding(.horizontal, MactionsTheme.Spacing.section)
+    .padding(.vertical, MactionsTheme.Spacing.control)
   }
 }
 
@@ -140,7 +185,7 @@ private struct GeneralSettingsTab: View {
     } header: {
       Text("Defaults for new repositories")
     } footer: {
-      Text("Applied when you add a repo. Per-repo platforms, counts, and labels are tuned in the Configure inspector on the main window.")
+      Text("Applied when you add a repo. Per-repo platforms, counts, and labels are tuned by selecting the repo on the main window.")
     }
   }
 

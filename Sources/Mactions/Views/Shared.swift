@@ -377,6 +377,12 @@ struct LabelEditor: View {
           .onChange(of: focused) { isFocused in if !isFocused { commit() } }
           .onAppear { draft = text }
           .onChange(of: text) { newValue in if !focused { draft = newValue } }
+          // Backstop: committing on focus loss covers tabbing/clicking away, but
+          // selecting another repo destroys this view synchronously — the focus
+          // event may not land first. Commit on disappear so a mid-edit draft
+          // (e.g. typing a label, then clicking a different repo) isn't lost.
+          // No-op when unchanged, so a normal dismiss costs nothing.
+          .onDisappear { commit() }
       }
       HStack(spacing: 4) {
         Text("Registers").eyebrow()

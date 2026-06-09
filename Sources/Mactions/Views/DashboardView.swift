@@ -5,9 +5,10 @@ import SwiftUI
 /// The dashboard window — now LIVE-FIRST: the primary surface is the runner
 /// fleet (repo-grouped), with **History** and **Memory** alongside it in the
 /// sidebar. Configuration is no longer a tab: per-(repo,platform) combos are
-/// edited in the trailing **Configure** panel (bound to the selected repo), and
-/// global set-once setup lives in the ⌘, Settings window. A slim header carries
-/// the live state + the controls; a bottom strip carries contextual capacity.
+/// edited in the **Configure** panel that opens when you select a repo (bound to
+/// that repo), and global set-once setup lives in the in-app Settings sheet. A
+/// slim header carries the live state + the controls; a bottom strip carries
+/// contextual capacity.
 ///
 /// Performance contract: everything slow (GitHub fetches, `ps`, VMX reads) runs
 /// off the main actor — the views only ever read already-published state, so the
@@ -17,10 +18,9 @@ struct DashboardView: View {
   @State private var tab: Tab? = .runners
   /// The Runners grid selection — a repo header id (`owner/name`) or a runner
   /// child id (`owner/name#runner`). Lifted here so the Configure panel can bind
-  /// to whichever repo is in focus.
+  /// to whichever repo is in focus. Selecting a repo opens its config on the
+  /// right; selecting a live runner shows that runner's job detail.
   @State private var selection: String?
-  /// Whether the trailing Configure (inspector) panel is showing.
-  @State private var showInspector = false
 
   enum Tab: String, CaseIterable, Identifiable {
     case runners = "Runners"
@@ -57,9 +57,7 @@ struct DashboardView: View {
         Group {
           switch tab ?? .runners {
           case .runners:
-            RunnersPane(
-              selection: $selection, showInspector: $showInspector,
-              selectedRepoID: selectedRepoID)
+            RunnersPane(selection: $selection, selectedRepoID: selectedRepoID)
           case .history: HistoryPane()
           case .memory: MemoryPane()
           }
@@ -71,6 +69,12 @@ struct DashboardView: View {
     }
     .frame(minWidth: 900, minHeight: 560)
     .onAppear { app.refreshWindowsPerVMGB() }
+    // Settings live IN the app as a sheet (the macOS ⌘, scene was unreachable
+    // from this AppKit-hosted window). Driven by AppState so the Settings button,
+    // ⌘,, and a platform tile's "needs setup" tap all open the same surface.
+    .sheet(isPresented: $app.settingsPresented) {
+      SettingsRootView().environmentObject(app)
+    }
   }
 
   // MARK: Header bar (slim, native — no logo / status-dot-only / capacity chips)
@@ -82,15 +86,7 @@ struct DashboardView: View {
       Spacer(minLength: MactionsTheme.Spacing.control)
 
       Button {
-        if tab != .runners { tab = .runners }
-        showInspector.toggle()
-      } label: {
-        Label("Configure", systemImage: "slider.horizontal.3")
-      }
-      .help("Edit the selected repo's platforms, runner count, and labels.")
-
-      Button {
-        openSettings()
+        app.presentSettings()
       } label: {
         Label("Settings", systemImage: "gearshape")
       }
@@ -112,7 +108,7 @@ struct DashboardView: View {
         app.windowsSetupBusy
           ? "Wait for the Windows base image to finish building before going online."
           : app.plan.enabledCombos().isEmpty
-            ? "Add a repo and enable a platform (Configure) first."
+            ? "Add a repo and select it on the left to enable a platform first."
             : "Bring the configured runner fleet online / offline.")
     }
     .padding(.horizontal, MactionsTheme.Spacing.section)
@@ -159,16 +155,6 @@ struct DashboardView: View {
       ? "Windows paused — not enough RAM for a VM"
       : "Windows VMs capped at \(budget) (RAM budget)"
   }
-
-  /// Open the ⌘, Settings scene without spawning a duplicate window (the
-  /// selector differs by macOS version).
-  private func openSettings() {
-    if #available(macOS 14.0, *) {
-      NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-    } else {
-      NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
-    }
-  }
 }
 
 // MARK: - Runners (repo-grouped outline + Configure/detail panel)
@@ -176,16 +162,17 @@ struct DashboardView: View {
 private struct RunnersPane: View {
   @EnvironmentObject private var app: AppState
   @Binding var selection: String?
-  @Binding var showInspector: Bool
   let selectedRepoID: String?
   /// Repos whose runner children are collapsed in the outline (default: expanded).
   @State private var collapsed: Set<String> = []
   @State private var showAddRepo = false
 
-  /// One repo's row in the outline: its plan summary + its live runners.
+  /// One repo's row in the outline: its configured platforms + plan summary +
+  /// its live runners.
   private struct RepoGroup: Identifiable {
     let repo: RepoRef
     let summary: String
+    let enabledPlatforms: [RunnerOS]
     let runners: [FleetRunnerRow]
     let activeCount: Int
     var id: String { repo.fullName }
@@ -196,7 +183,9 @@ private struct RunnersPane: View {
     return app.plan.repos.map { plan in
       let rs = byRepo[plan.repo.fullName] ?? []
       let active = rs.filter { app.busyRunnerNames.contains($0.runner.id) }.count
-      return RepoGroup(repo: plan.repo, summary: plan.summary(), runners: rs, activeCount: active)
+      return RepoGroup(
+        repo: plan.repo, summary: plan.summary(), enabledPlatforms: plan.enabledPlatforms,
+        runners: rs, activeCount: active)
     }
   }
 
@@ -222,36 +211,53 @@ private struct RunnersPane: View {
   @ViewBuilder private var gridColumn: some View {
     VStack(spacing: 0) {
       if app.plan.repos.isEmpty {
-        DashboardEmptyState(
-          systemImage: "tray", title: "No repositories",
-          message: "Add a repository, then enable platforms for it in Configure.")
+        VStack(spacing: MactionsTheme.Spacing.section) {
+          DashboardEmptyState(
+            systemImage: "tray", title: "No repositories",
+            message: "Add a repository to manage its self-hosted runners. Then pick a platform for it on the right.")
+          Button {
+            showAddRepo = true
+          } label: {
+            Label("Add repository…", systemImage: "plus")
+          }
+          .glassProminentButton()
+          .disabled(app.state != .offline)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {
         List(selection: $selection) {
           ForEach(groups) { group in
             repoHeader(group).tag(group.repo.fullName)
-            if !collapsed.contains(group.id) {
+            // Live runners nest under the repo and are collapsible. Offline there
+            // are none, so the disclosure chevron is hidden (no dead control) and
+            // the configured platforms show as logo chips in the header instead.
+            if !group.runners.isEmpty, !collapsed.contains(group.id) {
               ForEach(group.runners) { row in
                 RunnerRow(row: row, busy: app.busyRunnerNames.contains(row.runner.id))
                   .tag(row.id)
-                  .padding(.leading, 16)
+                  .padding(.leading, 18)
               }
             }
           }
         }
         .listStyle(.inset)
+        // The add/manage gutter only when there's a list — the empty state has
+        // its own prominent "Add repository…" button, so showing the gutter too
+        // would be a redundant second control in the same spot.
+        Divider()
+        gutter
       }
-      Divider()
-      gutter
     }
   }
 
-  /// The source-list bottom gutter: add/remove repositories.
+  /// The source-list bottom gutter: add / manage repositories. Labeled (not a
+  /// bare "+") so it's clear how to add repos; explains the offline gate.
   private var gutter: some View {
     HStack(spacing: MactionsTheme.Spacing.tight) {
       Button {
         showAddRepo = true
       } label: {
-        Image(systemName: "plus")
+        Label("Add repository", systemImage: "plus")
       }
       .buttonStyle(.borderless)
       .disabled(app.state != .offline)
@@ -262,24 +268,45 @@ private struct RunnersPane: View {
     .padding(.vertical, MactionsTheme.Spacing.tight)
   }
 
-  /// A selectable, collapsible repo header: chevron, status dot, name + combo
-  /// summary, and an aggregate runner badge.
+  /// A selectable repo header: a status dot, name + combo summary, configured-
+  /// platform logo chips, and an aggregate runner badge. A disclosure chevron is
+  /// shown ONLY when there are live runners to reveal (so it's never a no-op).
+  /// Selecting the row opens the repo's Configure panel on the right.
   private func repoHeader(_ group: RepoGroup) -> some View {
-    HStack(spacing: MactionsTheme.Spacing.tight) {
-      Button {
-        if collapsed.contains(group.id) { collapsed.remove(group.id) } else { collapsed.insert(group.id) }
-      } label: {
-        Image(systemName: collapsed.contains(group.id) ? "chevron.right" : "chevron.down")
-          .font(.caption2).foregroundStyle(.secondary).frame(width: 12)
+    let hasRunners = !group.runners.isEmpty
+    return HStack(spacing: MactionsTheme.Spacing.tight) {
+      // Chevron only when there's something to expand (live runners). Offline it
+      // would toggle nothing, so we render a fixed-width spacer to keep the rows
+      // aligned instead.
+      if hasRunners {
+        Button {
+          if collapsed.contains(group.id) { collapsed.remove(group.id) } else { collapsed.insert(group.id) }
+        } label: {
+          Image(systemName: collapsed.contains(group.id) ? "chevron.right" : "chevron.down")
+            .font(.caption2).foregroundStyle(.secondary).frame(width: 12)
+        }
+        .buttonStyle(.borderless)
+      } else {
+        Color.clear.frame(width: 12, height: 1)
       }
-      .buttonStyle(.borderless)
-      Circle().fill(group.runners.isEmpty ? Color.secondary : Color.green).frame(width: 7, height: 7)
+      Circle().fill(hasRunners ? Color.green : Color.secondary).frame(width: 7, height: 7)
       VStack(alignment: .leading, spacing: 1) {
         Text(group.repo.name).font(.callout.weight(.medium)).lineLimit(1).truncationMode(.middle)
         Text(group.summary).font(.caption).foregroundStyle(.secondary).lineLimit(1)
       }
-      Spacer(minLength: 0)
-      Text(badge(group)).font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+      Spacer(minLength: MactionsTheme.Spacing.tight)
+      // Configured platforms at a glance — the chips make it clear which combos
+      // are selected for this repo even when offline (nothing is running yet).
+      if !group.enabledPlatforms.isEmpty {
+        HStack(spacing: 3) {
+          ForEach(group.enabledPlatforms) { os in
+            OSLogo(os: os, size: 11).frame(width: 13).help(os.displayName)
+          }
+        }
+      }
+      if !badge(group).isEmpty {
+        Text(badge(group)).font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+      }
     }
     .padding(.vertical, 2)
     .contentShape(Rectangle())
@@ -291,19 +318,23 @@ private struct RunnersPane: View {
     return group.activeCount > 0 ? "\(n) · \(group.activeCount) active" : "\(n)"
   }
 
-  // MARK: Right — Configure (inspector) OR the selected runner's live detail
+  // MARK: Right — the selected runner's live detail OR the repo's Configure panel
 
   @ViewBuilder private var rightPanel: some View {
-    if showInspector {
-      RepoInspector(repoID: selectedRepoID)
-    } else if let id = selection, id.contains("#"),
+    // A live runner is selected → show its job/step detail.
+    if let id = selection, id.contains("#"),
       let row = app.runners.first(where: { $0.id == id })
     {
       RunnerDetailView(row: row)
+    } else if let repoID = selectedRepoID, app.plan.repos.contains(where: { $0.id == repoID }) {
+      // A repo is selected → configure its platforms, runner count, and labels.
+      RepoInspector(repoID: repoID)
     } else {
       DashboardEmptyState(
-        systemImage: "sidebar.right", title: "Select a runner",
-        message: "Pick a live runner to see its job and step progress — or hit Configure to edit a repo's platforms.")
+        systemImage: "slider.horizontal.3", title: "Select a repository",
+        message: app.plan.repos.isEmpty
+          ? "Add a repository on the left, then pick a platform for it here."
+          : "Pick a repository on the left to choose its platforms, runner count, and labels.")
     }
   }
 }
