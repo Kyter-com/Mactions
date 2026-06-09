@@ -543,6 +543,35 @@ if ([int]$longPaths -ne 1) {
 }
 Write-Host 'LongPathsEnabled: 1 (hosted-parity) - verified.'
 
+# --- 4b. GitHub-hosted Windows runner-identity env vars ---------------------
+# Bake the runner-IDENTITY env the hosted Windows image exports (BASE.md: a
+# GitHub OS/runner SEMANTIC, not a tool stack). Machine scope so the per-clone
+# runner service reads them on EVERY JIT-per-job boot - the VM provider injects
+# nothing but the JIT config disc, so unlike macOS/Linux (per-job process env)
+# these MUST live in the base image.
+#   - ImageOS: setup-* actions and cache keys branch on this token, and
+#     whitelist-validating actions (erlef/setup-beam) HARD-FAIL when it is unset
+#     ("ImageOS must be set") - a surprising failure before user code runs.
+#     GitHub publishes NO Win11/ARM token; the valid set is the Server line
+#     win19/win22/win25. The base tracks the NEWEST Win11 GA build, so 'win25'
+#     (the latest Server token) is the closest "current Windows" whitelist-safe
+#     proxy. The arch stays honest - the agent still exports RUNNER_ARCH=ARM64 -
+#     so only the SKU label is a stand-in.
+#   - RUNNER_TOOL_CACHE / AGENT_TOOLSDIRECTORY: hosted sets BOTH to the same path
+#     and setup-* read one or the other (AGENT_TOOLSDIRECTORY overrides), so we
+#     set them identically. The base bakes NO warmed cache (BASE.md keeps tool
+#     stacks out) - this only makes the literal path hosted-shaped; the agent
+#     would otherwise default to _work\tool. The clone is throwaway, so the dir
+#     is discarded after one job.
+[Environment]::SetEnvironmentVariable('ImageOS', 'win25', 'Machine')
+$env:ImageOS = 'win25'
+[Environment]::SetEnvironmentVariable('RUNNER_TOOL_CACHE', 'C:\hostedtoolcache\windows', 'Machine')
+$env:RUNNER_TOOL_CACHE = 'C:\hostedtoolcache\windows'
+[Environment]::SetEnvironmentVariable('AGENT_TOOLSDIRECTORY', 'C:\hostedtoolcache\windows', 'Machine')
+$env:AGENT_TOOLSDIRECTORY = 'C:\hostedtoolcache\windows'
+New-Item -ItemType Directory -Force -Path 'C:\hostedtoolcache\windows' | Out-Null
+Write-Host 'Hosted-parity runner-identity env set: ImageOS=win25, RUNNER_TOOL_CACHE/AGENT_TOOLSDIRECTORY=C:\hostedtoolcache\windows (verified at the sentinel gate).'
+
 # --- 5. GitHub-hosted Windows Update determinism ----------------------------
 # GitHub-hosted Windows images disable Windows Update by policy + service in
 # Configure-System.ps1 so a CI job is never slowed down or rebooted by a
@@ -772,13 +801,29 @@ $gcmInteractive = [Environment]::GetEnvironmentVariable('GCM_INTERACTIVE', 'Mach
 if ($gcmInteractive -ne 'Never') {
   $missing += "GCM_INTERACTIVE Machine env (expected Never, got '$gcmInteractive')"
 }
+# Hosted-parity runner-identity env (section 4b) - a swallowed SetEnvironmentVariable
+# must NOT ship a base that mis-advertises (or omits) ImageOS, since whitelist
+# setup-* actions hard-fail on a missing/bad token. Verify the Machine values
+# persisted, same gate as GCM_INTERACTIVE above.
+$imageOS = [Environment]::GetEnvironmentVariable('ImageOS', 'Machine')
+if ($imageOS -ne 'win25') {
+  $missing += "ImageOS Machine env (expected win25, got '$imageOS')"
+}
+$runnerToolCache = [Environment]::GetEnvironmentVariable('RUNNER_TOOL_CACHE', 'Machine')
+if ($runnerToolCache -ne 'C:\hostedtoolcache\windows') {
+  $missing += "RUNNER_TOOL_CACHE Machine env (expected C:\hostedtoolcache\windows, got '$runnerToolCache')"
+}
+$agentToolsDirectory = [Environment]::GetEnvironmentVariable('AGENT_TOOLSDIRECTORY', 'Machine')
+if ($agentToolsDirectory -ne 'C:\hostedtoolcache\windows') {
+  $missing += "AGENT_TOOLSDIRECTORY Machine env (expected C:\hostedtoolcache\windows, got '$agentToolsDirectory')"
+}
 if ($missing.Count) {
   Write-Warning ("REQUIRED runner settings missing after provisioning: {0}. NOT writing the provisioning sentinel; powering off so the base build fails fast." -f ($missing -join '; '))
   try { Stop-Transcript | Out-Null } catch { }
   shutdown /s /t 5 /c "Mactions base bootstrap FAILED: missing required tools/settings"
   exit 1
 }
-Write-Host 'Verified required runner tools/settings present: git, bash, pwsh, git safe.directory, GCM_INTERACTIVE.'
+Write-Host 'Verified required runner tools/settings present: git, bash, pwsh, git safe.directory, GCM_INTERACTIVE, ImageOS, RUNNER_TOOL_CACHE, AGENT_TOOLSDIRECTORY.'
 
 # Provisioning sentinel - written LAST, right before the orderly power-off.
 # fusion-windows-base polls for this via VMware Tools guest-ops and ONLY

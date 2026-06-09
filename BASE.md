@@ -93,6 +93,19 @@ Adding LocalMachine PowerShell execution policy is a good base change: it matche
 GitHub-hosted Windows shell behavior, adds no tool stack, and prevents explicit
 `shell: powershell` steps from failing before user code runs.
 
+Baking the `ImageOS` runner-identity token is a good base change: it is an
+OS/runner semantic that `setup-*` actions and cache keys read — and that
+whitelist-checking actions (e.g. `erlef/setup-beam`) hard-fail on when unset —
+yet it adds no tool stack and is one env var per OS. The honest value is the
+host's own identity where we have one (`macos<major>` on macOS, derived live;
+`ubuntu24` is already baked by the official Linux runner image) and the closest
+whitelist-safe proxy where we don't (`win25` on Windows, since GitHub publishes
+no Win11/ARM token and a present-but-invalid value is worse than unset).
+`ImageVersion` is the opposite call: it is an author-chosen cache-key fragment,
+not a runner contract — nothing fails when it is unset — so the better move is to
+leave it unset and document the difference rather than fabricate a hosted build
+identity the minimal base does not have.
+
 Preinstalling three Node versions is not a good default base change: workflows
 can use `actions/setup-node`, and the required version belongs in the repository
 that needs it.

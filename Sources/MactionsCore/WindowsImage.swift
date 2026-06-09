@@ -234,6 +234,15 @@ public enum WindowsImage {
   /// the authority that gets stamped into `windows-base.recipe` at build time —
   /// and a unit test asserts they match.
   ///
+  /// v11: bootstrap.ps1 bakes the hosted-parity runner-IDENTITY env vars at
+  /// Machine scope (the open issue #37 V2 item): ImageOS=win25 (the LATEST
+  /// whitelist-safe proxy for the Win11-ARM base — GitHub publishes no win11/ARM
+  /// token, the valid set is the Server line win19/win22/win25, and a
+  /// present-but-invalid value would hard-fail whitelist-checking setup-*
+  /// actions; the base tracks the newest Win11 GA build so the newest Server
+  /// token is the closest "current Windows" stand-in), and
+  /// RUNNER_TOOL_CACHE=AGENT_TOOLSDIRECTORY=C:\hostedtoolcache\windows.
+  /// Sentinel-verified before the base snapshots.
   /// v10: bootstrap.ps1 keeps hosted Windows Defender parity best-effort so
   /// Win11 ARM builds do not fail when Defender immediately remediates/verifies
   /// some preferences as unchanged; PortableGit temp SFX files use unique names
@@ -257,7 +266,7 @@ public enum WindowsImage {
   /// still snapshotted, shipping a base where `actions/checkout` falls back to a REST
   /// tarball and every `shell: bash`/`shell: pwsh` step dies. So v3 bases are
   /// untrustworthy and warrant a rebuild to a verified v4.
-  public static let currentProvisioningRecipeVersion = 10
+  public static let currentProvisioningRecipeVersion = 11
 
   /// Where `prepare-windows-image` records the provisioning-recipe version the
   /// base was built with. A sibling of `windows-base.build`; must survive run

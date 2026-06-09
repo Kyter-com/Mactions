@@ -21,6 +21,8 @@ final class LinuxContainerProviderTests: XCTestCase {
       "--name", "mactions-abc", "--label", "mactions",
       "--cpus", "2", "--memory", "6g",
       "-e", "ACTIONS_RUNNER_INPUT_JITCONFIG",
+      "-e", "RUNNER_TOOL_CACHE=/home/runner/_work/_tool",
+      "-e", "AGENT_TOOLSDIRECTORY=/home/runner/_work/_tool",
       "ghcr.io/actions/actions-runner:latest",
       "/home/runner/run.sh",
     ])
@@ -65,6 +67,8 @@ final class LinuxContainerProviderTests: XCTestCase {
       "--name", "mactions-xyz", "--label", "mactions",
       "--cpus", "4", "--memory", "8g",
       "-e", "ACTIONS_RUNNER_INPUT_JITCONFIG",
+      "-e", "RUNNER_TOOL_CACHE=/home/runner/_work/_tool",
+      "-e", "AGENT_TOOLSDIRECTORY=/home/runner/_work/_tool",
       "img:2",
       "/home/runner/run.sh",
     ])

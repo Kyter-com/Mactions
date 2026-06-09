@@ -116,11 +116,22 @@ public struct DockerCLI: LinuxContainerCLI {
     // never silently QEMU-emulate amd64. The JIT rides in via `-e <name>` (value
     // pulled from the process environment) so it stays out of `ps`. The trailing
     // command is the agent's run.sh — the official image defines no ENTRYPOINT.
+    //
+    // RUNNER_TOOL_CACHE/AGENT_TOOLSDIRECTORY (BASE.md OS/runner-identity parity,
+    // hosted-paired): hosted Ubuntu sets both to one path. We use the
+    // runner-WRITABLE, --rm-ephemeral `/home/runner/_work/_tool` — exactly where
+    // the agent already defaults the tool cache (uid 1001 owns /home/runner) —
+    // NOT hosted's `/opt/hostedtoolcache`, which is root-owned in this official
+    // image and would EACCES every setup-* write. Inlined (not secret, unlike the
+    // name-only JIT `-e`); kept identical so setup-*'s "AGENT_TOOLSDIRECTORY
+    // overrides RUNNER_TOOL_CACHE" rule is a no-op.
     [
       "run", "--rm", "--platform", "linux/arm64",
       "--name", name, "--label", label,
       "--cpus", String(cpus), "--memory", "\(memoryGB)g",
       "-e", jitEnvName,
+      "-e", "RUNNER_TOOL_CACHE=/home/runner/_work/_tool",
+      "-e", "AGENT_TOOLSDIRECTORY=/home/runner/_work/_tool",
       image,
       "/home/runner/run.sh",
     ]
@@ -154,11 +165,16 @@ public struct ContainerCLI: LinuxContainerCLI {
   public var displayName: String { "Apple container" }
 
   public func runArgs(name: String, image: String, label: String, cpus: Int, memoryGB: Int) -> [String] {
+    // RUNNER_TOOL_CACHE/AGENT_TOOLSDIRECTORY: same hosted-identity parity as the
+    // docker backend — the runner-writable, --rm-ephemeral `/home/runner/_work/
+    // _tool` (the agent's own default), never the root-owned `/opt/hostedtoolcache`.
     [
       "run", "--rm",
       "--name", name, "--label", label,
       "--cpus", String(cpus), "--memory", "\(memoryGB)g",
       "-e", jitEnvName,
+      "-e", "RUNNER_TOOL_CACHE=/home/runner/_work/_tool",
+      "-e", "AGENT_TOOLSDIRECTORY=/home/runner/_work/_tool",
       image,
       "/home/runner/run.sh",
     ]

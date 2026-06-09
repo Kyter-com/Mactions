@@ -54,6 +54,14 @@ public final class LocalProcessProvider: RunnerProvider, @unchecked Sendable {
     return process?.isRunning ?? false
   }
 
+  /// The GitHub-hosted `ImageOS` token for a macOS major version: lowercase
+  /// `macos` + the bare major, NO separator/case (e.g. 26 → `macos26`, 15 →
+  /// `macos15`). This exact shape is the contract setup-* actions validate and
+  /// cache keys embed — `macOS`, `macos-26`, etc. would be worse than unset
+  /// (whitelist-checking actions hard-fail). Pure → unit-tested so the format
+  /// can't silently drift.
+  static func imageOSToken(majorVersion: Int) -> String { "macos\(majorVersion)" }
+
   public func start(jitConfig: String, onExit: @escaping @Sendable (Int32) -> Void) throws {
     try FileManager.default.createDirectory(
       at: runDirectory.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -93,6 +101,28 @@ public final class LocalProcessProvider: RunnerProvider, @unchecked Sendable {
     env["RUNNER_TOOL_CACHE"] = runDirectory.appendingPathComponent("_tool").path
     env["XDG_CACHE_HOME"] = jobHome.appendingPathComponent(".cache").path
     env["TMPDIR"] = jobTmp.path
+
+    // GitHub-hosted-runner identity + git-cred parity (BASE.md: bake OS/runner
+    // SEMANTICS, never a tool stack). These are read by setup-* actions / git —
+    // they are not tools — so they belong in the base contract even though the
+    // macOS runner executes on the bare host:
+    //   - ImageOS: the lowercase-os+major token (e.g. macos15, macos26) that
+    //     setup-* and cache keys branch on. Derived from the LIVE host because
+    //     the runner literally IS that OS — honest by construction (it only
+    //     diverges from a published GitHub image if the host runs a macOS major
+    //     GitHub hasn't shipped an image for yet). When UNSET, whitelist-checking
+    //     actions (setup-ruby/erlef-setup-beam) hard-fail "ImageOS must be set"
+    //     before user code runs — the surprising-failure case BASE.md targets.
+    //   - AGENT_TOOLSDIRECTORY: hosted sets it to the SAME path as
+    //     RUNNER_TOOL_CACHE (a legacy alias some setup-* read instead). Keep them
+    //     EQUAL to the ephemeral per-run _tool dir so they can never diverge.
+    //   - GCM_INTERACTIVE=Never: the bare host may have Git Credential Manager
+    //     configured; a headless job hitting an interactive auth prompt would
+    //     hang. Mirrors the baked Windows value (bootstrap.ps1).
+    env["ImageOS"] = Self.imageOSToken(
+      majorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion)
+    env["AGENT_TOOLSDIRECTORY"] = env["RUNNER_TOOL_CACHE"]
+    env["GCM_INTERACTIVE"] = "Never"
 
     // Restore the keychain search list the HOME redirect collapsed: set the job's
     // *user* search list (persisted to jobHome/Library/Preferences) to the host

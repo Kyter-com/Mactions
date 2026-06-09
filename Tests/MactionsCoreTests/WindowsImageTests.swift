@@ -521,6 +521,53 @@ final class WindowsImageTests: XCTestCase {
       "bootstrap.ps1 must verify GCM_INTERACTIVE before writing the sentinel")
   }
 
+  /// Recipe v11 (issue #37 V2): bootstrap.ps1 bakes the hosted-parity
+  /// runner-IDENTITY env at Machine scope so the per-clone runner service reads
+  /// it on every JIT-per-job boot (the VM provider injects nothing but the JIT
+  /// disc). ImageOS MUST be a real GitHub whitelist token (win19/win22/win25) —
+  /// `win25` is the latest Server proxy for the Win11-ARM base — because a
+  /// present-but-invalid value hard-fails whitelist-checking setup-* actions
+  /// (worse than unset). Both the SET and the sentinel VERIFY are asserted, same
+  /// as the GCM_INTERACTIVE pattern.
+  func testBootstrapBakesHostedRunnerIdentityEnv() {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let bootstrapURL = repoRoot.appendingPathComponent("scripts/bootstrap.ps1")
+    guard let script = try? String(contentsOf: bootstrapURL, encoding: .utf8) else {
+      return XCTFail("could not read \(bootstrapURL.path) to check runner-identity env parity")
+    }
+
+    // SET (Machine scope) — the three identity vars.
+    XCTAssertNotNil(
+      script.range(of: "[Environment]::SetEnvironmentVariable('ImageOS', 'win25', 'Machine')"),
+      "bootstrap.ps1 must bake ImageOS=win25 at Machine scope (latest whitelist-safe proxy)")
+    XCTAssertNotNil(
+      script.range(of: "[Environment]::SetEnvironmentVariable('RUNNER_TOOL_CACHE', 'C:\\hostedtoolcache\\windows', 'Machine')"),
+      "bootstrap.ps1 must bake the hosted RUNNER_TOOL_CACHE path at Machine scope")
+    XCTAssertNotNil(
+      script.range(of: "[Environment]::SetEnvironmentVariable('AGENT_TOOLSDIRECTORY', 'C:\\hostedtoolcache\\windows', 'Machine')"),
+      "bootstrap.ps1 must bake AGENT_TOOLSDIRECTORY equal to RUNNER_TOOL_CACHE (hosted sets both)")
+
+    // ImageOS must NEVER be the literal 'Windows' / a non-whitelist value:
+    // whitelist-checking setup-* actions hard-fail on anything outside
+    // win19/win22/win25 — strictly worse than leaving it unset.
+    XCTAssertNil(
+      script.range(of: "SetEnvironmentVariable('ImageOS', 'Windows'"),
+      "ImageOS must be a GitHub whitelist token (win19/win22/win25), never the literal 'Windows'")
+
+    // VERIFY before the sentinel — a swallowed SetEnvironmentVariable must fail
+    // the build, not ship a base that mis-advertises ImageOS.
+    XCTAssertNotNil(
+      script.range(of: "[Environment]::GetEnvironmentVariable('ImageOS', 'Machine')"),
+      "bootstrap.ps1 must verify ImageOS before writing the sentinel")
+    XCTAssertNotNil(
+      script.range(of: "[Environment]::GetEnvironmentVariable('RUNNER_TOOL_CACHE', 'Machine')"),
+      "bootstrap.ps1 must verify RUNNER_TOOL_CACHE before writing the sentinel")
+    XCTAssertNotNil(
+      script.range(of: "[Environment]::GetEnvironmentVariable('AGENT_TOOLSDIRECTORY', 'Machine')"),
+      "bootstrap.ps1 must verify AGENT_TOOLSDIRECTORY before writing the sentinel")
+  }
+
   /// Hosted Configure-System.ps1 disables Windows Update by policy/service so
   /// background OS updates cannot slow or reboot a job. Mactions mirrors that
   /// deterministic behavior, but not the hosted script's broad root scheduled
