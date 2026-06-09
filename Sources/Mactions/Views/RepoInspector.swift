@@ -216,18 +216,19 @@ struct RepoInspector: View {
           severity: .warning, icon: "wrench.and.screwdriver")
       }
 
-      if os == .macOS {
-        Stepper(
-          "Runners: \(config?.count ?? app.plan.defaultMacOSCount)",
-          value: countBinding(repoID: repoPlan.id), in: 1...5)
-          .disabled(app.isTransitioning)
-      } else {
-        InfoRow(
-          "One throwaway \(os == .windows ? "VM" : "container") per job",
-          systemImage: os == .windows ? "cube.box" : "shippingbox"
-        ) {
-          Text("RAM-capped").font(.caption).foregroundStyle(.secondary)
-        }
+      let defaultCount = os == .macOS ? app.plan.defaultMacOSCount : 1
+      Stepper(
+        "Runners: \(config?.count ?? defaultCount)",
+        value: countBinding(repoID: repoPlan.id, os: os), in: 1...5)
+        .disabled(app.isTransitioning)
+      if os != .macOS {
+        // Each runner is a full VM/container, so how many actually run at once is
+        // capped by this Mac's RAM (Linux also by CPU) — the count is the target,
+        // and go-online's status line says when the budget delivers fewer.
+        Text(
+          "Each is a throwaway \(os == .windows ? "VM" : "container"); how many run "
+            + "at once is capped by this Mac's \(os == .windows ? "RAM" : "RAM/CPU").")
+          .font(.caption).foregroundStyle(.secondary)
       }
 
       VStack(alignment: .leading, spacing: MactionsTheme.Spacing.tight) {
@@ -274,13 +275,13 @@ struct RepoInspector: View {
 
   // MARK: Bindings (each write goes through the offline-gated AppState mutators)
 
-  private func countBinding(repoID: String) -> Binding<Int> {
-    Binding(
+  private func countBinding(repoID: String, os: RunnerOS) -> Binding<Int> {
+    let fallback = os == .macOS ? app.plan.defaultMacOSCount : 1
+    return Binding(
       get: {
-        app.plan.repos.first { $0.id == repoID }?.config(for: .macOS)?.count
-          ?? app.plan.defaultMacOSCount
+        app.plan.repos.first { $0.id == repoID }?.config(for: os)?.count ?? fallback
       },
-      set: { app.setCount($0, os: .macOS, repoID: repoID) })
+      set: { app.setCount($0, os: os, repoID: repoID) })
   }
 
   /// macOS: a two-way binding through `setLabels`. Windows/Linux: a read-only

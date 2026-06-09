@@ -16,9 +16,10 @@ import Foundation
 /// exact GitHub `runs-on` label set those runners register with.
 public struct PlatformConfig: Codable, Equatable, Sendable {
   public var enabled: Bool
-  /// Desired runner count, clamped 1...5. Only macOS varies it in the UI;
-  /// Windows/Linux are pinned to 1 at go-online (each is a full VM/container the
-  /// RAM budget caps), so their stored count is informational.
+  /// Desired runner count, clamped 1...5, for every platform: macOS runs this
+  /// many agent processes, Windows/Linux this many VMs/containers. go-online
+  /// further caps the LIVE Windows/Linux total to what the host RAM (and, for
+  /// Linux, CPU) budget allows, so the realized count can be below this target.
   public var count: Int
   /// This combo's OWN labels (e.g. `["self-hosted", "macOS", "mactions"]`).
   public var labels: [String]
@@ -55,13 +56,13 @@ public struct RepoPlan: Codable, Equatable, Sendable, Identifiable {
     RunnerOS.allCases.filter { platforms[$0.rawValue]?.enabled == true }
   }
 
-  /// A one-line subtitle for the repo header — e.g. `"macOS ×2 · Linux"`. Only
-  /// macOS shows its count (the others are always one VM/container per job).
-  /// Empty selection reads as a nudge.
+  /// A one-line subtitle for the repo header — e.g. `"macOS ×2 · Linux ×3"`. A
+  /// platform shows `×N` only when it runs more than one runner; a lone runner is
+  /// left implicit. Empty selection reads as a nudge.
   public func summary() -> String {
     let parts = RunnerOS.allCases.compactMap { os -> String? in
       guard let config = platforms[os.rawValue], config.enabled else { return nil }
-      return os == .macOS ? "macOS ×\(config.count)" : os.displayName
+      return config.count > 1 ? "\(os.displayName) ×\(config.count)" : os.displayName
     }
     return parts.isEmpty ? "No platforms — open Configure" : parts.joined(separator: " · ")
   }

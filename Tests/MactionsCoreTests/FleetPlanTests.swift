@@ -45,7 +45,7 @@ final class FleetPlanTests: XCTestCase {
       windowsImageReady: true, linuxImageReady: true)
     let web = plan.repos[0]
     XCTAssertEqual(web.config(for: .windows)?.enabled, true)
-    XCTAssertEqual(web.config(for: .windows)?.count, 1)  // VM/container pinned to 1
+    XCTAssertEqual(web.config(for: .windows)?.count, 1)  // migrate reproduces the legacy 1-VM fleet
     XCTAssertEqual(web.config(for: .windows)?.labels, RunnerOS.windows.defaultLabels)
     XCTAssertEqual(web.config(for: .linux)?.labels, RunnerOS.linux.defaultLabels)
     // macOS still honors the per-repo count.
@@ -177,5 +177,34 @@ final class FleetPlanTests: XCTestCase {
     XCTAssertEqual(plan.repos[0].config(for: .macOS)?.count, 5)
     plan.setCount(0, os: .macOS, in: "a/b")
     XCTAssertEqual(plan.repos[0].config(for: .macOS)?.count, 1)
+  }
+
+  func testSetCountAppliesToWindowsAndLinux() {
+    // The per-combo count is no longer macOS-only — Windows/Linux honor it too
+    // (go-online's RAM/CPU budget caps the realized total, but the plan stores
+    // the requested count for every platform), and the 1...5 clamp still holds.
+    var plan = FleetPlan(repos: [RepoPlan(repo: RepoRef(owner: "a", name: "b"))])
+    plan.setPlatform(.windows, enabled: true, in: "a/b")
+    plan.setCount(3, os: .windows, in: "a/b")
+    plan.setCount(99, os: .linux, in: "a/b")  // seeds a disabled linux placeholder
+    XCTAssertEqual(plan.repos[0].config(for: .windows)?.count, 3)
+    XCTAssertEqual(plan.repos[0].config(for: .linux)?.count, 5)  // clamped to 5
+  }
+
+  // MARK: Summary
+
+  func testSummaryShowsCountOnlyForPlatformsAboveOne() {
+    var plan = RepoPlan(repo: RepoRef(owner: "a", name: "b"))
+    plan.platforms[RunnerOS.macOS.rawValue] =
+      PlatformConfig(enabled: true, count: 1, labels: ["self-hosted"])
+    plan.platforms[RunnerOS.windows.rawValue] =
+      PlatformConfig(enabled: true, count: 3, labels: ["self-hosted"])
+    // A lone runner stays implicit; >1 shows `×N`. Order follows RunnerOS.allCases.
+    XCTAssertEqual(plan.summary(), "macOS · Windows ×3")
+  }
+
+  func testSummaryNudgesWhenNoPlatformsEnabled() {
+    let plan = RepoPlan(repo: RepoRef(owner: "a", name: "b"))
+    XCTAssertEqual(plan.summary(), "No platforms — open Configure")
   }
 }

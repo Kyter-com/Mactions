@@ -317,7 +317,8 @@ final class AppState: ObservableObject {
     noteComboEdit()
   }
 
-  /// Set a combo's runner count (macOS only in the UI).
+  /// Set a combo's runner count (any platform; go-online's RAM/CPU budget still
+  /// caps the live Windows/Linux total).
   func setCount(_ count: Int, os: RunnerOS, repoID: String) {
     plan.setCount(count, os: os, in: repoID)
     noteComboEdit()
@@ -526,6 +527,10 @@ final class AppState: ObservableObject {
         let wantsMac = combos.contains { $0.os == .macOS }
         let windowsCombos = combos.filter { $0.os == .windows }
         let linuxCombos = combos.filter { $0.os == .linux }
+        // Total runners ASKED for per OS (Σ per-combo counts) — the denominator
+        // for the "limited to X/Y" status when the budget caps below the plan.
+        let windowsRequested = windowsCombos.reduce(0) { $0 + $1.config.count }
+        let linuxRequested = linuxCombos.reduce(0) { $0 + $1.config.count }
         // Only fetch the macOS agent template when a macOS combo is actually
         // wanted — a Windows/Linux-only plan needs no local agent.
         let factory: LocalProcessProviderFactory?
@@ -621,17 +626,24 @@ final class AppState: ObservableObject {
               repo: combo.repo, os: .macOS, factory: factory,
               labels: combo.config.labels, count: combo.config.count)
           case .windows:
-            guard let windowsFactory, windowsVMsStamped < maxWindowsVMs else { continue }
-            windowsVMsStamped += 1
+            guard let windowsFactory else { continue }
+            // Grant up to this combo's requested count, bounded by the RAM
+            // budget's remaining headroom (shared across every Windows combo).
+            // 0 left ⇒ skip this combo (the status line reports the shortfall).
+            let grant = min(combo.config.count, maxWindowsVMs - windowsVMsStamped)
+            guard grant > 0 else { continue }
+            windowsVMsStamped += grant
             await addOrchestrator(
               repo: combo.repo, os: .windows, factory: windowsFactory,
-              labels: combo.config.labels, count: 1)
+              labels: combo.config.labels, count: grant)
           case .linux:
-            guard let linuxFactory, linuxStamped < maxLinux else { continue }
-            linuxStamped += 1
+            guard let linuxFactory else { continue }
+            let grant = min(combo.config.count, maxLinux - linuxStamped)
+            guard grant > 0 else { continue }
+            linuxStamped += grant
             await addOrchestrator(
               repo: combo.repo, os: .linux, factory: linuxFactory,
-              labels: combo.config.labels, count: 1)
+              labels: combo.config.labels, count: grant)
           }
         }
         guard fleetEpoch == myEpoch else {
@@ -648,26 +660,26 @@ final class AppState: ObservableObject {
           live == 0
           ? "Online, but no runners came up — check repo permissions / labels."
           : "Online: \(live) runner\(live == 1 ? "" : "s") across \(repoCount) repo\(repoCount == 1 ? "" : "s")."
-        // If the RAM budget kept some Windows combos from getting a runner, say so
-        // (silent under-provisioning reads as a bug). Denominator = combos that
-        // ASKED for Windows, not all repos.
-        if windowsFactory != nil, windowsVMsStamped < windowsCombos.count {
+        // If the RAM budget kept some Windows runners from coming up, say so
+        // (silent under-provisioning reads as a bug). Denominator = total Windows
+        // runners the plan asked for (Σ per-combo counts), not all repos.
+        if windowsFactory != nil, windowsVMsStamped < windowsRequested {
           let why =
             maxWindowsVMs == 0
             ? "this Mac's RAM can't safely run a \(perVMGB) GB Windows VM"
             : "RAM budget allows \(maxWindowsVMs) at once"
           statusMessage =
             (statusMessage ?? "")
-            + " Windows runners limited to \(windowsVMsStamped)/\(windowsCombos.count) (\(why))."
+            + " Windows runners limited to \(windowsVMsStamped)/\(windowsRequested) (\(why))."
         }
-        if linuxFactory != nil, linuxStamped < linuxCombos.count {
+        if linuxFactory != nil, linuxStamped < linuxRequested {
           let why =
             maxLinux == 0
             ? "this Mac can't safely run a Linux container"
             : "capacity allows \(maxLinux) at once"
           statusMessage =
             (statusMessage ?? "")
-            + " Linux runners limited to \(linuxStamped)/\(linuxCombos.count) (\(why))."
+            + " Linux runners limited to \(linuxStamped)/\(linuxRequested) (\(why))."
         }
         // A Windows combo was enabled but no base image / Fusion → say so instead
         // of silently skipping it.
