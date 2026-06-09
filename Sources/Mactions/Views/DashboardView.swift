@@ -80,7 +80,14 @@ struct DashboardView: View {
       StatusStrip(message: statusText, capNote: capNote)
     }
     .frame(minWidth: 900, minHeight: 560)
-    .onAppear { app.refreshWindowsPerVMGB() }
+    .onAppear {
+      app.refreshWindowsPerVMGB()
+      // Recompute the rebuild nudge so the dashboard banner reflects a stale base
+      // immediately — previously this only ran on the Settings pane's onAppear, so
+      // the banner didn't appear until the user opened Settings. Cheap: the recipe
+      // dimension is a local file compare; the OS-build check is throttled to 6h.
+      app.checkForWindowsImageUpdate()
+    }
   }
 
   // MARK: Header bar (slim, native — no logo / status-dot-only / capacity chips)
