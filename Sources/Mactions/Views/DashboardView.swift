@@ -55,6 +55,10 @@ struct DashboardView: View {
         restartBar
         Divider()
       }
+      if let rebuild = app.rebuildNotice {
+        rebuildBar(rebuild)
+        Divider()
+      }
       NavigationSplitView {
         List(Tab.allCases, selection: $tab) { item in
           Label(item.rawValue, systemImage: item.systemImage).tag(item)
@@ -194,6 +198,25 @@ struct DashboardView: View {
       Button("Restart fleet") { app.restartFleet() }
         .controlSize(.small)
         .disabled(app.state == .starting || app.state == .stopping)
+    }
+    .padding(.horizontal, MactionsTheme.Spacing.section)
+    .padding(.vertical, MactionsTheme.Spacing.control)
+    .background(Color.orange.opacity(0.12))
+  }
+
+  /// Shown when a runner base image is stale — the prominent dashboard analog of
+  /// the in-pane Settings rebuild banner, styled like `restartBar`. Non-blocking:
+  /// the fleet still runs on the existing base, so this just surfaces the update
+  /// + a one-click jump to the Settings pane that rebuilds it (the rebuild itself
+  /// needs the confirm dialog + offline gate that live there).
+  private func rebuildBar(_ rebuild: AppState.RebuildNotice) -> some View {
+    HStack(spacing: MactionsTheme.Spacing.tight) {
+      Image(systemName: rebuild.icon).foregroundStyle(.orange)
+      Text(rebuild.text)
+        .font(.callout).foregroundStyle(.orange)
+      Spacer(minLength: MactionsTheme.Spacing.control)
+      Button("Rebuild…") { app.presentSettings(rebuild.tab) }
+        .controlSize(.small)
     }
     .padding(.horizontal, MactionsTheme.Spacing.section)
     .padding(.vertical, MactionsTheme.Spacing.control)

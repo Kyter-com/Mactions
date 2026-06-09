@@ -272,6 +272,43 @@ final class AppState: ObservableObject {
   /// so the change is staged but not yet applied. Cleared on go-online/go-offline.
   @Published var pendingRestart = false
 
+  /// Content for the dashboard "a runner base needs a rebuild" banner — the
+  /// prominent, always-visible analog of `pendingRestart`, so a stale base is
+  /// noticeable on the dashboard instead of buried in the Settings pane. The
+  /// fleet keeps running on the existing base (non-blocking), so this is a nudge,
+  /// not a gate; the action deep-links to the pane that rebuilds it.
+  struct RebuildNotice: Equatable {
+    let text: String
+    /// SF Symbol (data, not a view) matching the reason — keeps the dashboard
+    /// bar and the Settings banner visually consistent.
+    let icon: String
+    /// Where "Rebuild…" jumps so the user lands on the actual rebuild controls.
+    let tab: SettingsTab
+  }
+
+  /// The active rebuild nudge, or `nil` when every runner base is current.
+  ///
+  /// Only Windows has a rebuild lifecycle today: its base image is the one
+  /// cached/auto-refreshed artifact, so it can drift (a newer Win11 build, or an
+  /// updated provisioning recipe). macOS runs the agent on the bare host and
+  /// refreshes the cached template automatically on go-online, and Linux pulls
+  /// the official runner image (no recipe to drift) — neither surfaces a rebuild
+  /// nudge. New rebuildable bases plug their own branch in here and the dashboard
+  /// banner renders them with no further wiring.
+  var rebuildNotice: RebuildNotice? {
+    if windowsMaintenance.needsRebuild, let notice = windowsUpdateNotice {
+      let icon: String
+      switch windowsMaintenance {
+      case .osBuildAvailable: icon = "arrow.up.circle"
+      case .provisioningOutdated: icon = "wrench.and.screwdriver"
+      case .both: icon = "exclamationmark.triangle"
+      case .upToDate, .notBuilt: icon = "arrow.clockwise.circle"
+      }
+      return RebuildNotice(text: notice, icon: icon, tab: .windows)
+    }
+    return nil
+  }
+
   func isSelected(_ repo: RepoRef) -> Bool { plan.repos.contains { $0.repo == repo } }
 
   /// Add (with default platforms) or remove a repo. Used by the add-repo picker.
