@@ -142,6 +142,19 @@ final class AppState: ObservableObject {
   /// Polled by the Runners pane so the activity ring spins only during a real job,
   /// not for an idle-but-online runner. Empty when offline.
   @Published var busyRunnerNames: Set<String> = []
+
+  /// Map a GitHub Actions API failure to a user-facing reason. A 403/404 on the
+  /// runs/jobs endpoints almost always means the signed-in token can register
+  /// runners (Administration scope) but can't READ Actions — the single most
+  /// common cause of "steps/logs never show". Surfaced instead of being swallowed
+  /// as a silent "no job".
+  static func actionsErrorMessage(_ error: Error) -> String {
+    if case let GitHubClient.ClientError.http(code, _) = error, code == 403 || code == 404 {
+      return
+        "GitHub returned \(code) reading this repo's Actions. The signed-in token can register runners but may lack \"Actions: read\" — reconnect with a classic token that has the `repo` scope, or a fine-grained token with Actions: Read-only."
+    }
+    return "Couldn't reach GitHub Actions: \(error.localizedDescription)"
+  }
   @Published var statusMessage: String?
   /// Finished runs (newest first), surfaced in the dashboard window's history.
   /// Loaded from disk on launch and appended to as runners exit; persisted off
@@ -1561,8 +1574,16 @@ final class AppState: ObservableObject {
   /// log stream, but the Jobs API returns per-step status).
   enum RunnerJobState: Sendable, Equatable {
     case loading
+    /// GitHub's runner API reports the runner busy, but the jobs API hasn't
+    /// published the matching job/steps yet (normal indexing lag right after a
+    /// job is assigned). Distinct from `.notFound` so the detail pane shows a
+    /// "running" state matching the spinner instead of "No job running".
+    case running
     case found(WorkflowJob)
     case notFound
+    /// The Actions API call failed (e.g. the token lacks `Actions: read`). Carries
+    /// the user-facing reason so the pane explains it instead of looking idle.
+    case error(String)
   }
   @Published var runnerJobs: [String: RunnerJobState] = [:]
 
@@ -1587,7 +1608,17 @@ final class AppState: ObservableObject {
     // actor (the awaits suspend it, never block) AND respect cancellation: closing
     // the dashboard cancels this `.task`, which cancels the in-flight URLSession
     // calls. (Task.detached would have detached from that cancellation.)
-    guard let job = await client.findJob(runnerName: record.id, since: record.startedAt) else {
+    let job: WorkflowJob?
+    do {
+      job = try await client.findJob(runnerName: record.id, since: record.startedAt)
+    } catch {
+      // A hard Actions-read failure (e.g. missing `Actions: read` scope) — surface
+      // the real reason instead of an indexing-miss message. Leave `jobConclusion`
+      // untouched so the row self-heals once access is fixed.
+      jobLogs[record.id] = .unavailable(Self.actionsErrorMessage(error))
+      return
+    }
+    guard let job else {
       jobLogs[record.id] = .unavailable(
         "No matching job found on GitHub — it may have expired, or GitHub hasn't indexed it yet.")
       // Leave `jobConclusion` untouched: a transient indexing miss must not get
@@ -1663,17 +1694,30 @@ final class AppState: ObservableObject {
     busyRunnerNames = busy
   }
 
-  func loadRunnerJob(for runnerName: String, repo: String) async {
+  /// `busy` is GitHub's runner-API verdict for this runner (from `busyRunnerNames`):
+  /// it decides whether an unmatched lookup reads as `.running` (busy → job just
+  /// not indexed yet) or `.notFound` (idle ephemeral runner). When the jobs API
+  /// itself reports an in-progress job, the runner is also added to
+  /// `runnersWithLiveJob` so the activity ring spins even if the runner API lagged.
+  func loadRunnerJob(for runnerName: String, repo: String, busy: Bool) async {
     guard let client = client(forRepo: repo) else {
-      runnerJobs[runnerName] = .notFound
+      runnerJobs[runnerName] = .error("Sign in to GitHub to see the running job's steps.")
       return
     }
     if runnerJobs[runnerName] == nil { runnerJobs[runnerName] = .loading }
     let since = Date().addingTimeInterval(-3 * 3600)  // runner came up recently
     // Structured await: off-main (nonisolated async) + cancels when the runner is
-    // deselected / the dashboard closes.
-    let job = await client.findJob(runnerName: runnerName, since: since)
-    runnerJobs[runnerName] = job.map(RunnerJobState.found) ?? .notFound
+    // deselected / the dashboard closes. findJob throws on an Actions-read failure
+    // (e.g. missing scope) so we surface it instead of mislabeling it "no job".
+    do {
+      let job = try await client.findJob(runnerName: runnerName, since: since)
+      // No job matched yet: if the runner API says it's busy, the job just isn't
+      // indexed yet (`.running`, consistent with the spinning ring); otherwise the
+      // ephemeral runner is genuinely idle (`.notFound`).
+      runnerJobs[runnerName] = job.map(RunnerJobState.found) ?? (busy ? .running : .notFound)
+    } catch {
+      runnerJobs[runnerName] = .error(Self.actionsErrorMessage(error))
+    }
   }
 
   private func sync() {

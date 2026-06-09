@@ -557,6 +557,19 @@ private struct RunnerDetailView: View {
           switch app.runnerJobs[row.runner.id] {
           case .loading, .none:
             HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Looking up the current job on GitHub…").font(.caption).foregroundStyle(.secondary) }
+          case .running:
+            // GitHub says the runner is busy, but the jobs API hasn't published the
+            // matching job/steps yet — show a running state consistent with the
+            // spinning ring (not a contradictory "no job"), and set expectations
+            // that there's no live log for an in-progress job.
+            VStack(alignment: .leading, spacing: 4) {
+              HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Running a job — waiting for GitHub to publish its steps…").font(.callout)
+              }
+              Text("Live logs aren't available while a job is in progress; the full log appears under History once it finishes.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
           case .found(let job):
             jobSteps(job)
           case .notFound:
@@ -565,6 +578,8 @@ private struct RunnerDetailView: View {
               Text("Ephemeral runners idle until GitHub assigns a job; the full log appears under History once it finishes.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
+          case .error(let message):
+            Banner(message, severity: .warning, icon: "wifi.exclamationmark")
           }
         }
         .padding(16)
@@ -574,7 +589,9 @@ private struct RunnerDetailView: View {
     // Poll the running job's steps while this runner is selected (off-main).
     .task(id: row.runner.id) {
       while !Task.isCancelled {
-        await app.loadRunnerJob(for: row.runner.id, repo: row.repoFullName)
+        await app.loadRunnerJob(
+          for: row.runner.id, repo: row.repoFullName,
+          busy: app.busyRunnerNames.contains(row.runner.id))
         try? await Task.sleep(nanoseconds: 4_000_000_000)
       }
     }

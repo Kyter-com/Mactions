@@ -125,6 +125,18 @@ public final class RunnerOrchestrator {
     let provider: RunnerProvider
     /// When the agent launched (used as the run's start time in history).
     let startedAt: Date
+    /// Set once GitHub has reported this runner `busy` — i.e. it has started its
+    /// one ephemeral job. A runner that's running a job must NEVER be pruned: a
+    /// teardown orphans the job (GitHub shows it "stuck" at the last logged step
+    /// until its own ~hours-long lost-communication timeout). It reaps itself via
+    /// `handleExit` when the agent exits at end of job.
+    var everBusy = false
+    /// When this slot first looked unhealthy (missing from GitHub's list, or not
+    /// `online`), or `nil` while it looks healthy. Pruning the missing/non-online
+    /// cases keys off SUSTAINED unhealth (≥ the grace interval) rather than "old
+    /// enough + a single bad reading", so one transient GitHub eventual-consistency
+    /// blip or connection hiccup can't tear down a long-running runner mid-job.
+    var unhealthySince: Date?
     init(
       name: String, remoteId: Int?, phase: ManagedRunner.Phase, provider: RunnerProvider,
       startedAt: Date
@@ -239,22 +251,38 @@ public final class RunnerOrchestrator {
     for slot in slots {
       let remoteRunner = slot.remoteId.flatMap { byId[$0] } ?? byName[slot.name]
       let age = now.timeIntervalSince(slot.startedAt)
-      guard let remoteRunner else {
-        if age >= remoteRegistrationGraceInterval {
-          stale.append((slot, nil))
-        }
+      if remoteRunner?.busy == true { slot.everBusy = true }
+
+      // A runner that has started its one job is doing work — never prune it, or
+      // the job is orphaned (left "stuck" on GitHub). It reaps itself via
+      // handleExit when the agent exits at end of job; a genuinely hung job is the
+      // workflow's `timeout-minutes` / GitHub's job timeout to end, not ours to
+      // kill the runner out from under.
+      if slot.everBusy {
+        slot.unhealthySince = nil
         continue
       }
 
-      if remoteRunner.status.lowercased() != "online" {
-        if age >= remoteRegistrationGraceInterval {
+      let healthy = remoteRunner?.status.lowercased() == "online"
+      if !healthy {
+        // Missing from GitHub's list, or not online. Tolerate a transient blip:
+        // only prune after it's been CONTINUOUSLY unhealthy for the grace window,
+        // not merely "older than grace + one bad reading" (which a single eventual-
+        // consistency hiccup would satisfy, tearing down a healthy runner).
+        if slot.unhealthySince == nil { slot.unhealthySince = now }
+        if age >= remoteRegistrationGraceInterval,
+          now.timeIntervalSince(slot.unhealthySince ?? now) >= remoteRegistrationGraceInterval
+        {
           stale.append((slot, remoteRunner))
         }
         continue
       }
 
+      // Healthy (online): a recovered blip clears the unhealthy clock. Then refresh
+      // a long-IDLE runner before its short-lived JIT registration expires.
+      slot.unhealthySince = nil
       if let idleJITRefreshInterval, idleJITRefreshInterval >= 0,
-        !remoteRunner.busy, age >= idleJITRefreshInterval
+        let remoteRunner, !remoteRunner.busy, age >= idleJITRefreshInterval
       {
         stale.append((slot, remoteRunner))
       }

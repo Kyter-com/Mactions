@@ -300,8 +300,14 @@ public struct GitHubClient: RunnerControlPlane {
   /// POLLED live-runner lookup cheap — it must not list jobs for every recent run
   /// on each 4-second poll. Returns nil if not found (job not yet visible, run too
   /// old to be in the recent window, etc.).
-  public func findJob(runnerName: String, since: Date, maxRuns: Int = 30) async -> WorkflowJob? {
-    guard let runs = try? await listRecentWorkflowRuns(perPage: 40) else { return nil }
+  ///
+  /// THROWS on the top-level runs-list failure (auth / missing `Actions: read`
+  /// scope / network) so callers can tell "this token can't read Actions" apart
+  /// from a genuine "no matching job" (a `nil` return) — swallowing both as `nil`
+  /// is what made a scope problem look like an idle runner. A single run's per-run
+  /// jobs fetch failing stays best-effort (skip that run, keep scanning).
+  public func findJob(runnerName: String, since: Date, maxRuns: Int = 30) async throws -> WorkflowJob? {
+    let runs = try await listRecentWorkflowRuns(perPage: 40)
     let earliest = since.addingTimeInterval(-1800)  // 30 min slack: re-run attempts + skew
     let candidates =
       runs

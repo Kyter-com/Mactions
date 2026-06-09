@@ -134,6 +134,37 @@ final class OrchestratorTests: XCTestCase {
     await orch.stop()
   }
 
+  /// A runner that has started a job (`busy` observed once) must survive a later
+  /// transient drop to `offline`/missing — tearing it down would orphan the job
+  /// (GitHub then shows it "stuck" at the last logged step). Grace is 0 here, so
+  /// WITHOUT the `everBusy` guard the offline reading would prune it immediately.
+  func testReconcileKeepsBusyRunnerThatLaterBlipsOffline() async {
+    let (orch, cp, factory) = makeOrchestrator(
+      count: 1, reconcileInterval: 50_000_000, remoteRegistrationGraceInterval: 0,
+      idleJITRefreshInterval: 0)
+    await orch.start()
+    let runner = try! XCTUnwrap(orch.runners.first)
+
+    // 1. GitHub reports it busy (its one job started) — orchestrator marks everBusy.
+    cp.remote = [
+      RemoteRunner(id: runner.remoteId!, name: runner.id, status: "online", busy: true),
+    ]
+    try? await Task.sleep(nanoseconds: 150_000_000)
+    XCTAssertEqual(orch.runners.first?.id, runner.id)
+
+    // 2. It blips OFFLINE mid-job (eventual consistency / connection hiccup).
+    cp.remote = [
+      RemoteRunner(id: runner.remoteId!, name: runner.id, status: "offline", busy: false),
+    ]
+    try? await Task.sleep(nanoseconds: 150_000_000)
+
+    // It must NOT be recycled — the running job would be orphaned.
+    XCTAssertEqual(cp.jitCount, 1)
+    XCTAssertFalse(factory.made[0].stopped)
+    XCTAssertEqual(orch.runners.first?.id, runner.id)
+    await orch.stop()
+  }
+
   func testReconcileRefreshesIdleOnlineRunnerBeforeJITExpires() async {
     let (orch, cp, factory) = makeOrchestrator(
       count: 1, reconcileInterval: 100_000_000, remoteRegistrationGraceInterval: 0,
