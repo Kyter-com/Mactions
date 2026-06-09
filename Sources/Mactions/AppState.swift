@@ -1,4 +1,5 @@
 import AppKit
+import IOKit.pwr_mgt
 import MactionsCore
 import SwiftUI
 
@@ -136,7 +137,39 @@ final class AppState: ObservableObject {
   @Published var pendingDeviceCode: GitHubAuth.DeviceCode?
 
   // Fleet runtime.
-  @Published var state: FleetState = .offline
+  @Published var state: FleetState = .offline {
+    didSet { updateSleepAssertion() }
+  }
+
+  /// Held while the fleet is anything but `.offline` so the Mac cannot IDLE-sleep
+  /// out from under a running job. Found live (2026-06-09, release v0.0.21): the
+  /// display idled off mid-release, macOS initiated sleep, `systemWillSleep` took
+  /// the fleet offline by design — killing two busy build legs (the macOS job
+  /// surfaced as "The operation was canceled", the Windows VM as "runner lost
+  /// communication") — and `systemDidWake` re-provisioned 20s later. With this
+  /// assertion, idle never triggers sleep while runners exist; the willSleep
+  /// handler now only fires for lid-close / user-initiated sleep, where taking
+  /// jobs down really is the right call (the machine is going away). The
+  /// assertion is `PreventUserIdleSystemSleep`: it does NOT keep the display on
+  /// and does NOT block forced sleep.
+  private var sleepAssertionID: IOPMAssertionID = 0
+
+  private func updateSleepAssertion() {
+    let shouldHold = state != .offline
+    let holding = sleepAssertionID != 0
+    if shouldHold, !holding {
+      var id: IOPMAssertionID = 0
+      let result = IOPMAssertionCreateWithName(
+        kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+        IOPMAssertionLevel(kIOPMAssertionLevelOn),
+        "Mactions: self-hosted runners online" as CFString,
+        &id)
+      if result == kIOReturnSuccess { sleepAssertionID = id }
+    } else if !shouldHold, holding {
+      IOPMAssertionRelease(sleepAssertionID)
+      sleepAssertionID = 0
+    }
+  }
   @Published var runners: [FleetRunnerRow] = []
   /// Names of OUR runners GitHub reports as `busy` (executing a job right now).
   /// Polled by the Runners pane so the activity ring spins only during a real job,

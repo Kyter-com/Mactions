@@ -116,6 +116,46 @@ final class OrchestratorTests: XCTestCase {
     await orch.stop()
   }
 
+  /// A prune/refresh reap must NOT land in run history. The Local/Linux
+  /// providers' stop() SIGTERMs the agent, whose terminationHandler still fires
+  /// onExit — before the `reaped` flag, every routine 8-min idle refresh was
+  /// recorded as a `failed` run (exit 143/15), flooding history with phantom
+  /// failures (observed live 2026-06-09). The reap must still replace the
+  /// runner; only the RECORD is suppressed. Natural exits keep recording.
+  func testIdleRefreshReapIsNotRecordedAsAFailedRun() async {
+    let (orch, cp, factory) = makeOrchestrator(
+      count: 1, reconcileInterval: 50_000_000, remoteRegistrationGraceInterval: 0,
+      idleJITRefreshInterval: 0)
+    let collector = RecordCollector()
+    orch.onRunFinished = { collector.records.append($0) }
+    await orch.start()
+    let runner = try! XCTUnwrap(orch.runners.first)
+
+    // Online + idle → the zero-interval refresh reaps it on the next tick.
+    cp.remote = [
+      RemoteRunner(id: runner.remoteId!, name: runner.id, status: "online", busy: false)
+    ]
+    try? await Task.sleep(nanoseconds: 160_000_000)
+    XCTAssertTrue(factory.made[0].stopped)
+    // The SIGTERM'd agent's terminationHandler fires onExit — like
+    // LocalProcessProvider/LinuxContainerProvider after a real stop().
+    factory.made[0].fireExit(143)
+    await settle()
+
+    XCTAssertTrue(
+      collector.records.isEmpty,
+      "a refresh reap is fleet maintenance, not a run — got \(collector.records)")
+    XCTAssertGreaterThanOrEqual(cp.jitCount, 2, "the reaped runner must still be replaced")
+
+    // A NATURAL exit (the orchestrator didn't initiate it) still records.
+    cp.remote = []
+    if let fresh = factory.made.last, fresh !== factory.made[0] { fresh.fireExit(0) }
+    await settle()
+    XCTAssertEqual(collector.records.count, 1)
+    XCTAssertEqual(collector.records.first?.outcome, .completed)
+    await orch.stop()
+  }
+
   func testReconcileKeepsBusyRunnerPastIdleRefreshWindow() async {
     let (orch, cp, factory) = makeOrchestrator(
       count: 1, reconcileInterval: 100_000_000, remoteRegistrationGraceInterval: 0,

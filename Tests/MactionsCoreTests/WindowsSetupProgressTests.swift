@@ -147,7 +147,7 @@ final class WindowsSetupProgressTests: XCTestCase {
     XCTAssertFalse(WindowsSetupProgress.isLikelyTransientFailure("converter finished but produced no ISO in /tmp"))
     // The new git/bash/pwsh verification failure is LOCAL (a broken build), NOT transient.
     XCTAssertFalse(WindowsSetupProgress.isLikelyTransientFailure(
-      "REQUIRED runner tools missing after provisioning: git (C:\\Git\\cmd\\git.exe)"))
+      "REQUIRED runner tools missing after provisioning: git (C:\\Program Files\\Git\\cmd\\git.exe)"))
   }
 }
 

@@ -169,10 +169,31 @@ public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
   /// Volume label the in-guest runtime locates the config disc by.
   private let configVolumeName: String
   /// How long to wait for the clone to reach `.running` before giving up, and
-  /// how long to then wait for it to power itself off (job done). The JIT token
-  /// expires ~60 min from mint, so jobTimeout stays under that budget.
+  /// how long to then wait for it to power itself off (job done).
   private let bootTimeout: TimeInterval
   private let jobTimeout: TimeInterval
+
+  /// Default `jobTimeout`: GitHub's job-execution allowance (the
+  /// `timeout-minutes: 360` default = 6 h) + 30 min of lifecycle headroom. The
+  /// provider clock starts at VM BOOT, not job start, so it must cover
+  /// registration + the idle wait for a job (bounded by the orchestrator's
+  /// ~8-min idle refresh) + the job itself + GitHub's cancellation wind-down +
+  /// guest shutdown — an exactly-6h watchdog would kill a legal full-length job
+  /// minutes before it finished. This is a last-resort watchdog for a WEDGED
+  /// guest, not the duration enforcer: GitHub cancels the job at the workflow's
+  /// `timeout-minutes` (default 360; self-hosted jobs may configure up to
+  /// 5 days), after which the guest powers itself off and the poll below sees
+  /// it. Idle/staleness is the orchestrator's: `idleJITRefreshInterval` (~8 min)
+  /// recycles idle runners and the sustained-offline prune reaps dead agents,
+  /// both keyed off GitHub's authoritative runner state. (An earlier 50-min
+  /// budget tried to stay under the JIT token's ~60-min expiry, but that expiry
+  /// bounds REGISTRATION — an unused jitconfig going stale — not job duration:
+  /// the macOS/Linux providers run the same JIT mechanism with no provider-level
+  /// timeout at all, and long jobs run fine. Verified against docs.github.com
+  /// usage limits + actions/runner auth.md, 2026-06.) Jobs needing
+  /// `timeout-minutes` > 360 on a Mactions Windows runner are not supported
+  /// until this becomes configurable — documented in PARITY.md.
+  public static let defaultJobTimeout: TimeInterval = (360 + 30) * 60
   private let pollInterval: TimeInterval
   /// Teardown budget: how long to wait for a confirmed power-off before deleting
   /// the clone, and the poll/escalation interval. Injectable so tests run fast.
@@ -199,7 +220,7 @@ public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
     cli: WindowsVMCLI,
     configVolumeName: String = "MACTIONS",
     bootTimeout: TimeInterval = 300,
-    jobTimeout: TimeInterval = 3000,
+    jobTimeout: TimeInterval = WindowsVMProvider.defaultJobTimeout,
     pollInterval: TimeInterval = 5,
     stopSettleTimeout: TimeInterval = 12,
     stopPollInterval: TimeInterval = 1.5

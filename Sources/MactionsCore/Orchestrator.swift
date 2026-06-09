@@ -135,6 +135,14 @@ public final class RunnerOrchestrator {
     /// grace window is a dead agent (e.g. a sleep/crash/force-quit "ghost" that
     /// shows offline-but-busy) and gets reaped + deregistered.
     var unhealthySince: Date?
+    /// Set when `pruneUnusableSlots` reaps this slot (idle-JIT refresh or
+    /// sustained-offline). The Local/Linux providers' `stop()` SIGTERMs the
+    /// agent, whose terminationHandler still fires `onExit` — without this
+    /// flag, `handleExit` would record every routine refresh as a `failed` run
+    /// (observed live 2026-06-09: history full of exit-143 "failed" entries
+    /// that were just the 8-min idle refresh). Reaps are fleet maintenance,
+    /// not runs; only exits the orchestrator did NOT initiate get recorded.
+    var reaped = false
     init(
       name: String, remoteId: Int?, phase: ManagedRunner.Phase, provider: RunnerProvider,
       startedAt: Date
@@ -291,6 +299,7 @@ public final class RunnerOrchestrator {
 
     guard !stale.isEmpty else { return }
     for item in stale {
+      item.slot.reaped = true  // before stop(): its onExit can fire immediately
       item.slot.provider.stop()
     }
     let staleIds = Set(stale.map { ObjectIdentifier($0.slot) })
@@ -356,17 +365,18 @@ public final class RunnerOrchestrator {
     // genuine end-of-life for an ephemeral runner (ran its one job, or the agent
     // crashed). Status 0 → `.completed`, non-zero → `.failed`.
     //
-    // We deliberately do NOT record teardown reaps (go-offline/quit) or stale-
-    // generation late exits. Two reasons: (1) they're noise — every idle runner
-    // gets reaped on each go-offline; and (2) on teardown AppState drops the
-    // orchestrator the instant `stop()` returns, while a provider's exit callback
-    // can still fire asynchronously afterward — by then this `[weak self]` hop
-    // no-ops, so a record emitted on that path would be lost unreliably anyway.
-    // Recording only the online path keeps history to "runs that actually ran"
-    // and is race-free (the orchestrator is always alive here). A runner cut off
-    // mid-job by go-offline isn't recorded — we can't tell idle from busy without
-    // parsing the agent log (a later phase).
-    if state == .online, epoch == slotEpoch {
+    // We deliberately do NOT record teardown reaps (go-offline/quit), prune
+    // reaps (`slot.reaped` — idle-JIT refresh / sustained-offline), or stale-
+    // generation late exits. Reasons: (1) they're noise — every idle runner is
+    // reaped on each go-offline, and the idle refresh recycles runners every
+    // ~8 min, which used to flood history with phantom exit-143 "failed" runs;
+    // and (2) on teardown AppState drops the orchestrator the instant `stop()`
+    // returns, while a provider's exit callback can still fire asynchronously
+    // afterward — by then this `[weak self]` hop no-ops, so a record emitted on
+    // that path would be lost unreliably anyway. Recording only the
+    // orchestrator-didn't-initiate-it online path keeps history to "runs that
+    // actually ran" and is race-free (the orchestrator is always alive here).
+    if state == .online, epoch == slotEpoch, !slot.reaped {
       onRunFinished?(
         RunRecord(
           id: slot.name, os: os, repo: "\(config.owner)/\(config.repo)",

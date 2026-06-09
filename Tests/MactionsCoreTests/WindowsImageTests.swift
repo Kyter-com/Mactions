@@ -357,6 +357,29 @@ final class WindowsImageTests: XCTestCase {
       "currentProvisioningRecipeVersion drifted from PROVISIONING_RECIPE_VERSION — bump BOTH together")
   }
 
+  /// BASE.md decision test: 7-Zip is a convenience tool, not a runner/OS
+  /// semantic — and its old install (recipe ≤v11) was pinned to a 404-able URL,
+  /// non-fatal, and never on PATH, so bases silently varied in whether they had
+  /// it at all. Recipe v12 removed it; this guard keeps the install (and its
+  /// flaky pinned download) from quietly returning. Workflows that need 7-Zip
+  /// install it themselves — see PARITY.md. (PortableGit being a "7-Zip
+  /// self-extractor" is fine: the SFX is self-contained and needs no installed
+  /// 7-Zip.)
+  func testBootstrapDoesNotInstallSevenZip() {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let bootstrapURL = repoRoot.appendingPathComponent("scripts/bootstrap.ps1")
+    guard let script = try? String(contentsOf: bootstrapURL, encoding: .utf8) else {
+      return XCTFail("could not read \(bootstrapURL.path) to check the 7-Zip removal")
+    }
+    XCTAssertFalse(
+      script.contains("7-zip.org"),
+      "bootstrap.ps1 must not download 7-Zip — it fails the BASE.md decision test (removed in recipe v12)")
+    XCTAssertFalse(
+      script.contains("Installing 7-Zip"),
+      "bootstrap.ps1 must not install 7-Zip — workflows install it themselves (PARITY.md)")
+  }
+
   /// GitHub-hosted Windows images set the LocalMachine execution policy to
   /// Unrestricted. Mactions keeps the same narrow scope/value so explicit
   /// `shell: powershell` steps can run the runner's temporary wrapper script
@@ -519,6 +542,124 @@ final class WindowsImageTests: XCTestCase {
     XCTAssertNotNil(
       script.range(of: "[Environment]::GetEnvironmentVariable('GCM_INTERACTIVE', 'Machine')"),
       "bootstrap.ps1 must verify GCM_INTERACTIVE before writing the sentinel")
+  }
+
+  /// Recipe v13: Git must land at the hosted layout — C:\Program Files\Git —
+  /// so workflows hardcoding hosted paths (bash.EXE, usr\bin tools) resolve on
+  /// a Mactions runner, and the machine PATH must carry the same Git dirs
+  /// hosted's install produces: \cmd + the mingw \bin + \usr\bin (the
+  /// installer's PathOption=CmdTools — "Git and the optional Unix tools") plus
+  /// \bin (Install-Git.ps1's Add-MachinePathItem). usr\bin is what makes
+  /// sed/awk/grep resolve from pwsh/cmd steps on hosted (issue #37 V4) —
+  /// appended, so System32's find/sort still win, same as hosted. Also guards
+  /// the PS 5.1 Start-Process pitfall: -ArgumentList is joined WITHOUT
+  /// quoting, so the SFX -o target (now space-containing) must be
+  /// embedded-quoted or it splits into two argv tokens and Git silently lands
+  /// at "C:\Program".
+  func testBootstrapInstallsGitAtHostedProgramFilesLayout() {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let bootstrapURL = repoRoot.appendingPathComponent("scripts/bootstrap.ps1")
+    guard let script = try? String(contentsOf: bootstrapURL, encoding: .utf8) else {
+      return XCTFail("could not read \(bootstrapURL.path) to check the Git install layout")
+    }
+
+    XCTAssertNotNil(
+      script.range(of: "$gitDir = Join-Path $env:ProgramFiles 'Git'"),
+      "PortableGit must extract to C:\\Program Files\\Git — the hosted layout")
+    XCTAssertNil(
+      script.range(of: "'C:\\Git'"),
+      "the pre-v13 C:\\Git install root must not return — hardcoded hosted paths would break again")
+    XCTAssertNotNil(
+      script.range(of: "-o`\"$gitDir`\""),
+      "the SFX -o<dir> argument must be embedded-quoted (PS 5.1 Start-Process does not quote args with spaces)")
+    XCTAssertNotNil(
+      script.range(of: "Join-Path $env:ProgramFiles 'Git\\cmd\\git.exe'"),
+      "the sentinel gate must require git.exe at the hosted location")
+    XCTAssertNotNil(
+      script.range(of: "Join-Path $env:ProgramFiles 'Git\\bin\\bash.exe'"),
+      "the sentinel gate must require bash.exe at the hosted location")
+    // The machine-PATH append must cover the full hosted composition: cmd, bin,
+    // the mingw bin dir (clangarm64 on ARM64 payloads), and usr\bin.
+    XCTAssertNotNil(
+      script.range(of: "foreach ($p in $gitPathDirs)"),
+      "the machine-PATH append must iterate the hosted Git dir set")
+    XCTAssertNotNil(
+      script.range(of: "$gitUsrBin = Join-Path $gitDir 'usr\\bin'"),
+      "usr\\bin must join the machine PATH — hosted's PathOption=CmdTools puts it there, making sed/awk/grep resolve from pwsh/cmd steps")
+    XCTAssertNotNil(
+      script.range(of: "@('clangarm64', 'mingw64')"),
+      "the mingw bin dir must be detected for both ARM64 (clangarm64) and legacy (mingw64) payload layouts")
+  }
+
+  /// Recipe v13: UAC must mirror hosted's Disable-UserAccessControl EXACTLY —
+  /// ConsentPromptBehaviorAdmin=0 with EnableLUA left at 1. Recipes ≤v12 set
+  /// EnableLUA=0, which broke every UWP/MSIX/Store launch ("This app can't be
+  /// activated when UAC is disabled") — a failure hosted does not have. The
+  /// full admin token comes from the MactionsRunOnce task's -RunLevel Highest,
+  /// not from killing UAC.
+  func testBootstrapMirrorsHostedUACPolicyBeforeSentinel() {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let bootstrapURL = repoRoot.appendingPathComponent("scripts/bootstrap.ps1")
+    guard let script = try? String(contentsOf: bootstrapURL, encoding: .utf8) else {
+      return XCTFail("could not read \(bootstrapURL.path) to check UAC parity")
+    }
+
+    guard
+      let writeRange = script.range(of: "-Name 'ConsentPromptBehaviorAdmin' -Value 0 -Force")
+    else {
+      return XCTFail("bootstrap.ps1 must set ConsentPromptBehaviorAdmin=0 (hosted's exact UAC write)")
+    }
+    XCTAssertNil(
+      script.range(of: "EnableLUA -Value"),
+      "bootstrap.ps1 must NOT touch EnableLUA — hosted leaves UAC on; the task's RunLevel Highest supplies the admin token")
+    XCTAssertNotNil(
+      script.range(of: "-Name 'ConsentPromptBehaviorAdmin'", range: writeRange.upperBound..<script.endIndex),
+      "bootstrap.ps1 must read ConsentPromptBehaviorAdmin back to verify it persisted")
+    XCTAssertNotNil(
+      script.range(of: "-RunLevel Highest"),
+      "the MactionsRunOnce task must keep -RunLevel Highest — with UAC on it is the only source of the full admin token")
+    guard
+      let sentinelRange = script.range(
+        of: "New-Item -ItemType File -Force -Path (Join-Path $RunnerRoot '.mactions-provisioned')")
+    else {
+      return XCTFail("could not locate the provisioning sentinel write in bootstrap.ps1")
+    }
+    XCTAssertLessThan(
+      writeRange.lowerBound.utf16Offset(in: script),
+      sentinelRange.lowerBound.utf16Offset(in: script),
+      "UAC parity must be applied before the base is stamped provisioned")
+  }
+
+  /// Recipe v13: hosted runners run UTC (the Azure image default); a fresh
+  /// Win11 install from US media defaults to Pacific. The base must set and
+  /// verify UTC before the sentinel so time-zone-sensitive steps see the
+  /// hosted value.
+  func testBootstrapSetsHostedUTCTimeZoneBeforeSentinel() {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let bootstrapURL = repoRoot.appendingPathComponent("scripts/bootstrap.ps1")
+    guard let script = try? String(contentsOf: bootstrapURL, encoding: .utf8) else {
+      return XCTFail("could not read \(bootstrapURL.path) to check time-zone parity")
+    }
+
+    guard let setRange = script.range(of: "tzutil /s 'UTC'") else {
+      return XCTFail("bootstrap.ps1 must set the time zone to UTC (hosted parity)")
+    }
+    XCTAssertNotNil(
+      script.range(of: "tzutil /g"),
+      "bootstrap.ps1 must read the time zone back to verify it persisted")
+    guard
+      let sentinelRange = script.range(
+        of: "New-Item -ItemType File -Force -Path (Join-Path $RunnerRoot '.mactions-provisioned')")
+    else {
+      return XCTFail("could not locate the provisioning sentinel write in bootstrap.ps1")
+    }
+    XCTAssertLessThan(
+      setRange.lowerBound.utf16Offset(in: script),
+      sentinelRange.lowerBound.utf16Offset(in: script),
+      "time-zone parity must be applied before the base is stamped provisioned")
   }
 
   /// Recipe v11 (issue #37 V2): bootstrap.ps1 bakes the hosted-parity

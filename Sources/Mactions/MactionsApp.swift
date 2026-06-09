@@ -67,6 +67,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // was online. (If sleep beats the async teardown, the reconcile loop's
     // sustained-offline prune reaps the ghosts within the grace window after wake;
     // this just makes the common laptop-lid-close case clean.)
+    //
+    // IDLE sleep never reaches this handler: AppState holds a
+    // PreventUserIdleSystemSleep assertion while the fleet is online. Found live
+    // (2026-06-09, release v0.0.21): the display idled off mid-release, macOS
+    // initiated a sleep attempt, willSleep fired and killed two BUSY build legs
+    // ("The operation was canceled" / "runner lost communication"), then didWake
+    // re-provisioned 20s later. With the assertion, this path now means
+    // lid-close / user-initiated sleep — the machine really is going away, and
+    // a clean deregister-first teardown beats GitHub-side ghosts.
     let nc = NSWorkspace.shared.notificationCenter
     nc.addObserver(
       self, selector: #selector(systemWillSleep), name: NSWorkspace.willSleepNotification,

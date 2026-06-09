@@ -234,6 +234,30 @@ public enum WindowsImage {
   /// the authority that gets stamped into `windows-base.recipe` at build time —
   /// and a unit test asserts they match.
   ///
+  /// v13: three hosted-parity OS-semantic fixes, all sentinel-verified:
+  /// - Git relocates to C:\Program Files\Git — the exact hosted layout, so
+  ///   workflows hardcoding hosted paths (bash.EXE, usr\bin tools) resolve.
+  ///   Same PortableGit payload, and the machine PATH now carries the full
+  ///   hosted composition: \cmd + the mingw \bin (clangarm64 on ARM64) +
+  ///   \usr\bin (the installer's PathOption=CmdTools adds all three — "Git and
+  ///   the optional Unix tools") plus \bin (Install-Git.ps1's
+  ///   Add-MachinePathItem). usr\bin closes issue #37 V4: sed/awk/grep resolve
+  ///   from pwsh/cmd steps like hosted (appended, so System32's find/sort
+  ///   still win, also like hosted).
+  /// - UAC mirrors hosted exactly: ConsentPromptBehaviorAdmin=0 with EnableLUA
+  ///   left at 1 (recipes ≤v12 set EnableLUA=0, which broke every UWP/MSIX
+  ///   launch — a failure hosted doesn't have). The full admin token comes from
+  ///   the MactionsRunOnce task's -RunLevel Highest, so symlink creation keeps
+  ///   working here even though it fails on hosted's filtered agent.
+  /// - Time zone set to UTC, the hosted/Azure default (fresh Win11 US media
+  ///   installs default to Pacific).
+  /// v12: bootstrap.ps1 no longer installs 7-Zip (BASE.md decision test: a
+  /// convenience tool, not a runner/OS semantic - and the old install was the
+  /// worst of both worlds: pinned to a 404-able URL, non-fatal, and never on
+  /// PATH, so `7z` was unusable even when present). Workflows that need 7-Zip
+  /// install it themselves; see PARITY.md. Existing bases still run jobs fine -
+  /// the bump just surfaces the standard rebuild nudge so new bases skip the
+  /// flaky download.
   /// v11: bootstrap.ps1 bakes the hosted-parity runner-IDENTITY env vars at
   /// Machine scope (the open issue #37 V2 item): ImageOS=win25 (the LATEST
   /// whitelist-safe proxy for the Win11-ARM base — GitHub publishes no win11/ARM
@@ -266,7 +290,7 @@ public enum WindowsImage {
   /// still snapshotted, shipping a base where `actions/checkout` falls back to a REST
   /// tarball and every `shell: bash`/`shell: pwsh` step dies. So v3 bases are
   /// untrustworthy and warrant a rebuild to a verified v4.
-  public static let currentProvisioningRecipeVersion = 11
+  public static let currentProvisioningRecipeVersion = 13
 
   /// Where `prepare-windows-image` records the provisioning-recipe version the
   /// base was built with. A sibling of `windows-base.build`; must survive run

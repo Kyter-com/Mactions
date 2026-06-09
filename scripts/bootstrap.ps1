@@ -14,9 +14,10 @@
        C:\actions-runner (short root path to dodge Windows MAX_PATH on deep
        node_modules trees).
     2. Drop C:\setup\run-job.ps1 (the PER-CLONE runtime) and register a recurring
-       logon Scheduled Task that runs it on EVERY boot.
-    3. Apply minimal GitHub-hosted Windows OS policy parity.
-    4. Disable UAC for this disposable guest so the task gets a full admin token.
+       logon Scheduled Task (-RunLevel Highest, so it gets the full admin token
+       under UAC) that runs it on EVERY boot.
+    3. Apply minimal GitHub-hosted Windows OS policy parity (shell policy, long
+       paths, runner-identity env, update/telemetry, Defender, time zone, UAC).
 
   Per job, the host clones this base, injects a tiny config ISO carrying the JIT
   registration (VMware Fusion: the clone's sata0:0 CD is wired to it at clone
@@ -28,9 +29,8 @@
       state, then deletes the clone. Nothing inbound, nothing left behind.
 
   After this script finishes, SHUT THE VM DOWN - the powered-off VM is the
-  pristine base image. (The first clone boot applies the EnableLUA=0 reboot-gated
-  change.) Runs under in-box Windows PowerShell 5.1, so everything here is
-  5.1-compatible.
+  pristine base image. Runs under in-box Windows PowerShell 5.1, so everything
+  here is 5.1-compatible.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -146,7 +146,6 @@ if (-not (Test-Outbound)) {
 #   - Git for Windows: actions/checkout falls back to a slow REST tarball
 #     download when `git` isn't on PATH. With git installed, checkout uses a
 #     real clone and respects fetch-depth, submodules, LFS, etc.
-#   - 7-Zip: common need for archive actions; also a fast unzip path.
 #   - PowerShell 7 (pwsh): the default Windows-runner shell since 2019; many
 #     actions hard-require `shell: pwsh` (e.g. azure/trusted-signing-action).
 #     Windows ships only PS 5.1, so we bake pwsh in - the same reasoning that
@@ -156,29 +155,15 @@ if (-not (Test-Outbound)) {
 #   - Node.js (actions/setup-node downloads the right version per .nvmrc)
 #   - .NET (actions/setup-dotnet)
 #   - Python (actions/setup-python)
-function Install-Msi {
-  param([Parameter(Mandatory)][string]$Url,
-        [Parameter(Mandatory)][string]$LocalName)
-  $tmp = Join-Path $env:TEMP $LocalName
-  if (Test-Path $tmp) { Remove-Item $tmp -Force }
-  Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing
-  $proc = Start-Process msiexec.exe -ArgumentList '/i', $tmp, '/quiet', '/norestart' -Wait -PassThru
-  Remove-Item $tmp -Force
-  if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
-    throw "msiexec /i $LocalName failed with exit code $($proc.ExitCode)"
-  }
-}
-function Install-Exe {
-  param([Parameter(Mandatory)][string]$Url,
-        [Parameter(Mandatory)][string]$LocalName,
-        [string[]]$Args = @('/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES'))
-  $tmp = Join-Path $env:TEMP $LocalName
-  if (Test-Path $tmp) { Remove-Item $tmp -Force }
-  Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing
-  $proc = Start-Process $tmp -ArgumentList $Args -Wait -PassThru
-  Remove-Item $tmp -Force
-  if ($proc.ExitCode -ne 0) { throw "$LocalName installer failed with exit code $($proc.ExitCode)" }
-}
+#
+# Tools we DELIBERATELY leave out (BASE.md decision test): anything that is a
+# convenience package rather than a runner/OS semantic - 7-Zip, jq, choco, gh,
+# CMake, language runtimes, browsers. Workflows install what they need; see
+# PARITY.md for the per-tool guidance. (7-Zip was in the base through recipe
+# v11: a pinned, non-fatal, off-PATH NSIS install - silently absent whenever
+# the pinned URL 404'd, and unusable as `7z` even when present. Removed rather
+# than promoted: it fails every prong of the BASE.md decision test, and
+# PortableGit is a self-extractor, so nothing in provisioning needs it.)
 
 # Git for Windows (ARM64) - use the PortableGit 7-Zip self-extractor. NOT the
 # Inno installer and NOT MinGit. Three-way rationale:
@@ -207,7 +192,13 @@ try {
   if (-not $gitAsset) {
     Write-Warning "No PortableGit ARM64 asset in release $($gitRel.tag_name); skipping Git install."
   } else {
-    $gitDir = 'C:\Git'
+    # Hosted-parity LOCATION (recipe v13): extract to C:\Program Files\Git - the
+    # exact layout the official installer produces on GitHub-hosted Windows - so
+    # workflows that hardcode "C:\Program Files\Git\..." (bash.EXE, usr\bin
+    # tools) resolve identically. PortableGit is the same payload the installer
+    # ships and is space-in-path safe (the installer's own default target IS
+    # Program Files).
+    $gitDir = Join-Path $env:ProgramFiles 'Git'
     $gitSfx = Join-Path $env:TEMP ("portablegit-arm64-{0}.7z.exe" -f ([guid]::NewGuid().ToString('N')))
     # Retry the download - git+bash are REQUIRED (verified before the sentinel below),
     # so a transient blip here must not silently skip Git and produce a base that fails
@@ -219,7 +210,10 @@ try {
     # 7-Zip SFX flags: -y auto-confirms (no prompt, no wait), -o<dir> sets the
     # extraction target (no space after -o). PortableGit then runs its own
     # non-interactive post-install to wire up the MSYS environment bash needs.
-    $proc = Start-Process $gitSfx -ArgumentList '-y', "-o$gitDir" -Wait -PassThru
+    # The -o value is explicitly embedded-quoted: PS 5.1's Start-Process joins
+    # -ArgumentList with spaces WITHOUT quoting, so a bare "-o$gitDir" would
+    # split "C:\Program Files\Git" into two argv tokens at the SFX.
+    $proc = Start-Process $gitSfx -ArgumentList '-y', "-o`"$gitDir`"" -Wait -PassThru
     try { Remove-Item $gitSfx -Force -ErrorAction Stop } catch {
       Write-Warning "Could not remove temporary PortableGit SFX $gitSfx (continuing): $_"
     }
@@ -232,12 +226,22 @@ try {
     if (-not (Test-Path (Join-Path $gitBin 'bash.exe'))) {
       throw "bash.exe not found under $gitBin after PortableGit extract (shell: bash would break)"
     }
+    # The mingw dir name is build-dependent (clangarm64 on ARM64 Git for
+    # Windows; mingw64 on older/x64 payloads) - take whichever exists.
+    $gitUsrBin = Join-Path $gitDir 'usr\bin'
+    $gitMingwBin = @('clangarm64', 'mingw64') |
+      ForEach-Object { Join-Path $gitDir ($_ + '\bin') } |
+      Where-Object { Test-Path $_ } |
+      Select-Object -First 1
+    $gitPathDirs = @($gitCmd, $gitBin) `
+      + @(if ($gitMingwBin) { $gitMingwBin }) `
+      + @(if (Test-Path $gitUsrBin) { $gitUsrBin })
     $machPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-    foreach ($p in @($gitCmd, $gitBin)) {
+    foreach ($p in $gitPathDirs) {
       if ($machPath -notlike "*$p*") { $machPath = $machPath.TrimEnd(';') + ';' + $p }
     }
     [Environment]::SetEnvironmentVariable('Path', $machPath, 'Machine')
-    $env:Path = $env:Path + ';' + $gitCmd + ';' + $gitBin
+    $env:Path = $env:Path + ';' + ($gitPathDirs -join ';')
     & "$gitCmd\git.exe" --version | Write-Host
     & "$gitBin\bash.exe" -c 'echo "bash OK: $BASH_VERSION"' | Write-Host
 
@@ -246,8 +250,16 @@ try {
     #   but hosted has the broader system default);
     # - disable interactive Git Credential Manager prompts in CI;
     # - seed OpenSSH/Git known_hosts for GitHub and Azure DevOps SSH remotes.
-    # Keep the installer/layout different (PortableGit at C:\Git) because the
-    # official ARM64 Inno installer can show GUI and stall our unattended base.
+    # The INSTALLER still differs (PortableGit SFX, because the official ARM64
+    # Inno installer can show GUI and stall our unattended base) but the layout
+    # and PATH now match hosted: C:\Program Files\Git, and the machine PATH
+    # carries the same Git dirs hosted's install produces. Hosted composition
+    # (verified against Install-Git.ps1 + the Git for Windows installer's
+    # PathOption=CmdTools branch): \cmd, the mingw \bin (clangarm64 on ARM64),
+    # AND \usr\bin appended by the installer ("Git and the optional Unix
+    # tools"), plus \bin via Add-MachinePathItem. usr\bin is what makes
+    # sed/awk/grep resolve from pwsh/cmd steps on hosted - APPENDED, so
+    # System32's find/sort still win, same as hosted.
     & "$gitCmd\git.exe" config --system --add safe.directory '*'
     if ($LASTEXITCODE -ne 0) {
       throw "git config --system --add safe.directory '*' failed with exit code $LASTEXITCODE"
@@ -275,22 +287,6 @@ try {
   }
 } catch {
   Write-Warning "Git install failed (continuing): $_"
-}
-
-# 7-Zip ARM64 - small, fast, useful for many actions. NOTE: 7-Zip ships NO
-# ARM64 .msi (only x64) - the ARM64 build is an NSIS .exe that takes /S (NOT
-# Inno's /VERYSILENT). There's no "latest" URL alias, so the version is pinned
-# and must be bumped manually (check https://www.7-zip.org/download.html).
-# Non-fatal: the try/catch lets the runner come up without it.
-$SevenZipUrl = 'https://www.7-zip.org/a/7z2601-arm64.exe'   # MANUAL pin (no "latest" alias) - bump at https://www.7-zip.org/download.html
-Write-Host 'Installing 7-Zip (ARM64)...'
-try {
-  Install-Exe -Url $SevenZipUrl -LocalName '7z-arm64.exe' -Args @('/S')
-} catch {
-  # Non-fatal: the runner comes up without 7-Zip. The pinned version can 404 once
-  # 7-Zip ships a newer ARM64 build - say so explicitly so it's obvious the base
-  # is missing 7-Zip (and which URL to bump) rather than a silent omission.
-  Write-Warning "7-Zip install skipped (continuing without it): $SevenZipUrl failed - $_. If this is a 404, bump the pinned version in bootstrap.ps1."
 }
 
 # PowerShell 7 (ARM64) - the official win-arm64 .msi. GitHub Actions' `shell: pwsh`
@@ -472,7 +468,7 @@ if ($jit) {
   # task is -AtLogOn only, so it won't re-fire within the same logged-on session).
   # Power off so the host's power-state poll reclaims the slot fast and the
   # orchestrator reconciles a fresh clone (with a fresh JIT) instead of burning
-  # the full ~50-min jobTimeout on an idle guest while the JIT token expires.
+  # the full multi-hour jobTimeout on an idle guest while the JIT token expires.
   Write-Output "no jitconfig found on any removable/CD volume after wait; powering off so the host reclaims the slot"
   Stop-Transcript | Out-Null
   shutdown /s /t 0
@@ -753,12 +749,38 @@ if (-not (Get-Command -Name Set-MpPreference -ErrorAction SilentlyContinue)) {
   }
 }
 
-# --- 7. Disable UAC for the disposable guest --------------------------------
-# `runner` is a local admin; with UAC on, the task could get a filtered token,
-# breaking job steps that need admin. This guest is destroyed after one job.
-# Reboot-gated - applied on the first clone boot for a job.
+# --- 6b. GitHub-hosted Windows time-zone parity ------------------------------
+# Hosted runners run UTC (Azure images default to it); a fresh Win11 install
+# from US media defaults to Pacific. Time-zone-sensitive steps (date-stamped
+# artifacts, TZ-naive test assertions) should see the hosted value.
+& tzutil /s 'UTC'
+$tz = (& tzutil /g)
+if ($tz -ne 'UTC') {
+  throw "Time zone is '$tz' after tzutil /s UTC (expected UTC) - hosted-parity time zone did NOT persist; failing the build before the sentinel."
+}
+Write-Host 'Time zone: UTC (hosted-parity) - verified.'
+
+# --- 7. GitHub-hosted Windows UAC parity -------------------------------------
+# Mirror Configure-BaseImage.ps1's Disable-UserAccessControl EXACTLY:
+# ConsentPromptBehaviorAdmin=0 (elevate without prompting) and NOTHING else -
+# EnableLUA stays 1. Recipes <=v12 set EnableLUA=0 instead, which broke every
+# UWP/MSIX/Store app launch ("This app can't be activated when UAC is
+# disabled") - a failure hosted does not have. The full admin token the job
+# needs does NOT depend on killing UAC: the MactionsRunOnce task principal is
+# -RunLevel Highest, which requests the UNFILTERED token under UAC, and with
+# ConsentPromptBehaviorAdmin=0 nothing ever prompts. (That elevated token is
+# also why symlink creation keeps working here while it fails on hosted, whose
+# agent runs filtered - runner-images#14084.) Takes effect without a reboot,
+# unlike the old EnableLUA flip.
 Set-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' `
-  -Name EnableLUA -Value 0
+  -Name 'ConsentPromptBehaviorAdmin' -Value 0 -Force
+$consentPrompt = Get-ItemPropertyValue `
+  -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' `
+  -Name 'ConsentPromptBehaviorAdmin'
+if ([int]$consentPrompt -ne 0) {
+  throw "ConsentPromptBehaviorAdmin is '$consentPrompt' after policy write (expected 0) - hosted-parity UAC policy did NOT persist; failing the build before the sentinel."
+}
+Write-Host 'UAC: ConsentPromptBehaviorAdmin=0, EnableLUA untouched (hosted-parity) - verified.'
 
 Write-Host ''
 Write-Host '== Bootstrap complete. =='
@@ -766,7 +788,7 @@ Write-Host 'Per job, the host injects the JIT via a config disc; the runner regi
 Write-Host 'OUTBOUND, runs one job, and the VM powers itself off.'
 
 # Verify the REQUIRED runner tools/settings actually installed before we declare
-# the base provisioned. The Git/7-Zip/pwsh installs above are best-effort
+# the base provisioned. The Git/pwsh installs above are best-effort
 # (try/catch -> warn) so one transient download failure doesn't abort the whole
 # ~hour build - but a SILENTLY-skipped git/bash/pwsh produces a base that
 # snapshots "provisioned" yet can't run `actions/checkout` (falls back to a slow
@@ -774,12 +796,12 @@ Write-Host 'OUTBOUND, runs one job, and the VM powers itself off.'
 # `shell: pwsh` action. Recipe v7 also requires the local hosted-Git parity
 # settings (`safe.directory=*`, GCM_INTERACTIVE=Never). Gate the sentinel on
 # these local requirements so a swallowed installer/config failure cannot ship a
-# non-parity base. 7-Zip and live `ssh-keyscan` known_hosts seeding stay optional.
-# Literal paths (not $gitDir/$pwshDir - those are scoped inside the install try-blocks
-# above and may be unset if a block threw before assigning them).
+# non-parity base. Live `ssh-keyscan` known_hosts seeding stays optional.
+# Recomputed paths (not $gitDir/$pwshDir - those are scoped inside the install
+# try-blocks above and may be unset if a block threw before assigning them).
 $required = [ordered]@{
-  'git'  = 'C:\Git\cmd\git.exe'
-  'bash' = 'C:\Git\bin\bash.exe'
+  'git'  = (Join-Path $env:ProgramFiles 'Git\cmd\git.exe')
+  'bash' = (Join-Path $env:ProgramFiles 'Git\bin\bash.exe')
   'pwsh' = (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe')
 }
 $missing = @()
@@ -793,7 +815,7 @@ if ($missing.Count) {
   exit 1
 }
 
-$gitSafeDirs = & 'C:\Git\cmd\git.exe' config --system --get-all safe.directory 2>$null
+$gitSafeDirs = & (Join-Path $env:ProgramFiles 'Git\cmd\git.exe') config --system --get-all safe.directory 2>$null
 if ($LASTEXITCODE -ne 0 -or @($gitSafeDirs) -notcontains '*') {
   $missing += 'git safe.directory (*)'
 }

@@ -144,6 +144,18 @@ RECORDED_BUILD=""
 # ~/.mactions/windows-base.recipe on a successful build, and MUST stay equal to
 # WindowsImage.currentProvisioningRecipeVersion (a unit test enforces that), which
 # the app reads to decide whether a built base needs a rebuild.
+# v13: three hosted-parity OS-semantic fixes, all sentinel-verified: Git moves
+# to C:\Program Files\Git with the full hosted machine-PATH composition - \cmd,
+# the mingw \bin (clangarm64 on ARM64), \usr\bin (PathOption=CmdTools adds all
+# three on hosted; usr\bin makes sed/awk/grep resolve from pwsh/cmd steps) plus
+# \bin (Install-Git.ps1's Add-MachinePathItem); UAC mirrors hosted exactly
+# (ConsentPromptBehaviorAdmin=0, EnableLUA stays 1 - the MactionsRunOnce task's
+# -RunLevel Highest supplies the full admin token, and UWP/MSIX launches work
+# again); time zone set to UTC (hosted/Azure default).
+# v12: bootstrap.ps1 no longer installs 7-Zip (BASE.md decision test: a
+# convenience tool, not a runner/OS semantic; the old install was pinned to a
+# 404-able URL, non-fatal, and off PATH). Workflows install it themselves; see
+# PARITY.md.
 # v11: bootstrap.ps1 bakes hosted-parity runner-IDENTITY env at Machine scope
 # (issue #37 V2): ImageOS=win25 (latest whitelist-safe Server proxy for the
 # Win11-ARM base; GitHub has no win11/ARM token and a bad value hard-fails
@@ -168,7 +180,7 @@ RECORDED_BUILD=""
 # v4: bootstrap.ps1 verifies git/bash/pwsh before the sentinel (+ retries their
 # downloads). v3 bases can be silently missing those tools (a swallowed transient
 # download failure still snapshotted), so they warrant a rebuild to a verified v4.
-PROVISIONING_RECIPE_VERSION=11
+PROVISIONING_RECIPE_VERSION=13
 
 # Fetch a UUP dump URL with backoff, writing the body to OUTFILE. Retries on
 # network errors, HTTP 429 (UUP dump's ~20-25s per-IP throttle), and 5xx; fails

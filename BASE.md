@@ -3,6 +3,10 @@
 Mactions runners should be as small as they can be while still behaving like real
 GitHub Actions runners.
 
+(This document is the philosophy; **[PARITY.md](PARITY.md)** is the resulting
+per-OS contract — every verified difference vs GitHub-hosted runners and what
+to do about each.)
+
 The base image is not meant to clone the full GitHub-hosted image. GitHub-hosted
 Windows and macOS images include many preinstalled runtimes and tools because
 they need to satisfy a broad public CI audience. Mactions has a different goal:

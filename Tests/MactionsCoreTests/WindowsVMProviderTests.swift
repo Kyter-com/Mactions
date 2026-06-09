@@ -102,6 +102,23 @@ final class WindowsVMProviderTests: XCTestCase {
     XCTAssertEqual(p.phase(from: "???"), .starting)
   }
 
+  // MARK: Job-timeout parity
+
+  /// The default jobTimeout must cover GitHub's own job-execution allowance
+  /// (the `timeout-minutes: 360` default = 6 h) PLUS lifecycle headroom — the
+  /// provider clock starts at VM boot, so it also spans registration, the
+  /// pre-job idle wait (bounded by the orchestrator's ~8-min idle refresh),
+  /// cancellation wind-down, and guest shutdown. Anything ≤ 6 h would
+  /// reintroduce issue #37 B12 (a legal full-length job force-killed minutes
+  /// before finishing, surfaced as "runner lost communication"); the old 50-min
+  /// budget was based on a misread of JIT expiry, which bounds registration,
+  /// not job duration. It is a hung-guest watchdog only — never the duration
+  /// enforcer (GitHub's timeout-minutes is).
+  func testDefaultJobTimeoutCoversHostedSixHourJobLimitWithLifecycleHeadroom() {
+    XCTAssertEqual(WindowsVMProvider.defaultJobTimeout, (360 + 30) * 60)
+    XCTAssertGreaterThan(WindowsVMProvider.defaultJobTimeout, 360 * 60)
+  }
+
   // MARK: Clone naming + factory
 
   func testCloneNameCarriesMactionsPrefix() {
