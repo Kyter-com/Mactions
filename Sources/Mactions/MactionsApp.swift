@@ -59,6 +59,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       NSApp.applicationIconImage = icon
     }
     DashboardWindowController.shared.show()
+
+    // System sleep suspends our VMs/containers; their runner agents then drop to
+    // offline-but-busy on GitHub, orphaning any in-flight job (left "stuck" at its
+    // last step). Take the fleet offline before sleep — like Quit, this is a clean
+    // "go offline" that deregisters the runners — and bring it back on wake if it
+    // was online. (If sleep beats the async teardown, the reconcile loop's
+    // sustained-offline prune reaps the ghosts within the grace window after wake;
+    // this just makes the common laptop-lid-close case clean.)
+    let nc = NSWorkspace.shared.notificationCenter
+    nc.addObserver(
+      self, selector: #selector(systemWillSleep), name: NSWorkspace.willSleepNotification,
+      object: nil)
+    nc.addObserver(
+      self, selector: #selector(systemDidWake), name: NSWorkspace.didWakeNotification, object: nil)
+  }
+
+  /// True iff the fleet was online when the Mac went to sleep, so `systemDidWake`
+  /// knows to bring it back. Main-actor state.
+  private var wasOnlineBeforeSleep = false
+
+  @objc private func systemWillSleep(_ notification: Notification) {
+    let state = AppState.shared
+    guard state.state != .offline else {
+      wasOnlineBeforeSleep = false
+      return
+    }
+    wasOnlineBeforeSleep = true
+    // Best-effort within the brief pre-sleep window. stop() deregisters FIRST, so
+    // even if the local VM teardown doesn't finish before sleep, the registration
+    // removal (the part that prevents a GitHub-side ghost) lands fast.
+    Task { @MainActor in await state.goOfflineAndWait() }
+  }
+
+  @objc private func systemDidWake(_ notification: Notification) {
+    guard wasOnlineBeforeSleep else { return }
+    wasOnlineBeforeSleep = false
+    // Resume the fleet we paused for sleep.
+    AppState.shared.goOnline()
   }
 
   /// Closing the dashboard window must NOT quit the app — quitting is what takes

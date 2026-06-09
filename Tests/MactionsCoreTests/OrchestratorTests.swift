@@ -134,34 +134,56 @@ final class OrchestratorTests: XCTestCase {
     await orch.stop()
   }
 
-  /// A runner that has started a job (`busy` observed once) must survive a later
-  /// transient drop to `offline`/missing — tearing it down would orphan the job
-  /// (GitHub then shows it "stuck" at the last logged step). Grace is 0 here, so
-  /// WITHOUT the `everBusy` guard the offline reading would prune it immediately.
-  func testReconcileKeepsBusyRunnerThatLaterBlipsOffline() async {
+  /// A TRANSIENT offline blip must NOT prune a runner — only SUSTAINED unhealth
+  /// (≥ grace) does. Grace is 10 s while the whole test runs in ~250 ms, so the
+  /// runner is never offline long enough to be reaped even though it blips offline
+  /// for a tick. This is the guard that stops a mid-job runner being torn down on
+  /// a momentary GitHub eventual-consistency hiccup (which would orphan the job).
+  func testReconcileToleratesTransientOfflineBlipWithinGrace() async {
     let (orch, cp, factory) = makeOrchestrator(
-      count: 1, reconcileInterval: 50_000_000, remoteRegistrationGraceInterval: 0,
-      idleJITRefreshInterval: 0)
+      count: 1, reconcileInterval: 40_000_000, remoteRegistrationGraceInterval: 10,
+      idleJITRefreshInterval: nil)
     await orch.start()
     let runner = try! XCTUnwrap(orch.runners.first)
 
-    // 1. GitHub reports it busy (its one job started) — orchestrator marks everBusy.
-    cp.remote = [
-      RemoteRunner(id: runner.remoteId!, name: runner.id, status: "online", busy: true),
-    ]
-    try? await Task.sleep(nanoseconds: 150_000_000)
-    XCTAssertEqual(orch.runners.first?.id, runner.id)
-
-    // 2. It blips OFFLINE mid-job (eventual consistency / connection hiccup).
+    // Blip offline briefly…
     cp.remote = [
       RemoteRunner(id: runner.remoteId!, name: runner.id, status: "offline", busy: false),
     ]
-    try? await Task.sleep(nanoseconds: 150_000_000)
+    try? await Task.sleep(nanoseconds: 120_000_000)
+    // …then recover, well within the 10 s grace.
+    cp.remote = [
+      RemoteRunner(id: runner.remoteId!, name: runner.id, status: "online", busy: false),
+    ]
+    try? await Task.sleep(nanoseconds: 120_000_000)
 
-    // It must NOT be recycled — the running job would be orphaned.
     XCTAssertEqual(cp.jitCount, 1)
     XCTAssertFalse(factory.made[0].stopped)
     XCTAssertEqual(orch.runners.first?.id, runner.id)
+    await orch.stop()
+  }
+
+  /// The flip side: a runner OFFLINE for the whole grace window is a dead agent —
+  /// even if GitHub still flags it `busy` (the offline-but-busy "ghost" a
+  /// sleep/crash/force-quit leaves, which used to sit forever holding a stuck
+  /// job). It must be reaped, DEREGISTERED, and replaced — not protected. Grace 0
+  /// → reaped on the first sustained-unhealthy tick.
+  func testReconcileReapsSustainedOfflineBusyGhost() async {
+    let (orch, cp, factory) = makeOrchestrator(
+      count: 1, reconcileInterval: 50_000_000, remoteRegistrationGraceInterval: 0,
+      idleJITRefreshInterval: nil)
+    await orch.start()
+    let runner = try! XCTUnwrap(orch.runners.first)
+
+    // offline + busy == the orphan signature (agent died mid-job).
+    cp.remote = [
+      RemoteRunner(id: runner.remoteId!, name: runner.id, status: "offline", busy: true),
+    ]
+    try? await Task.sleep(nanoseconds: 160_000_000)
+
+    XCTAssertTrue(factory.made[0].stopped)
+    XCTAssertTrue(cp.deleted.contains(runner.remoteId!))
+    XCTAssertGreaterThanOrEqual(cp.jitCount, 2)
     await orch.stop()
   }
 

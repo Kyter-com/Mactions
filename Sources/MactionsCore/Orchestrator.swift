@@ -125,17 +125,15 @@ public final class RunnerOrchestrator {
     let provider: RunnerProvider
     /// When the agent launched (used as the run's start time in history).
     let startedAt: Date
-    /// Set once GitHub has reported this runner `busy` — i.e. it has started its
-    /// one ephemeral job. A runner that's running a job must NEVER be pruned: a
-    /// teardown orphans the job (GitHub shows it "stuck" at the last logged step
-    /// until its own ~hours-long lost-communication timeout). It reaps itself via
-    /// `handleExit` when the agent exits at end of job.
-    var everBusy = false
     /// When this slot first looked unhealthy (missing from GitHub's list, or not
-    /// `online`), or `nil` while it looks healthy. Pruning the missing/non-online
-    /// cases keys off SUSTAINED unhealth (≥ the grace interval) rather than "old
-    /// enough + a single bad reading", so one transient GitHub eventual-consistency
-    /// blip or connection hiccup can't tear down a long-running runner mid-job.
+    /// `online`), or `nil` while it looks healthy. The missing/non-online prune
+    /// keys off SUSTAINED unhealth (≥ the grace interval), not "old enough + a
+    /// single bad reading": one transient eventual-consistency / connection blip
+    /// must NOT tear down a runner that's mid-job (which orphans the job). The flip
+    /// side is the cleanup we DO want — a runner that's genuinely running a job
+    /// stays online+busy on GitHub, so a runner that's been OFFLINE for the whole
+    /// grace window is a dead agent (e.g. a sleep/crash/force-quit "ghost" that
+    /// shows offline-but-busy) and gets reaped + deregistered.
     var unhealthySince: Date?
     init(
       name: String, remoteId: Int?, phase: ManagedRunner.Phase, provider: RunnerProvider,
@@ -198,11 +196,18 @@ public final class RunnerOrchestrator {
     let current = slots
     slots = []
     notify()
-    for slot in current { slot.provider.stop() }
-    // Belt-and-suspenders: ephemeral runners deregister themselves on exit, but
-    // a killed agent can leave a ghost. Proactively delete anything still
-    // registered under THIS machine's prefix — never another Mac's runners.
+    // Deregister FIRST (a fast API call), BEFORE the local teardown below — a
+    // Windows VM can take >10s to power off + delete, and the quit/sleep handlers
+    // bound this whole call with a deadline. If a slow teardown ran first and the
+    // deadline cut us off before the deregister, GitHub would be left with a
+    // still-registered runner it thinks is busy → an orphaned job "stuck" at its
+    // last step until GitHub's hours-long lost-communication timeout. Removing the
+    // registration up front instead makes GitHub fail any in-flight job cleanly.
+    // Scoped to THIS machine's prefix — never another Mac's runners.
     await deregisterOrphanRunners(controlPlane, prefix: machinePrefix)
+    // Now reclaim the local VMs/containers/processes (the registrations are
+    // already gone, so a leftover here is just disk — swept on next go-online).
+    for slot in current { slot.provider.stop() }
     state = .offline
     notify()
   }
@@ -251,24 +256,18 @@ public final class RunnerOrchestrator {
     for slot in slots {
       let remoteRunner = slot.remoteId.flatMap { byId[$0] } ?? byName[slot.name]
       let age = now.timeIntervalSince(slot.startedAt)
-      if remoteRunner?.busy == true { slot.everBusy = true }
-
-      // A runner that has started its one job is doing work — never prune it, or
-      // the job is orphaned (left "stuck" on GitHub). It reaps itself via
-      // handleExit when the agent exits at end of job; a genuinely hung job is the
-      // workflow's `timeout-minutes` / GitHub's job timeout to end, not ours to
-      // kill the runner out from under.
-      if slot.everBusy {
-        slot.unhealthySince = nil
-        continue
-      }
-
       let healthy = remoteRunner?.status.lowercased() == "online"
+
       if !healthy {
-        // Missing from GitHub's list, or not online. Tolerate a transient blip:
-        // only prune after it's been CONTINUOUSLY unhealthy for the grace window,
-        // not merely "older than grace + one bad reading" (which a single eventual-
-        // consistency hiccup would satisfy, tearing down a healthy runner).
+        // Missing from GitHub's list, or not online. Prune ONLY after SUSTAINED
+        // unhealth (≥ grace), never on a single bad reading — a transient
+        // eventual-consistency / connection blip must not tear down a runner
+        // that's mid-job (that orphans the job). Conversely, a runner that's been
+        // offline for the whole grace window is a genuinely DEAD agent — a live
+        // job keeps the runner online+busy on GitHub — so reaping + deregistering
+        // it is exactly the cleanup that clears an offline-but-busy "ghost" left
+        // by a sleep / crash / force-quit. (Whether it was ever busy is
+        // irrelevant: sustained-offline == dead.)
         if slot.unhealthySince == nil { slot.unhealthySince = now }
         if age >= remoteRegistrationGraceInterval,
           now.timeIntervalSince(slot.unhealthySince ?? now) >= remoteRegistrationGraceInterval
@@ -278,8 +277,10 @@ public final class RunnerOrchestrator {
         continue
       }
 
-      // Healthy (online): a recovered blip clears the unhealthy clock. Then refresh
-      // a long-IDLE runner before its short-lived JIT registration expires.
+      // Online: a recovered blip clears the unhealthy clock. Then refresh a
+      // long-IDLE runner before its short-lived JIT registration expires — the
+      // `!busy` guard keeps a runner that's executing a job (never refresh it out
+      // from under, which would orphan the job).
       slot.unhealthySince = nil
       if let idleJITRefreshInterval, idleJITRefreshInterval >= 0,
         let remoteRunner, !remoteRunner.busy, age >= idleJITRefreshInterval
