@@ -296,11 +296,20 @@ final class AppState: ObservableObject {
   }
 
   /// Note a per-combo edit: persist, and if the fleet is live flag a pending
-  /// restart so the change is applied on the next go-online.
+  /// restart so the change is applied on the next go-online. Gated to the STABLE
+  /// `.online` state (not just `!= .offline`): edits are UI-disabled during the
+  /// transient `.starting`/`.stopping` restart window (see `isTransitioning`), so
+  /// an edit can't land after goOnline snapshots the plan yet before it clears the
+  /// flag — which would silently strand the edit (unapplied but not flagged).
+  /// Invariant: `pendingRestart == true` ⟹ `state == .online`.
   private func noteComboEdit() {
     saveConfig()
-    if state != .offline { pendingRestart = true }
+    if state == .online { pendingRestart = true }
   }
+
+  /// True during the brief go-online / go-offline transition. Config edit controls
+  /// disable on it (like the Go-online button) so nothing races the snapshot.
+  var isTransitioning: Bool { state == .starting || state == .stopping }
 
   /// Enable/disable a `(repo, platform)` combo (the inspector's platform toggle).
   func setPlatform(_ os: RunnerOS, enabled: Bool, repoID: String) {
@@ -685,6 +694,10 @@ final class AppState: ObservableObject {
         guard fleetEpoch == myEpoch else { return }
         reportBlockingError("Failed to start: \(error.localizedDescription)")
         state = .offline
+        // Back offline (nothing live) — keep the invariant that a restart bar
+        // only shows online. The edits are still in the plan and apply on the
+        // next go-online; the error banner explains the failure.
+        pendingRestart = false
       }
     }
   }
@@ -707,6 +720,7 @@ final class AppState: ObservableObject {
     runners = []
     busyRunnerNames = []
     pendingRestart = false  // nothing live to be out of sync with
+    errorBanner = nil  // a prior blocking error is moot once we're cleanly offline
     state = .offline
     statusMessage = "Offline."
   }

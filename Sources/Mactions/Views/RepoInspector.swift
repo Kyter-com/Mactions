@@ -113,11 +113,11 @@ struct RepoInspector: View {
     let building = (os == .windows && app.windowsSetupBusy) || (os == .linux && app.linuxSetupBusy)
     let needsSetup = !ready && !building
     let selected = enabled && ready
-    // Locked only while this platform's image is building (the tap would fight the
-    // build). Toggling is allowed online now — it stages a pending restart — so we
-    // no longer disable on online. We dim a locked tile so the spinner state reads
-    // as busy rather than a frozen control.
-    let locked = building
+    // Locked while this platform's image is building (the tap would fight the
+    // build) OR during a go-online/offline transition (so an edit can't race the
+    // plan snapshot mid-restart). Toggling is allowed in the stable online state —
+    // it stages a pending restart. A locked tile dims so it reads as busy.
+    let locked = building || app.isTransitioning
     return Button {
       handleTileTap(os, repoID: repoPlan.id, enabled: enabled, ready: ready)
     } label: {
@@ -220,6 +220,7 @@ struct RepoInspector: View {
         Stepper(
           "Runners: \(config?.count ?? app.plan.defaultMacOSCount)",
           value: countBinding(repoID: repoPlan.id), in: 1...5)
+          .disabled(app.isTransitioning)
       } else {
         InfoRow(
           "One throwaway \(os == .windows ? "VM" : "container") per job",
@@ -234,6 +235,7 @@ struct RepoInspector: View {
         LabelEditor(
           text: labelsBinding(repoPlan: repoPlan, os: os),
           editable: os == .macOS)
+          .disabled(app.isTransitioning)
         // Surface the SAME rule goOnline() hard-blocks on (non-empty + must
         // include `self-hosted`) right here, so a bad label set is caught while
         // editing instead of as a cryptic blocked "Go online" later. Only macOS
