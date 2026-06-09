@@ -105,7 +105,7 @@ struct AddRepoSheet: View {
   private var footer: some View {
     HStack {
       if app.state != .offline {
-        Label(MactionsTheme.Copy.offlineGate, systemImage: "info.circle")
+        Label(MactionsTheme.Copy.offlineToManageRepos, systemImage: "info.circle")
           .font(.caption).foregroundStyle(.secondary)
       }
       Spacer()

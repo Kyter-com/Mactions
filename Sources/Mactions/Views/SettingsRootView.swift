@@ -12,25 +12,24 @@ enum SettingsTab: Hashable { case general, windows, linux }
 /// GitHub connection, new-repo defaults + capacity, and the long Windows/Linux
 /// base setup + maintenance flows that used to crowd the old Setup pane.
 ///
-/// Presented as an IN-APP SHEET on the dashboard window (not the macOS ⌘,
-/// preferences window): the primary window is AppKit-hosted, so the standard
-/// `showSettingsWindow:` action never fired — and the user asked for settings to
-/// live in the app.
+/// The content of the Settings window — a NON-MODAL companion window
+/// (`SettingsWindowController`), not the macOS ⌘, preferences window (the
+/// AppKit-hosted app can't reach `showSettingsWindow:`) and no longer a modal
+/// sheet (which overlaid live runners + trapped a running base build). The user
+/// asked for settings in the app; a companion window is the in-app form that
+/// doesn't block the dashboard.
 ///
-/// We deliberately do NOT use a macOS `TabView`: in a sheet it draws its own
-/// full-width tab-bar band (hairlines above AND below the pills) that read as a
-/// stray "overlap bar" under our header. Instead a single segmented `Picker` +
-/// `switch` gives the same tabbed feel with chrome we fully control: header →
-/// one hairline → segmented control → one hairline → the selected tab's Form.
-/// The selection is bound to `AppState.settingsTab` so a deep-link (e.g. a
-/// platform tile's "needs setup" tap) lands on the right tab.
+/// We deliberately do NOT use a macOS `TabView`: it draws its own full-width
+/// tab-bar band (hairlines above AND below the pills) that read as a stray
+/// "overlap bar". A single segmented `Picker` + `switch` gives the same tabbed
+/// feel with chrome we control, and `AppState.settingsTab` lets a deep-link
+/// (e.g. a platform tile's "needs setup" tap) land on the right tab. The window
+/// titlebar provides the title + close, so no in-content header is needed.
 struct SettingsRootView: View {
   @EnvironmentObject private var app: AppState
 
   var body: some View {
     VStack(spacing: 0) {
-      header
-      Divider()
       Picker("", selection: $app.settingsTab) {
         Text("General").tag(SettingsTab.general)
         Text("Windows").tag(SettingsTab.windows)
@@ -40,7 +39,8 @@ struct SettingsRootView: View {
       .labelsHidden()
       .accessibilityLabel("Settings category")
       .padding(.horizontal, MactionsTheme.Spacing.section)
-      .padding(.vertical, MactionsTheme.Spacing.control)
+      .padding(.top, MactionsTheme.Spacing.control)
+      .padding(.bottom, MactionsTheme.Spacing.control)
       Divider()
       Group {
         switch app.settingsTab {
@@ -52,17 +52,6 @@ struct SettingsRootView: View {
       .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
     .frame(width: 540, height: 600)
-  }
-
-  private var header: some View {
-    HStack {
-      Text("Settings").font(.headline)
-      Spacer()
-      Button("Done") { app.settingsPresented = false }
-        .keyboardShortcut(.defaultAction)
-    }
-    .padding(.horizontal, MactionsTheme.Spacing.section)
-    .padding(.vertical, MactionsTheme.Spacing.control)
   }
 }
 

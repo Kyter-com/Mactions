@@ -47,6 +47,14 @@ struct DashboardView: View {
     VStack(spacing: 0) {
       headerBar
       Divider()
+      if let error = app.errorBanner {
+        errorBar(error)
+        Divider()
+      }
+      if app.pendingRestart {
+        restartBar
+        Divider()
+      }
       NavigationSplitView {
         List(Tab.allCases, selection: $tab) { item in
           Label(item.rawValue, systemImage: item.systemImage).tag(item)
@@ -69,12 +77,6 @@ struct DashboardView: View {
     }
     .frame(minWidth: 900, minHeight: 560)
     .onAppear { app.refreshWindowsPerVMGB() }
-    // Settings live IN the app as a sheet (the macOS ⌘, scene was unreachable
-    // from this AppKit-hosted window). Driven by AppState so the Settings button,
-    // ⌘,, and a platform tile's "needs setup" tap all open the same surface.
-    .sheet(isPresented: $app.settingsPresented) {
-      SettingsRootView().environmentObject(app)
-    }
   }
 
   // MARK: Header bar (slim, native — no logo / status-dot-only / capacity chips)
@@ -83,6 +85,7 @@ struct DashboardView: View {
     HStack(spacing: MactionsTheme.Spacing.control) {
       Circle().fill(statusColor).frame(width: 9, height: 9)
       Text(stateSubtitle).font(.callout.weight(.medium)).fixedSize()
+      buildIndicator
       Spacer(minLength: MactionsTheme.Spacing.control)
 
       Button {
@@ -102,7 +105,10 @@ struct DashboardView: View {
       .glassProminentButton()
       .keyboardShortcut("o", modifiers: .command)
       .disabled(
-        app.plan.enabledCombos().isEmpty
+        // The empty-combos gate only blocks GOING online — never disable "Go
+        // offline" (you can disable every platform while online now, which would
+        // otherwise strand the fleet on).
+        (app.state == .offline && app.plan.enabledCombos().isEmpty)
           || app.windowsSetupBusy  // can't clone the base while it's being (re)built
           || app.state == .starting || app.state == .stopping)
       .help(
@@ -114,6 +120,84 @@ struct DashboardView: View {
     }
     .padding(.horizontal, MactionsTheme.Spacing.section)
     .padding(.vertical, MactionsTheme.Spacing.control)
+  }
+
+  /// A persistent in-window indicator while a base image is building, so the
+  /// 30–40 min Windows build (or the Linux pull) is never invisible once the
+  /// Settings window is closed. Tapping reopens Settings to watch; Windows also
+  /// carries the Cancel here (the build's only abort control otherwise lives in
+  /// Settings).
+  @ViewBuilder private var buildIndicator: some View {
+    if app.windowsSetupBusy || app.linuxSetupBusy {
+      let isWindows = app.windowsSetupBusy
+      let text = isWindows ? "Building Windows base…" : "Setting up Linux…"
+      HStack(spacing: 6) {
+        Button {
+          app.presentSettings(isWindows ? .windows : .linux)
+        } label: {
+          HStack(spacing: 6) {
+            ProgressView().controlSize(.small)
+            Text(text).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+          }
+        }
+        .buttonStyle(.plain)
+        .help("Open Settings to watch progress")
+        .accessibilityLabel(text)
+        .accessibilityHint("Opens Settings to watch progress")
+        if isWindows {
+          Button {
+            app.cancelWindowsSetup()
+          } label: {
+            Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+          }
+          .buttonStyle(.borderless)
+          .help("Cancel the Windows base build")
+          .accessibilityLabel("Cancel Windows base build")
+        }
+      }
+      .padding(.horizontal, MactionsTheme.Spacing.control)
+      .padding(.vertical, 3)
+      .background(Capsule().fill(Color.secondary.opacity(0.12)))
+    }
+  }
+
+  /// A persistent, dismissible error bar for blocking failures (sign-in /
+  /// go-online) — they used to flash once in the bottom strip and vanish.
+  private func errorBar(_ message: String) -> some View {
+    HStack(alignment: .top, spacing: MactionsTheme.Spacing.tight) {
+      Image(systemName: "exclamationmark.octagon.fill").foregroundStyle(.red)
+      Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
+      Spacer(minLength: MactionsTheme.Spacing.control)
+      Button {
+        app.errorBanner = nil
+      } label: {
+        Image(systemName: "xmark")
+      }
+      .buttonStyle(.borderless)
+      .help("Dismiss")
+      .accessibilityLabel("Dismiss error")
+    }
+    .padding(.horizontal, MactionsTheme.Spacing.section)
+    .padding(.vertical, MactionsTheme.Spacing.control)
+    .background(Color.red.opacity(0.12))
+  }
+
+  /// Shown while the live fleet's config has been edited but not yet applied —
+  /// edits are allowed online and staged, and this is the one-click way to apply
+  /// them (restart = go offline, then back online reading the fresh plan).
+  private var restartBar: some View {
+    HStack(spacing: MactionsTheme.Spacing.tight) {
+      Image(systemName: "arrow.triangle.2.circlepath").foregroundStyle(.orange)
+      Text("Configuration changed — restart the fleet to apply.")
+        .font(.callout).foregroundStyle(.orange)
+      Spacer(minLength: MactionsTheme.Spacing.control)
+      Button("Restart fleet") { app.restartFleet() }
+        .controlSize(.small)
+        .disabled(app.state == .starting || app.state == .stopping)
+    }
+    .padding(.horizontal, MactionsTheme.Spacing.section)
+    .padding(.vertical, MactionsTheme.Spacing.control)
+    .background(Color.orange.opacity(0.12))
   }
 
   private var statusColor: Color {
@@ -279,7 +363,7 @@ private struct RunnersPane: View {
       .buttonStyle(.borderless)
       .keyboardShortcut("n", modifiers: .command)
       .disabled(app.state != .offline)
-      .help(app.state == .offline ? "Add or remove repositories (⌘N)" : MactionsTheme.Copy.offlineGate)
+      .help(app.state == .offline ? "Add or remove repositories (⌘N)" : MactionsTheme.Copy.offlineToManageRepos)
       Spacer(minLength: 0)
     }
     .padding(.horizontal, MactionsTheme.Spacing.control)

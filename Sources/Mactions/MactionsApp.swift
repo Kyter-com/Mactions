@@ -7,13 +7,13 @@ import SwiftUI
 /// deliberately a `Settings` scene below, NOT a `WindowGroup`, which would
 /// auto-open a second window competing with the AppKit one.
 ///
-/// Settings now live IN the app: `SettingsRootView` is presented as a SHEET on
-/// the dashboard (driven by `AppState.settingsPresented`), NOT the macOS ⌘,
-/// preferences window. The old `showSettingsWindow:` action never reached a
-/// responder from the AppKit-hosted window, so the toolbar gear was dead. The
+/// Settings now live IN the app: `SettingsRootView` is shown in a non-modal
+/// companion window (`SettingsWindowController`), NOT the macOS ⌘, preferences
+/// window. The old `showSettingsWindow:` action never reached a responder from
+/// the AppKit-hosted window, so the toolbar gear was dead. The
 /// `Settings { EmptyView() }` scene below is kept ONLY as the "don't auto-open a
 /// window" trick; the standard Settings menu item is replaced so ⌘, opens the
-/// in-app sheet instead of the empty scene.
+/// in-app Settings window instead of the empty scene.
 ///
 /// Quitting the app is the "go offline" signal — the delegate deregisters runners
 /// before letting termination complete.
@@ -24,18 +24,15 @@ struct MactionsApp: App {
   var body: some Scene {
     // An empty `Settings` scene purely suppresses the auto-opened WindowGroup
     // window; it's never shown (the replaced menu item below opens the in-app
-    // sheet instead). The real primary window is AppKit-owned (see
+    // Settings window instead). The real primary window is AppKit-owned (see
     // DashboardWindowController, shown from applicationDidFinishLaunching).
     Settings { EmptyView() }
       .commands {
-        // Route the standard "Settings… (⌘,)" menu item to the in-app sheet
-        // rather than the (empty, AppKit-unreachable) preferences scene.
+        // Route the standard "Settings… (⌘,)" menu item to the in-app Settings
+        // window rather than the (empty, AppKit-unreachable) preferences scene.
         CommandGroup(replacing: .appSettings) {
-          Button("Settings…") {
-            DashboardWindowController.shared.show()  // ensure a window to host the sheet
-            AppState.shared.presentSettings()
-          }
-          .keyboardShortcut(",", modifiers: .command)
+          Button("Settings…") { AppState.shared.presentSettings() }
+            .keyboardShortcut(",", modifiers: .command)
         }
       }
   }

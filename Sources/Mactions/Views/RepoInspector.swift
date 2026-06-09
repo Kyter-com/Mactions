@@ -61,10 +61,9 @@ struct RepoInspector: View {
             platformDetail(repoPlan, os: os)
           }
         }
-
-        if app.state != .offline {
-          Banner(MactionsTheme.Copy.offlineGate, severity: .info)
-        }
+        // Edits are allowed while the fleet is live and staged until restart; the
+        // dashboard's global "restart to apply" bar carries the message + action,
+        // so we don't duplicate it here.
       }
       .padding(MactionsTheme.Spacing.section)
       .frame(maxWidth: .infinity, alignment: .leading)
@@ -88,7 +87,7 @@ struct RepoInspector: View {
       .buttonStyle(.borderless)
       .controlSize(.small)
       .disabled(app.state != .offline)
-      .help("Remove this repository")
+      .help(app.state == .offline ? "Remove this repository" : MactionsTheme.Copy.offlineToManageRepos)
       .accessibilityLabel("Remove repository")
       .confirmationDialog(
         "Remove \(repoPlan.repo.name)?", isPresented: $confirmRemove, titleVisibility: .visible
@@ -114,12 +113,11 @@ struct RepoInspector: View {
     let building = (os == .windows && app.windowsSetupBusy) || (os == .linux && app.linuxSetupBusy)
     let needsSetup = !ready && !building
     let selected = enabled && ready
-    // Locked = the tap would no-op (toggling enable is offline-only; a building
-    // tile is busy). We dim locked tiles so the disabled state is legible — a
-    // `.plain` button doesn't dim on its own, which made an online tap read as a
-    // frozen control. Unready tiles stay full-opacity: their tap still works (it
-    // opens Settings).
-    let locked = tileDisabled(ready: ready, building: building)
+    // Locked only while this platform's image is building (the tap would fight the
+    // build). Toggling is allowed online now — it stages a pending restart — so we
+    // no longer disable on online. We dim a locked tile so the spinner state reads
+    // as busy rather than a frozen control.
+    let locked = building
     return Button {
       handleTileTap(os, repoID: repoPlan.id, enabled: enabled, ready: ready)
     } label: {
@@ -174,13 +172,6 @@ struct RepoInspector: View {
     .accessibilityHint(tileHelp(os, ready: ready, enabled: enabled))
   }
 
-  /// Toggling a ready tile is offline-gated; tapping an unready tile just opens
-  /// Settings (navigation), so it stays live online. A building tile is locked.
-  private func tileDisabled(ready: Bool, building: Bool) -> Bool {
-    if building { return true }
-    return ready ? app.state != .offline : false
-  }
-
   private func handleTileTap(_ os: RunnerOS, repoID: String, enabled: Bool, ready: Bool) {
     if ready {
       app.setPlatform(os, enabled: !enabled, repoID: repoID)
@@ -191,11 +182,6 @@ struct RepoInspector: View {
   }
 
   private func tileHelp(_ os: RunnerOS, ready: Bool, enabled: Bool) -> String {
-    // A ready tile can only be toggled offline — say so instead of an inviting
-    // "tap to disable" the online tap won't honor.
-    if ready, app.state != .offline {
-      return "\(os.displayName) is \(enabled ? "enabled" : "off") — go offline to change this repo's platforms."
-    }
     switch os {
     case .macOS:
       return enabled
@@ -233,9 +219,7 @@ struct RepoInspector: View {
       if os == .macOS {
         Stepper(
           "Runners: \(config?.count ?? app.plan.defaultMacOSCount)",
-          value: countBinding(repoID: repoPlan.id), in: 1...5
-        )
-        .disabled(app.state != .offline)
+          value: countBinding(repoID: repoPlan.id), in: 1...5)
       } else {
         InfoRow(
           "One throwaway \(os == .windows ? "VM" : "container") per job",
@@ -250,7 +234,6 @@ struct RepoInspector: View {
         LabelEditor(
           text: labelsBinding(repoPlan: repoPlan, os: os),
           editable: os == .macOS)
-          .disabled(app.state != .offline)
         // Surface the SAME rule goOnline() hard-blocks on (non-empty + must
         // include `self-hosted`) right here, so a bad label set is caught while
         // editing instead of as a cryptic blocked "Go online" later. Only macOS

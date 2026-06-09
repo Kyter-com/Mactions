@@ -151,20 +151,31 @@ final class AppState: ObservableObject {
   // In-app Settings presentation. The primary window is an AppKit-hosted
   // NSWindow, so the SwiftUI `Settings` scene's `showSettingsWindow:` action
   // never reaches a responder from here — the old toolbar gear was a dead button.
-  // Instead we present `SettingsRootView` as a SHEET on the dashboard, driven by
-  // this flag (pure SwiftUI state, so it's reliable regardless of the responder
-  // chain). The user also asked for settings to live IN the app, not a separate
-  // preferences window.
-  /// Whether the in-app Settings sheet is showing.
-  @Published var settingsPresented = false
+  // Instead we present `SettingsRootView` in our own NON-MODAL companion window
+  // (SettingsWindowController), so settings live IN the app (the user's ask) yet
+  // don't overlay the live runner list or trap a running base build the way a
+  // modal sheet did.
   /// Which Settings tab to open on present — lets a "needs setup" tap on a
   /// platform tile jump straight to the Windows / Linux tab.
   @Published var settingsTab: SettingsTab = .general
 
-  /// Open the in-app Settings sheet, optionally on a specific tab.
+  /// Open the Settings window, optionally on a specific tab.
   func presentSettings(_ tab: SettingsTab = .general) {
     settingsTab = tab
-    settingsPresented = true
+    SettingsWindowController.shared.show()
+  }
+
+  /// A persistent, dismissible error for BLOCKING failures (sign-in failed,
+  /// go-online refused). `statusMessage` is transient — the next action
+  /// overwrites it and it's invisible behind windows — so a failure the user must
+  /// act on would otherwise vanish unseen. This stays until dismissed or the next
+  /// attempt clears it. Shown as a banner at the top of the dashboard.
+  @Published var errorBanner: String?
+
+  /// Surface a blocking failure both as the persistent banner and the status line.
+  private func reportBlockingError(_ message: String) {
+    errorBanner = message
+    statusMessage = message
   }
 
   /// One orchestrator per combo, keyed `<owner/name>#<RunnerOS.rawValue>`.
@@ -247,11 +258,25 @@ final class AppState: ObservableObject {
     text.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
   }
 
-  // MARK: Plan mutation (the per-(repo,platform) config — offline-gated, persisted)
+  // MARK: Plan mutation (the per-(repo,platform) config)
+  //
+  // Per-combo edits (enable/count/labels) are allowed WHILE ONLINE: the live
+  // orchestrators snapshot the plan at go-online and don't re-read it, so editing
+  // can't race them — it just won't take effect until the fleet restarts. We mark
+  // `pendingRestart` so the UI offers a one-click "restart fleet to apply" instead
+  // of forcing a full manual offline→edit→online cycle for a one-character label
+  // fix. Repo ADD/REMOVE stays offline-only: the live grid is keyed off
+  // `plan.repos`, so removing a repo online would hide a still-running runner.
+
+  /// Set true when a per-combo edit lands while the fleet is live (not offline),
+  /// so the change is staged but not yet applied. Cleared on go-online/go-offline.
+  @Published var pendingRestart = false
 
   func isSelected(_ repo: RepoRef) -> Bool { plan.repos.contains { $0.repo == repo } }
 
   /// Add (with default platforms) or remove a repo. Used by the add-repo picker.
+  /// Offline-only: the live grid is keyed off `plan.repos`, so changing membership
+  /// online would desync the displayed fleet from the running one.
   func toggleRepo(_ repo: RepoRef) {
     guard state == .offline else { return }
     if isSelected(repo) { plan.removeRepo(id: repo.fullName) } else { plan.addRepo(repo) }
@@ -270,25 +295,39 @@ final class AppState: ObservableObject {
     saveConfig()
   }
 
+  /// Note a per-combo edit: persist, and if the fleet is live flag a pending
+  /// restart so the change is applied on the next go-online.
+  private func noteComboEdit() {
+    saveConfig()
+    if state != .offline { pendingRestart = true }
+  }
+
   /// Enable/disable a `(repo, platform)` combo (the inspector's platform toggle).
   func setPlatform(_ os: RunnerOS, enabled: Bool, repoID: String) {
-    guard state == .offline else { return }
     plan.setPlatform(os, enabled: enabled, in: repoID)
-    saveConfig()
+    noteComboEdit()
   }
 
   /// Set a combo's runner count (macOS only in the UI).
   func setCount(_ count: Int, os: RunnerOS, repoID: String) {
-    guard state == .offline else { return }
     plan.setCount(count, os: os, in: repoID)
-    saveConfig()
+    noteComboEdit()
   }
 
   /// Set a combo's labels from a comma-separated string.
   func setLabels(_ text: String, os: RunnerOS, repoID: String) {
-    guard state == .offline else { return }
     plan.setLabels(Self.parseLabels(text), os: os, in: repoID)
-    saveConfig()
+    noteComboEdit()
+  }
+
+  /// Apply staged per-combo edits to the live fleet: take it offline, then back
+  /// online (which re-reads the plan). The one-click form of the manual cycle.
+  func restartFleet() {
+    guard state != .offline else { return }
+    Task {
+      await goOfflineAndWait()
+      goOnline()
+    }
   }
 
   // MARK: New-repo defaults (Settings → General)
@@ -324,20 +363,22 @@ final class AppState: ObservableObject {
       let token = try GitHubCLIAuth.currentToken()
       try TokenStore.save(token)
       isSignedIn = true
+      errorBanner = nil
       statusMessage = "Signed in via GitHub CLI."
       Task { await loadRepos() }
     } catch {
-      statusMessage = "\(error)"
+      reportBlockingError("Couldn't use the GitHub CLI login: \(error.localizedDescription)")
     }
   }
 
   func signInWithDeviceFlow() {
     guard !clientId.isEmpty else {
-      statusMessage = "Add an OAuth client id in Settings, or paste a token below."
+      reportBlockingError("Add an OAuth client id in Settings, or paste a token below.")
       return
     }
     authBusy = true
     statusMessage = nil
+    errorBanner = nil
     Task {
       do {
         let code = try await GitHubAuth.requestDeviceCode(clientId: clientId)
@@ -346,10 +387,11 @@ final class AppState: ObservableObject {
         let token = try await GitHubAuth.pollForToken(clientId: clientId, deviceCode: code)
         try TokenStore.save(token)
         isSignedIn = true
+        errorBanner = nil
         statusMessage = "Signed in."
         await loadRepos()
       } catch {
-        statusMessage = "Sign-in failed: \(error)"
+        reportBlockingError("Sign-in failed: \(error.localizedDescription)")
       }
       pendingDeviceCode = nil
       authBusy = false
@@ -362,10 +404,11 @@ final class AppState: ObservableObject {
     do {
       try TokenStore.save(trimmed)
       isSignedIn = true
+      errorBanner = nil
       statusMessage = "Token saved."
       Task { await loadRepos() }
     } catch {
-      statusMessage = "Couldn't store the token: \(error)"
+      reportBlockingError("Couldn't store the token: \(error.localizedDescription)")
     }
   }
 
@@ -416,11 +459,12 @@ final class AppState: ObservableObject {
   }
 
   func goOnline() {
-    guard let token = TokenStore.load() else { statusMessage = "Sign in first."; return }
-    guard !plan.repos.isEmpty else { statusMessage = "Add a repository first."; return }
+    errorBanner = nil  // a fresh attempt clears any prior blocking error
+    guard let token = TokenStore.load() else { reportBlockingError("Sign in to GitHub first."); return }
+    guard !plan.repos.isEmpty else { reportBlockingError("Add a repository first."); return }
     let combos = plan.enabledCombos()
     guard !combos.isEmpty else {
-      statusMessage = "Enable at least one platform for a repo (select it on the left to configure)."
+      reportBlockingError("Enable at least one platform for a repo (select it on the left to configure).")
       return
     }
     // Per-combo editable labels are the top silent-failure risk — a combo whose
@@ -429,14 +473,14 @@ final class AppState: ObservableObject {
     let invalid = plan.invalidCombos()
     guard invalid.isEmpty else {
       let names = invalid.map { "\($0.repo.name) (\($0.os.displayName))" }.joined(separator: ", ")
-      statusMessage =
-        "Fix labels for: \(names). Each combo's labels must be non-empty and include `self-hosted`."
+      reportBlockingError(
+        "Fix labels for: \(names). Each combo's labels must be non-empty and include `self-hosted`.")
       return
     }
     // The Windows base image is mid-(re)build — going online would clone a base
     // that's being wiped/rebuilt. Make the UI disable a hard guard too.
     guard !windowsSetupBusy else {
-      statusMessage = "Finish building the Windows base image before going online."
+      reportBlockingError("Finish building the Windows base image before going online.")
       return
     }
     saveConfig()
@@ -586,6 +630,8 @@ final class AppState: ObservableObject {
           return
         }
         state = .online
+        errorBanner = nil  // came online cleanly — clear any prior blocking error
+        pendingRestart = false  // the live fleet now matches the plan
         sync()
         let live = orchestrators.values.reduce(0) { $0 + $1.runners.count }
         let repoCount = Set(combos.map { $0.repo.fullName }).count
@@ -637,7 +683,7 @@ final class AppState: ObservableObject {
         }
       } catch {
         guard fleetEpoch == myEpoch else { return }
-        statusMessage = "Failed to start: \(error.localizedDescription)"
+        reportBlockingError("Failed to start: \(error.localizedDescription)")
         state = .offline
       }
     }
@@ -660,6 +706,7 @@ final class AppState: ObservableObject {
     HostCleanup.purgeRuns()
     runners = []
     busyRunnerNames = []
+    pendingRestart = false  // nothing live to be out of sync with
     state = .offline
     statusMessage = "Offline."
   }

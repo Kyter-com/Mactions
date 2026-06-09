@@ -93,11 +93,11 @@ enum MactionsTheme {
     static let outer: CGFloat = 12
     static let inner: CGFloat = 8
   }
-  /// Shared UI copy. One phrase for the pervasive offline gate, so every gated
-  /// control reinforces the same "configure offline, watch online" model instead
-  /// of six near-identical variants.
+  /// Shared UI copy. Per-combo edits are now allowed while online (they stage a
+  /// pending restart), so the only remaining hard offline gate is repository
+  /// add/remove — one phrase for it everywhere it's surfaced.
   enum Copy {
-    static let offlineGate = "Go offline to make changes."
+    static let offlineToManageRepos = "Go offline to add or remove repositories."
   }
 }
 
