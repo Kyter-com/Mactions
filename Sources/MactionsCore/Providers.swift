@@ -4,11 +4,13 @@ import Foundation
 /// a local process, a Tart VM, etc. It takes a JIT config, runs the agent for
 /// exactly one job, and reports when the agent exits so the orchestrator can
 /// recycle it.
-public protocol RunnerProvider: AnyObject {
+public protocol RunnerProvider: AnyObject, Sendable {
   /// Stable id for logging/UI (usually the runner name).
   var id: String { get }
   /// Launch the agent with `jitConfig`. `onExit` fires (any thread) when the
   /// agent process/VM finishes — a clean ephemeral exit or a crash.
+  /// May BLOCK (agent clone, VM clone, container run), so the orchestrator runs
+  /// it off the main actor — all conformers are `@unchecked Sendable`.
   func start(jitConfig: String, onExit: @escaping @Sendable (Int32) -> Void) throws
   /// Tear down immediately (user went offline / quit).
   func stop()

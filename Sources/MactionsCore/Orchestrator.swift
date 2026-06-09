@@ -292,8 +292,25 @@ public final class RunnerOrchestrator {
       let slot = Slot(
         name: jit.runnerName, remoteId: jit.runnerId, phase: .online, provider: provider,
         startedAt: Date())
-      try provider.start(jitConfig: jit.encodedConfig) { [weak self] status in
-        Task { @MainActor in self?.handleExit(slot, epoch: myEpoch, status: status) }
+      // `provider.start` BLOCKS — it clones the ~200 MB agent (cp), shells out to
+      // `security`, or clones a whole VM. Run it OFF the main actor so the UI
+      // doesn't beach-ball while the fleet spins up (the orchestrator is
+      // @MainActor, so a bare call would block the main thread per runner). The
+      // `await` suspends the main actor; it never blocks it. Providers are
+      // Sendable and `Slot` is @MainActor-isolated (hence Sendable), so the
+      // exit-callback hop back to the main actor stays safe.
+      let encoded = jit.encodedConfig
+      try await Task.detached {
+        try provider.start(jitConfig: encoded) { [weak self] status in
+          Task { @MainActor in self?.handleExit(slot, epoch: myEpoch, status: status) }
+        }
+      }.value
+      // We may have gone offline during the (now off-main) launch — don't keep a
+      // runner for a dead generation; tear down the one we just started.
+      guard epoch == myEpoch, state == .starting || state == .online else {
+        provider.stop()
+        try? await controlPlane.deleteRunner(id: jit.runnerId)
+        return false
       }
       slots.append(slot)
       notify()

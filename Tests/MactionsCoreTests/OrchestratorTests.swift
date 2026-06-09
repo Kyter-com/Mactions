@@ -17,7 +17,7 @@ final class FakeControlPlane: RunnerControlPlane, @unchecked Sendable {
   func deleteRunner(id: Int) async throws { deleted.append(id) }
 }
 
-final class FakeProvider: RunnerProvider {
+final class FakeProvider: RunnerProvider, @unchecked Sendable {
   let id: String
   private var onExit: ((Int32) -> Void)?
   private(set) var started = false
