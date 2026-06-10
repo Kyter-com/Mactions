@@ -269,6 +269,35 @@ swift run Mactions   # launches the app for dev
 
 `swift run` is fine for development; the Xcode app target provides the real AppIcon and release packaging path.
 
+### Exporting the real app icon
+
+The Liquid Glass/3D icon is produced by Xcode's Icon Composer pipeline from
+`Sources/Mactions/Mactions.icon`. Do **not** recreate it from `Group.svg` or
+`AppLogo.image(...)` for README/social assets — those are fallback/compositing
+paths and miss the compiled glow/depth treatment.
+
+To refresh `docs/assets/mactions-logo.png`, build the Xcode app target and
+extract the compiled `.icns`:
+
+```bash
+xcodebuild -project Mactions.xcodeproj \
+  -scheme MactionsApp \
+  -configuration Debug \
+  -derivedDataPath /tmp/MactionsDerived \
+  CODE_SIGNING_ALLOWED=NO \
+  build
+
+rm -rf /tmp/mactions-icon.iconset
+iconutil -c iconset \
+  /tmp/MactionsDerived/Build/Products/Debug/Mactions.app/Contents/Resources/Mactions.icns \
+  -o /tmp/mactions-icon.iconset
+
+cp /tmp/mactions-icon.iconset/icon_128x128@2x.png docs/assets/mactions-logo.png
+```
+
+`icon_128x128@2x.png` is the useful README size: rendered by the real app-icon
+compiler, small enough for git, and sharp at the README's 112 px display width.
+
 **CI:** there's deliberately no push-triggered CI. GitHub-hosted `macos-latest` runners aren't available to the Kyter-com org (jobs get no runner and fail in ~4s), and a self-hosted runner only exists while someone has Mactions open — neither is reliable for push CI. So validation is local `swift test` plus the manual **`.github/workflows/selfhosted-smoke.yml`** (`workflow_dispatch`), which builds + tests on a Mactions-provided runner. A dedicated always-on Mac runner would let this become real push CI.
 
 ## Host hygiene (no leftover crap)
