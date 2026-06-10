@@ -27,10 +27,6 @@
   <img alt="Last commit" src="https://img.shields.io/github/last-commit/Kyter-com/Mactions?style=flat-square">
 </p>
 
-<p align="center">
-  <img src="docs/assets/mactions-preview.svg" alt="Mactions dashboard preview" width="960">
-</p>
-
 ## Why it exists
 
 GitHub-hosted macOS and Windows ARM capacity can be unpredictable, and permanent
