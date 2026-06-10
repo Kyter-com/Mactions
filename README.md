@@ -1,55 +1,171 @@
-# Mactions
+<p align="center">
+  <img src="docs/assets/mactions-logo.svg" width="112" alt="Mactions app icon">
+</p>
 
-A macOS menubar app that turns your Mac into an **on-demand, ephemeral GitHub Actions runner host**. Open it and go online: Mactions **watches your repos for queued jobs and starts a runner only when one needs it** (scale-from-zero — nothing runs while the queue is empty); quit it and the watching stops. Every runner is single-use: it registers, runs one job, deregisters, and is torn down — replaced only while matching jobs remain queued.
+<h1 align="center">Mactions</h1>
 
-> **Status: proof-of-concept.** The end-to-end loop works for **macOS** (a local runner process — an isolated clone wiped each run) and **Linux** (an ephemeral **arm64 container per job**, `LinuxContainerProvider` — **proven end to end 2026-06-08**: through the app UI a green Linux job ran on `ghcr.io/actions/actions-runner` registered `[self-hosted, Linux, ARM64, mactions]`, then the container was destroyed via `--rm`; backend: Apple `container` on macOS 26+). **Windows** is **opt-in** and **proven end to end on VMware Fusion** (2026-06-01): a `WindowsVMProvider` clones a throwaway Win11-ARM VM per job, the guest registers **outbound** to GitHub and runs **one** job, then powers off and the clone is destroyed. It's OFF by default behind a **"Set up Windows runner"** button (nothing heavy downloads or builds until you click it). The working backend is **VMware Fusion** (free since Nov 2024) — its `vmrun` CLI does headless clone/start/stop + snapshots and its EFI boots Win11-ARM, where stock QEMU's firmware hangs and UTM is GUI-bound. Fusion is a **manual download** (Broadcom portal — not brew-installable); the app detects it and installs the other free prerequisites (the UUP-dump ISO-converter tools + `xorriso`) via Homebrew — it **never** installs Homebrew itself (if `brew` is missing it points you at https://brew.sh). The Swift `VMwareCLI` provider drives the per-job loop, "Go online" auto-selects Fusion, and the **one-time base build is automated end to end** (`prepare-windows-image` → `fusion-windows-base`: mandatory no-prompt ISO, unattended install, VMware Tools/vmxnet3, bootstrap, snapshot) — and the **whole flow is proven via the UI**: the app built the base itself, ran a green Windows job on it, and tore every clone down on go-offline. The build also **verifies provisioning before snapshotting**, carries narrow GitHub-hosted Windows OS-policy parity (shell policy, long paths, Git post-install semantics, Windows Update, Defender), and a **host-RAM cap** keeps concurrent VMs from thrashing the Mac. Built with **Swift 6** (strict concurrency). See [AGENTS.md](AGENTS.md) for the full picture, architecture, and roadmap.
+<p align="center">
+  <strong>Ephemeral GitHub Actions runners from the Mac on your desk.</strong>
+</p>
 
-## Quick start
+<p align="center">
+  Mactions watches your repositories, starts a self-hosted runner only when a matching job queues, and tears that runner down after one job.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Kyter-com/Mactions/actions/workflows/release.yml"><img alt="Hosted macOS release" src="https://github.com/Kyter-com/Mactions/actions/workflows/release.yml/badge.svg"></a>
+  <a href="https://github.com/Kyter-com/Mactions/actions/workflows/selfhosted-smoke.yml"><img alt="Self-hosted smoke" src="https://github.com/Kyter-com/Mactions/actions/workflows/selfhosted-smoke.yml/badge.svg"></a>
+  <a href="https://github.com/Kyter-com/Mactions/actions/workflows/win-smoke.yml"><img alt="Windows smoke" src="https://github.com/Kyter-com/Mactions/actions/workflows/win-smoke.yml/badge.svg"></a>
+</p>
+
+<p align="center">
+  <img alt="Swift 6" src="https://img.shields.io/badge/Swift-6-F05138?style=flat-square&logo=swift&logoColor=white">
+  <img alt="macOS 13+" src="https://img.shields.io/badge/macOS-13%2B-111111?style=flat-square&logo=apple&logoColor=white">
+  <img alt="Apple Silicon" src="https://img.shields.io/badge/Apple%20Silicon-optimized-0A84FF?style=flat-square">
+  <a href="https://github.com/Kyter-com/Mactions/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/Kyter-com/Mactions?style=flat-square"></a>
+  <a href="https://github.com/Kyter-com/Mactions/issues"><img alt="GitHub issues" src="https://img.shields.io/github/issues/Kyter-com/Mactions?style=flat-square"></a>
+  <img alt="Last commit" src="https://img.shields.io/github/last-commit/Kyter-com/Mactions?style=flat-square">
+</p>
+
+<p align="center">
+  <img src="docs/assets/mactions-preview.svg" alt="Mactions dashboard preview" width="960">
+</p>
+
+## Why it exists
+
+GitHub-hosted macOS and Windows ARM capacity can be unpredictable, and permanent
+self-hosted runners are awkward for laptop-scale work. Mactions gives you a
+native control plane for short-lived runners:
+
+- **Scale from zero.** The normal idle state is no runner at all. Mactions polls
+  queued jobs and provisions only when there is matching demand.
+- **One job, then gone.** Every runner uses GitHub's ephemeral/JIT flow, runs a
+  single job, deregisters, and is destroyed.
+- **Mac-native fleet control.** Add repos, choose platforms, watch live runners,
+  inspect job history, and view host memory from a SwiftUI dashboard.
+- **Multi-OS from Apple Silicon.** Run macOS jobs on the host, Linux jobs in an
+  arm64 Apple `container`, and Windows jobs in throwaway Win11 ARM VMware Fusion
+  linked clones.
+- **No always-on daemon.** If the app is offline or closed, it is not accepting
+  work. That is the point.
+
+## Status
+
+Mactions is a working proof of concept, not a hardened CI product. It is useful
+for trusted private repositories where you want local, on-demand runner capacity.
+
+| Platform | Backend | State | Runner labels |
+| --- | --- | --- | --- |
+| macOS | Local process on the host Mac | Working; fastest path, no VM isolation | `[self-hosted, macOS, mactions]` |
+| Linux | Apple `container`, arm64 | Proven end to end on 2026-06-08 | `[self-hosted, Linux, ARM64, mactions]` |
+| Windows | VMware Fusion linked clone, Win11 ARM | Opt-in; proven end to end on 2026-06-01 | `[self-hosted, Windows, mactions]` |
+
+Linux and Windows setup stay behind explicit buttons. Mactions will not download
+a Windows image, build a VM, or pull the Linux runner image until you ask it to.
+
+## Requirements
+
+- macOS 13+ for the app. Apple Silicon is the target machine shape.
+- Swift 6/Xcode for source builds.
+- Apple `container` on macOS 26+ for Linux runners.
+- VMware Fusion for Windows runners. Mactions uses Fusion's `vmrun` CLI and the
+  bundled VMware Tools ISO during the Win11 ARM base build; Fusion itself is a
+  manual install.
+- Homebrew for the Windows media tools Mactions can install automatically:
+  `aria2`, `cabextract`, `wimlib`, `cdrtools`, `minacle/chntpw/chntpw`, and
+  `xorriso`.
+
+## Quick Start
 
 ```bash
-swift run Mactions      # launches the menubar app (look in the menubar)
+git clone https://github.com/Kyter-com/Mactions.git
+cd Mactions
+swift run Mactions
 ```
 
-1. **Connect GitHub.** Either:
-   - Paste a token (fastest): a classic PAT with `repo` scope, or a fine-grained token with **Administration: read & write** on the target repo, or
-   - Sign in with the device flow: register an OAuth App (Settings → Developer settings → OAuth Apps, enable **Device Flow**), paste its client id, click **Sign in with GitHub**, approve the code in the browser.
-2. **Set owner + repo** (e.g. `Kyter-com` / `sweep-collector`), labels, and the max concurrent runners.
-3. **Go online.** Mactions arms the fleet and watches for queued jobs — runners start on demand (no idle runners while the queue is empty) and retire after their one job. Reference them in a workflow with `runs-on: [self-hosted, macOS, mactions]` — or `runs-on: [self-hosted, Linux, ARM64, mactions]` for a Linux container runner (note the `ARM64`: it's an arm64 runner, so workflows opt in by label) — matching your labels. Migrating a workflow from a GitHub-hosted runner? **[PARITY.md](PARITY.md)** is the per-OS contract: what matches hosted behavior, what differs, and what to do about each difference.
-4. **Quit the app** to take them offline (it deregisters them first).
+Then, in the app:
 
-Optional: click the **window button** (⊞) in the popover header to open the **dashboard** — a Pulse-style console with **Runners / History / Memory** tabs. Select a past run to see its **GitHub Actions job log inline** (fetched from GitHub, so it works for macOS *and* Windows runs); watch a running runner's **step checklist**; and see **live memory** (a gauge + sparkline + per-VM/runner breakdown). It's purely a viewer: it gives the app a dock icon while open and hides it again on close, and closing the window never takes runners offline (only quitting does). Built with Liquid Glass on macOS 26.
+1. Connect GitHub with the GitHub CLI login, device flow, or a personal access
+   token.
+2. Add a repository, or enable "watch all repositories I can admin".
+3. Choose the platforms that repo can use.
+4. Click **Go online**.
 
-## Develop
+Point a workflow at the labels you enabled:
+
+```yaml
+jobs:
+  test:
+    runs-on: [self-hosted, macOS, mactions]
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift test
+```
+
+Linux jobs must opt into ARM64:
+
+```yaml
+runs-on: [self-hosted, Linux, ARM64, mactions]
+```
+
+## How it works
+
+1. Mactions polls GitHub for queued jobs in selected repositories.
+2. Matching queued jobs become demand for a platform/label set.
+3. Mactions asks GitHub for a JIT runner config.
+4. The provider starts exactly one runner:
+   - macOS: isolated per-run working directory on the host.
+   - Linux: `ghcr.io/actions/actions-runner` inside a throwaway Apple
+     `container`.
+   - Windows: Win11 ARM linked clone from a prepared VMware Fusion base image.
+5. The runner executes one job, deregisters, exits, and is cleaned up.
+6. If more matching jobs remain queued, Mactions replaces it. Otherwise the
+   fleet returns to zero.
+
+## Security model
+
+Treat Mactions as trusted-repo infrastructure.
+
+- macOS jobs run on the host. The working directory and HOME are isolated per
+  run, but this is not a sandbox.
+- Linux jobs run in throwaway containers. The writable layer is discarded, but
+  containers still share the host kernel.
+- Windows jobs run in throwaway VMs, which is the strongest isolation currently
+  shipped here.
+- The GitHub token is stored in `~/.mactions/auth.token` with `0600`
+  permissions. A signed release can move this to Keychain later.
+
+Do not point public fork PRs or untrusted workflow code at a personal Mac.
+
+## Development
 
 ```bash
-swift build      # build
-swift test       # unit tests (no network)
+swift build
+swift test
 ```
 
-No external dependencies. The orchestration logic lives in the `MactionsCore` library (pure Foundation, fully unit-tested); the SwiftUI menubar app is a thin shell over it.
+The package has two targets:
 
-### Run in Xcode (real app icon)
+- `MactionsCore`: pure Foundation orchestration logic and provider code.
+- `Mactions`: SwiftUI/AppKit app shell, dashboard, settings, and assets.
 
-`swift run` can't assign an app icon (it shows a runtime approximation). To get the **real Liquid Glass icon** and a proper `.app` bundle, build the Xcode app target — generated from [`project.yml`](project.yml) with [XcodeGen](https://github.com/yonaskolb/XcodeGen):
+For the real macOS app icon and `.app` bundle, generate the Xcode project:
 
 ```bash
-brew install xcodegen    # one-time
-xcodegen generate        # writes Mactions.xcodeproj (gitignored)
-open Mactions.xcodeproj   # pick the "MactionsApp" scheme, then Run (⌘R)
+brew install xcodegen
+xcodegen generate
+open Mactions.xcodeproj
 ```
 
-The app target compiles the same `Sources/Mactions` and links a native `MactionsCore` framework target (the same sources as the SwiftPM library); `actool` composes `Mactions.icon` (Icon Composer) into the AppIcon. To change the icon, re-export from Icon Composer into `Sources/Mactions/Mactions.icon`.
+Pick the `MactionsApp` scheme and run.
 
-## Release
+## Documentation
 
-Hosted releases are built on GitHub-hosted macOS from `.github/workflows/release.yml`: Developer ID signing, notarization/stapling, DMG/ZIP packaging, Sparkle appcast generation, and GitHub Release upload. See [docs/RELEASE.md](docs/RELEASE.md) for the required Actions secrets/variables and the tag flow.
-
-## Security
-
-The default macOS **local-process** runner has no isolation — only point it at **trusted / private** repos. **Linux** runs each job in a **throwaway Apple `container`** (`--rm` discards the whole writable layer), which is clean for trusted/private repos but shares the host kernel; do not route untrusted/public macOS or Linux jobs here. **Windows** runs in a throwaway VMware Fusion VM. The GitHub token is stored in a `0600` file under `~/.mactions` (not the keychain — an unsigned dev build re-prompts on every keychain access; a signed build could use the keychain).
-
-> **macOS code signing on a self-hosted runner — RESOLVED (2026-06-03):** the real per-run blocker was Mactions' own HOME redirect: `security` derives the user keychain search list from `$HOME`, so inside the throwaway clone the list collapsed to just the System keychain (0 identities) and electron-builder — even with `CSC_LINK` set — fell back to an **ad-hoc** signature that failed notarization, on *any* Mac. `LocalProcessProvider` now seeds the per-run search list with the host login keychain (it never touches the user's real one), and a release leg **signed + notarized green** on a personal Mac. Separately, a locked-down/**MDM-managed** Mac can still fail at the *host* level (`security find-identity -v -p codesigning` showing 0 valid for a good cert) — diagnose with that command; run release builds on a Mac where it shows your identity as valid.
-
-> **Windows code signing (Azure Trusted Signing) on the ARM64 runner — RESOLVED (2026-06-03):** the `SignTool failed with exit code 3` was **not** a data-plane/RBAC rejection and not raw emulation — the Azure signing dlib is a mixed-mode **.NET 8** assembly, and the **x64** signtool+dlib (the only ones Microsoft ships; no arm64 dlib exists) need an **x64 .NET 8 runtime** under emulation, which the runner didn't have (only arm64 .NET 10; see `Azure/artifact-signing-action#138`). The workflow now installs the x64 .NET 8 runtime (`DOTNET_ROOT_X64`) and the installer **signs green on the Win11-ARM runner**. One related gotcha: `wrangler` (workerd) has **no win32-arm64 build**, so R2 uploads must run from another leg — the Windows leg hands its signed artifacts to a small ubuntu publish job. See [AGENTS.md](AGENTS.md) → Windows support.
-
-See **[AGENTS.md](AGENTS.md)** for architecture, the per-OS reality (the macOS 2-VM cap, Linux containers, why Windows is hard), and the roadmap.
+- [Runner parity](docs/PARITY.md): exact differences from GitHub-hosted macOS,
+  Linux, and Windows runners.
+- [Base image philosophy](docs/BASE.md): what belongs in runner images and what
+  workflows should install themselves.
+- [Release setup](docs/RELEASE.md): Developer ID signing, notarization, Sparkle,
+  and GitHub Release packaging.
+- [Maintainer notes](AGENTS.md): architecture, implementation history, and the
+  detailed roadmap.
