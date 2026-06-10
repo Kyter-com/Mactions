@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/mactions-logo.svg" width="112" alt="Mactions app icon">
+  <img src="docs/assets/mactions-logo.png" width="112" alt="Mactions app icon">
 </p>
 
 <h1 align="center">Mactions</h1>
