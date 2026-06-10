@@ -171,6 +171,27 @@ final class AppState: ObservableObject {
     }
   }
   @Published var runners: [FleetRunnerRow] = []
+  /// Scale-from-zero observability: matching QUEUED jobs per watched repo
+  /// (summed across that repo's combos, from each orchestrator's last
+  /// successful queue poll). What lets the UI tell "watching, nothing queued"
+  /// apart from "spinning up for N jobs" while the runner list is empty.
+  /// (A job whose labels satisfy MORE than one of a repo's combos is counted
+  /// once per combo — that mirrors the fleet's provisioning intent: each
+  /// matching combo provisions for it and the loser is trimmed.)
+  @Published var repoQueuedJobs: [String: Int] = [:]
+  /// Repos with a live orchestrator (explicit + all-repos discovered) — what
+  /// "armed and watching" actually means per repo. A configured repo whose
+  /// combos were all skipped (image not built, budget 0) is NOT in this set.
+  @Published var watchedRepos: Set<String> = []
+  var watchedRepoCount: Int { watchedRepos.count }
+  /// Repos whose most recent queue poll FAILED (any combo): "watching" would
+  /// be a lie — the queue state is unknown until a poll succeeds.
+  @Published var repoPollFailing: Set<String> = []
+  /// Repos with queued demand that a budget-denied provision is waiting on.
+  @Published var repoWaitingForCapacity: Set<String> = []
+  /// Repos whose runners are repeatedly dying during launch (dead daemon, bad
+  /// base image): repo → the orchestrator's last launch error.
+  @Published var repoLaunchFailure: [String: String] = [:]
   /// Names of OUR runners GitHub reports as `busy` (executing a job right now).
   /// Polled by the Runners pane so the activity ring spins only during a real job,
   /// not for an idle-but-online runner. Empty when offline.
@@ -236,6 +257,32 @@ final class AppState: ObservableObject {
   /// on the agent download) can detect that the user went offline meanwhile and
   /// abort instead of reviving a dead fleet.
   private var fleetEpoch = 0
+  /// Retained while online so ALL-REPOS discovery can create orchestrators on
+  /// demand (the factories are otherwise locals of `goOnline`). Cleared with
+  /// the fleet.
+  private var fleetFactories: [RunnerOS: RunnerProviderFactory] = [:]
+  /// The live shared capacity ledger every orchestrator (explicit + discovered)
+  /// draws on. One per online generation; cleared with the fleet.
+  private var fleetBudget: HostBudget?
+  /// Orchestrator keys created by all-repos DISCOVERY (seeded from the plan's
+  /// defaults) rather than the explicit plan — reaped when their repo's queue
+  /// goes quiet. Same key space as `orchestrators`.
+  private var discoveredKeys: Set<String> = []
+  /// Consecutive quiet discovery scans per discovered key (reaped at 2 — one
+  /// quiet scan can be a race with a job that's mid-pickup).
+  private var discoveryQuietScans: [String: Int] = [:]
+  private var discoveryTask: Task<Void, Never>?
+  /// One shared control plane per repo (explicit AND discovered), kept for the
+  /// online session: same-repo combos + the discovery probe collapse into one
+  /// queued-jobs fetch per tick window, and the underlying client's ETag store
+  /// makes unchanged re-polls free against the rate limit.
+  private var fleetControlPlanes: [String: SharedRepoControlPlane] = [:]
+  /// Discovered repos whose crash-ghost sweep already ran this session (the
+  /// analog of goOnline's per-explicit-repo sweep; once per repo, and only
+  /// before its first orchestrator exists — a later sweep would deregister
+  /// live sibling runners).
+  private var sweptDiscoveredRepos: Set<String> = []
+  private var discoveryRepoListRefreshedAt = Date.distantPast
   private let defaults = UserDefaults.standard
 
   init() {
@@ -413,6 +460,14 @@ final class AppState: ObservableObject {
     noteComboEdit()
   }
 
+  /// Toggle the ALL-REPOS scope: when on, the online fleet also watches every
+  /// admin repo (discovery seeded from the default platforms) — not just the
+  /// explicit list. Staged like every other plan edit.
+  func setAllRepos(_ enabled: Bool) {
+    plan.allRepos = enabled
+    noteComboEdit()
+  }
+
   /// Apply staged per-combo edits to the live fleet: take it offline, then back
   /// online (which re-reads the plan). The one-click form of the manual cycle.
   func restartFleet() {
@@ -429,22 +484,30 @@ final class AppState: ObservableObject {
 
   func setDefaultMacOSLabels(_ text: String) {
     plan.defaultMacOSLabels = Self.parseLabels(text)
-    saveConfig()
+    noteDefaultsEdit()
   }
 
   func setDefaultMacOSCount(_ count: Int) {
     plan.defaultMacOSCount = max(1, min(5, count))
-    saveConfig()
+    noteDefaultsEdit()
   }
 
   /// Whether a platform is auto-enabled on a freshly-added repo.
   func isDefaultPlatform(_ os: RunnerOS) -> Bool { plan.defaultPlatforms.contains(os.rawValue) }
 
+  /// Defaults edits normally affect only future repo adds (plain save). Under
+  /// ALL-REPOS mode they are live discovery inputs (the platform match set and
+  /// seed labels/counts) while the armed factories stay frozen from goOnline —
+  /// so stage a restart like any other combo edit instead of half-applying.
+  private func noteDefaultsEdit() {
+    if plan.isAllRepos { noteComboEdit() } else { saveConfig() }
+  }
+
   func setDefaultPlatform(_ os: RunnerOS, on: Bool) {
     var set = Set(plan.defaultPlatforms)
     if on { set.insert(os.rawValue) } else { set.remove(os.rawValue) }
     plan.defaultPlatforms = RunnerOS.allCases.map(\.rawValue).filter { set.contains($0) }
-    saveConfig()
+    noteDefaultsEdit()
   }
 
   // MARK: Auth
@@ -554,9 +617,14 @@ final class AppState: ObservableObject {
   func goOnline() {
     errorBanner = nil  // a fresh attempt clears any prior blocking error
     guard let token = TokenStore.load() else { reportBlockingError("Sign in to GitHub first."); return }
-    guard !plan.repos.isEmpty else { reportBlockingError("Add a repository first."); return }
+    // All-repos mode needs no explicit repo list — discovery finds demand
+    // across every admin repo, seeded from the plan's default platforms.
+    guard !plan.repos.isEmpty || plan.isAllRepos else {
+      reportBlockingError("Add a repository first.")
+      return
+    }
     let combos = plan.enabledCombos()
-    guard !combos.isEmpty else {
+    guard !combos.isEmpty || plan.isAllRepos else {
       reportBlockingError("Enable at least one platform for a repo (select it on the left to configure).")
       return
     }
@@ -607,11 +675,22 @@ final class AppState: ObservableObject {
       guard fleetEpoch == myEpoch else { return }
       var created: [RunnerOrchestrator] = []
       do {
-        let wantsMac = combos.contains { $0.os == .macOS }
+        // An OS is "wanted" when an explicit combo enables it OR all-repos
+        // discovery could route a job to it (default platforms).
+        let discoveryPlatforms: Set<String> =
+          plan.isAllRepos ? Set(plan.defaultPlatforms) : []
+        let wantsMac =
+          combos.contains { $0.os == .macOS }
+          || discoveryPlatforms.contains(RunnerOS.macOS.rawValue)
         let windowsCombos = combos.filter { $0.os == .windows }
         let linuxCombos = combos.filter { $0.os == .linux }
-        // Total runners ASKED for per OS (Σ per-combo counts) — the denominator
-        // for the "limited to X/Y" status when the budget caps below the plan.
+        let wantsWindows =
+          !windowsCombos.isEmpty || discoveryPlatforms.contains(RunnerOS.windows.rawValue)
+        let wantsLinux =
+          !linuxCombos.isEmpty || discoveryPlatforms.contains(RunnerOS.linux.rawValue)
+        // Concurrent runners the plan could ask for per OS (Σ per-combo caps) —
+        // the denominator for the "capped at X" status when the host budget
+        // sits below the plan's ceiling.
         let windowsRequested = windowsCombos.reduce(0) { $0 + $1.config.count }
         let linuxRequested = linuxCombos.reduce(0) { $0 + $1.config.count }
         // Only fetch the macOS agent template when a macOS combo is actually
@@ -625,11 +704,11 @@ final class AppState: ObservableObject {
         } else {
           factory = nil
         }
-        // Windows fleet: only when a Windows combo exists AND a base image exists
+        // Windows fleet: only when Windows is wanted AND a base image exists
         // AND VMware Fusion is installed. Never spun up automatically. Fusion is
         // the sole backend (the proven Win11-ARM path).
         let windowsFactory: WindowsVMProviderFactory? =
-          (!windowsCombos.isEmpty && windowsImageReady)
+          (wantsWindows && windowsImageReady)
           ? WindowsVMProviderFactory.detectInstalledCLI().map {
             WindowsVMProviderFactory(baseImage: windowsBaseImage, cli: $0)
           }
@@ -647,8 +726,7 @@ final class AppState: ObservableObject {
           ? 0
           : WindowsVMBudget.maxConcurrentVMs(
             physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory, perVMGB: perVMGB)
-        var windowsVMsStamped = 0
-        // Linux fleet: only when a Linux combo exists, a container runtime is
+        // Linux fleet: only when Linux is wanted, a container runtime is
         // installed, AND it's actually ready right now. Re-verify ready() (daemon
         // up + image present) here because the persisted linuxImageReady can be
         // stale (image pruned / daemon stopped) — and a dead-daemon `<cli> run`
@@ -657,7 +735,7 @@ final class AppState: ObservableObject {
         // probe shells out, so run it off the main actor.
         let linuxImg = linuxRunnerImage
         let linuxCLI =
-          (!linuxCombos.isEmpty && linuxImageReady)
+          (wantsLinux && linuxImageReady)
           ? LinuxContainerProviderFactory.detectInstalledCLI() : nil
         var linuxReady = false
         if let lxCLI = linuxCLI {
@@ -677,7 +755,21 @@ final class AppState: ObservableObject {
           : LinuxContainerBudget.maxConcurrentContainers(
             physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
             activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount)
-        var linuxStamped = 0
+
+        // The live SHARED capacity ledger every combo draws on at provision
+        // time. Replaces the old static per-combo grants: scale-from-zero makes
+        // demand bursty and concurrent, so capacity is spent when a runner is
+        // actually provisioned and refunded when it exits — N combos can no
+        // longer pre-claim the whole budget while idle.
+        let budget = HostBudget(limits: [.windows: maxWindowsVMs, .linux: maxLinux])
+        fleetBudget = budget
+        fleetFactories = [:]
+        if let factory { fleetFactories[.macOS] = factory }
+        // A factory whose budget is 0 must NOT arm discovery: it would create
+        // orchestrators whose every provision is budget-denied — queued jobs
+        // would match, spin up nothing, and wait silently.
+        if let windowsFactory, maxWindowsVMs > 0 { fleetFactories[.windows] = windowsFactory }
+        if let linuxFactory, maxLinux > 0 { fleetFactories[.linux] = linuxFactory }
 
         // Stand up one orchestrator per combo, keyed `<owner/name>#<os>` so the
         // live list maps cleanly back to repo + OS (no fragile suffix parsing).
@@ -685,11 +777,17 @@ final class AppState: ObservableObject {
           repo: RepoRef, os: RunnerOS, factory: RunnerProviderFactory,
           labels: [String], count: Int
         ) async {
-          let client = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
+          // ONE control plane per repo, shared across its combos: their
+          // queued-jobs polls collapse into a single fetch per tick window.
+          let plane =
+            fleetControlPlanes[repo.fullName]
+            ?? SharedRepoControlPlane(
+              inner: GitHubClient(owner: repo.owner, repo: repo.name, token: token))
+          fleetControlPlanes[repo.fullName] = plane
           let fleet = FleetConfig(
-            owner: repo.owner, repo: repo.name, labels: labels, desiredCount: count)
+            owner: repo.owner, repo: repo.name, labels: labels, maxRunners: count)
           let orch = RunnerOrchestrator(
-            controlPlane: client, factory: factory, config: fleet, os: os)
+            controlPlane: plane, factory: factory, config: fleet, os: os, budget: budget)
           orch.onChange = { [weak self] in self?.sync() }
           orch.onRunFinished = { [weak self] record in self?.recordRun(record) }
           let key = "\(repo.fullName)#\(os.rawValue)"
@@ -709,24 +807,18 @@ final class AppState: ObservableObject {
               repo: combo.repo, os: .macOS, factory: factory,
               labels: combo.config.labels, count: combo.config.count)
           case .windows:
-            guard let windowsFactory else { continue }
-            // Grant up to this combo's requested count, bounded by the RAM
-            // budget's remaining headroom (shared across every Windows combo).
-            // 0 left ⇒ skip this combo (the status line reports the shortfall).
-            let grant = min(combo.config.count, maxWindowsVMs - windowsVMsStamped)
-            guard grant > 0 else { continue }
-            windowsVMsStamped += grant
+            // The combo keeps its full requested cap; the shared budget bounds
+            // LIVE VMs at provision time (0 ⇒ the host can't fit even one — the
+            // status line says so and the combo is skipped).
+            guard let windowsFactory, maxWindowsVMs > 0 else { continue }
             await addOrchestrator(
               repo: combo.repo, os: .windows, factory: windowsFactory,
-              labels: combo.config.labels, count: grant)
+              labels: combo.config.labels, count: combo.config.count)
           case .linux:
-            guard let linuxFactory else { continue }
-            let grant = min(combo.config.count, maxLinux - linuxStamped)
-            guard grant > 0 else { continue }
-            linuxStamped += grant
+            guard let linuxFactory, maxLinux > 0 else { continue }
             await addOrchestrator(
               repo: combo.repo, os: .linux, factory: linuxFactory,
-              labels: combo.config.labels, count: grant)
+              labels: combo.config.labels, count: combo.config.count)
           }
         }
         guard fleetEpoch == myEpoch else {
@@ -737,32 +829,69 @@ final class AppState: ObservableObject {
         errorBanner = nil  // came online cleanly — clear any prior blocking error
         pendingRestart = false  // the live fleet now matches the plan
         sync()
-        let live = orchestrators.values.reduce(0) { $0 + $1.runners.count }
-        let repoCount = Set(combos.map { $0.repo.fullName }).count
-        statusMessage =
-          live == 0
-          ? "Online, but no runners came up — check repo permissions / labels."
-          : "Online: \(live) runner\(live == 1 ? "" : "s") across \(repoCount) repo\(repoCount == 1 ? "" : "s")."
-        // If the RAM budget kept some Windows runners from coming up, say so
-        // (silent under-provisioning reads as a bug). Denominator = total Windows
-        // runners the plan asked for (Σ per-combo counts), not all repos.
-        if windowsFactory != nil, windowsVMsStamped < windowsRequested {
+        // Scale-from-zero: ZERO live runners is the NORMAL armed state — runners
+        // are provisioned when a matching job is queued and torn down after.
+        // Count ARMED repos (orchestrators actually created), not configured
+        // ones — a repo whose every combo was skipped isn't being watched, and
+        // the header (watchedRepos-based) must not contradict this strip. When
+        // they differ, say so: "1 of 2" + the skip reasons appended below.
+        let configuredCount = Set(combos.map { $0.repo.fullName }).count
+        let armedCount = Set(fleetRepo.values).count
+        let scopeText =
+          plan.isAllRepos
+          ? "all repos"
+          : armedCount < configuredCount
+            ? "\(armedCount) of \(configuredCount) repos"
+            : "\(configuredCount) repo\(configuredCount == 1 ? "" : "s")"
+        statusMessage = "Online — watching \(scopeText) for queued jobs; runners start on demand."
+        // If the host budget caps concurrency below what the plan could ask
+        // for, say so up front (a silent cap reads as a bug when a burst of
+        // jobs only gets some runners). Denominator = Σ per-combo caps.
+        if windowsFactory != nil, maxWindowsVMs < windowsRequested {
           let why =
             maxWindowsVMs == 0
             ? "this Mac's RAM can't safely run a \(perVMGB) GB Windows VM"
             : "RAM budget allows \(maxWindowsVMs) at once"
           statusMessage =
             (statusMessage ?? "")
-            + " Windows runners limited to \(windowsVMsStamped)/\(windowsRequested) (\(why))."
+            + " Windows capped at \(maxWindowsVMs)/\(windowsRequested) (\(why))."
         }
-        if linuxFactory != nil, linuxStamped < linuxRequested {
+        if linuxFactory != nil, maxLinux < linuxRequested {
           let why =
             maxLinux == 0
             ? "this Mac can't safely run a Linux container"
             : "capacity allows \(maxLinux) at once"
           statusMessage =
             (statusMessage ?? "")
-            + " Linux runners limited to \(linuxStamped)/\(linuxRequested) (\(why))."
+            + " Linux capped at \(maxLinux)/\(linuxRequested) (\(why))."
+        }
+        // All-repos discovery wants a platform that can't arm (not set up, or
+        // budget 0) → say so. Without this, a queued Windows job in a
+        // discovered repo would just silently never start — explicit combos
+        // get the messages below, discovery-only demand got nothing.
+        if plan.isAllRepos {
+          for os: RunnerOS in [.windows, .linux]
+          where discoveryPlatforms.contains(os.rawValue) && fleetFactories[os] == nil {
+            let why: String
+            switch os {
+            case .windows:
+              why =
+                windowsFactory == nil
+                ? (windowsImageReady
+                  ? "install VMware Fusion (Settings → Windows)"
+                  : "build the base image (Settings → Windows)")
+                : "this Mac's RAM can't safely run a Windows VM"
+            case .linux:
+              why =
+                linuxFactory == nil
+                ? "set up the container runtime (Settings → Linux)"
+                : "this Mac can't safely run a Linux container"
+            default:
+              continue
+            }
+            statusMessage =
+              (statusMessage ?? "") + " All-repos \(os.displayName) discovery off — \(why)."
+          }
         }
         // A Windows combo was enabled but no base image / Fusion → say so instead
         // of silently skipping it.
@@ -785,6 +914,7 @@ final class AppState: ObservableObject {
           }
           statusMessage = (statusMessage ?? "") + " Linux skipped — \(detail)."
         }
+        startDiscoveryIfNeeded(token: token, epoch: myEpoch)
       } catch {
         guard fleetEpoch == myEpoch else { return }
         reportBlockingError("Failed to start: \(error.localizedDescription)")
@@ -804,16 +934,36 @@ final class AppState: ObservableObject {
   func goOfflineAndWait() async {
     guard !orchestrators.isEmpty || state != .offline else { return }
     fleetEpoch += 1 // invalidate any in-flight goOnline
+    discoveryTask?.cancel()
+    discoveryTask = nil
     state = .stopping
     sync()
-    for orch in orchestrators.values { await orch.stop() }
+    // Stop fleets concurrently: under all-repos discovery there can be many
+    // orchestrators, each stop() awaiting per-runner deregister calls — serial
+    // teardown could overrun quit's 6 s deadline. Everything stays
+    // main-actor-isolated; only the network waits overlap.
+    let stops = orchestrators.values.map { orch in
+      Task { @MainActor in await orch.stop() }
+    }
+    for stop in stops { await stop.value }
     orchestrators.removeAll()
     fleetOS.removeAll()
     fleetRepo.removeAll()
+    fleetFactories.removeAll()
+    fleetBudget = nil
+    discoveredKeys.removeAll()
+    discoveryQuietScans.removeAll()
+    fleetControlPlanes.removeAll()
+    sweptDiscoveredRepos.removeAll()
     // Each run wipes its own working copy; sweep again defensively.
     HostCleanup.purgeRuns()
     runners = []
     busyRunnerNames = []
+    repoQueuedJobs = [:]
+    watchedRepos = []
+    repoPollFailing = []
+    repoWaitingForCapacity = []
+    repoLaunchFailure = [:]
     pendingRestart = false  // nothing live to be out of sync with
     errorBanner = nil  // a prior blocking error is moot once we're cleanly offline
     state = .offline
@@ -825,6 +975,162 @@ final class AppState: ObservableObject {
     guard state == .offline else { statusMessage = "Go offline first."; return }
     HostCleanup.purgeAll()
     statusMessage = "Removed the cached agent and all run files."
+  }
+
+  // MARK: All-repos discovery (scale-from-zero across every admin repo)
+
+  /// While online with the plan's ALL-REPOS scope on, periodically scan the
+  /// user's admin repos for queued jobs the DEFAULT platform configs could
+  /// serve, lazily creating an orchestrator per matching `(repo, OS)` — and
+  /// reaping it once its repo's queue goes quiet. Explicitly-configured repos
+  /// are excluded: their own combos already poll.
+  private func startDiscoveryIfNeeded(token: String, epoch myEpoch: Int) {
+    discoveryTask?.cancel()
+    discoveryTask = nil
+    guard plan.isAllRepos else { return }
+    // Snapshot the plan for this online generation: discovery's match set and
+    // seeds must stay consistent with the factories goOnline armed. Defaults
+    // edited while online are STAGED (noteDefaultsEdit → restart bar), not
+    // half-applied to a live scan.
+    let planSnapshot = plan
+    discoveryTask = Task { [weak self] in
+      while !Task.isCancelled {
+        await self?.discoveryScan(token: token, plan: planSnapshot, epoch: myEpoch)
+        try? await Task.sleep(nanoseconds: 60_000_000_000)
+      }
+    }
+  }
+
+  private func discoveryScan(token: String, plan: FleetPlan, epoch myEpoch: Int) async {
+    guard fleetEpoch == myEpoch, state == .online else { return }
+    // Refresh the admin-repo list at most every 10 min — the lister sorts by
+    // recent push, so the head of the list is the active tail of the account.
+    if availableRepos.isEmpty
+      || Date().timeIntervalSince(discoveryRepoListRefreshedAt) > 600
+    {
+      if let repos = try? await GitHubRepoLister(token: token).listAdminRepos() {
+        guard fleetEpoch == myEpoch, state == .online else { return }
+        availableRepos = repos
+        discoveryRepoListRefreshedAt = Date()
+      }
+    }
+    let explicit = Set(plan.repos.map { $0.repo.fullName })
+    // Bound the sweep to the 50 most recently pushed repos: a queued job
+    // implies fresh activity, so the active tail is where demand appears, and
+    // the bound keeps worst-case quota predictable (idle 304s are free anyway).
+    let candidates = Array(availableRepos.filter { !explicit.contains($0.fullName) }.prefix(50))
+    var matchedKeys: Set<String> = []
+    // Repos whose queue poll FAILED this scan: unknown, not quiet — their
+    // discovered orchestrators must hold (the same failed-poll-HOLD rule the
+    // orchestrator's own loop follows), not march toward the quiet reap.
+    var unknownRepos: Set<String> = []
+    for repo in candidates {
+      guard fleetEpoch == myEpoch, state == .online, !Task.isCancelled else { return }
+      // The repo's SHARED control plane (created here for never-seen repos):
+      // the probe and any orchestrators it spawns reuse one queued-jobs fetch
+      // per tick window, and its ETag store makes idle re-polls free.
+      let plane =
+        fleetControlPlanes[repo.fullName]
+        ?? SharedRepoControlPlane(
+          inner: GitHubClient(owner: repo.owner, repo: repo.name, token: token))
+      fleetControlPlanes[repo.fullName] = plane
+      let queued: [[String]]
+      do {
+        queued = try await plane.listQueuedJobLabels()
+      } catch {
+        unknownRepos.insert(repo.fullName)
+        continue
+      }
+      guard !queued.isEmpty else { continue }
+      guard fleetEpoch == myEpoch, state == .online else { return }
+      for os in plan.discoveryMatches(for: queued) {
+        let key = "\(repo.fullName)#\(os.rawValue)"
+        matchedKeys.insert(key)
+        guard orchestrators[key] == nil, let factory = fleetFactories[os],
+          let budget = fleetBudget
+        else { continue }
+        // First touch of a discovered repo: sweep prior-session crash ghosts —
+        // the analog of goOnline's explicit-repo sweep, which never covers
+        // repos outside the plan. Gated to BEFORE the repo's first orchestrator
+        // exists (a prefix sweep with live sibling runners would deregister
+        // them out from under their combo).
+        if !sweptDiscoveredRepos.contains(repo.fullName),
+          !fleetRepo.values.contains(repo.fullName)
+        {
+          sweptDiscoveredRepos.insert(repo.fullName)
+          await deregisterOrphanRunners(plane, includeOfflineMactionsRunners: true)
+          guard fleetEpoch == myEpoch, state == .online else { return }
+        }
+        let seedConfig = plan.seed(for: os)
+        let fleet = FleetConfig(
+          owner: repo.owner, repo: repo.name, labels: seedConfig.labels,
+          maxRunners: seedConfig.count)
+        let orch = RunnerOrchestrator(
+          controlPlane: plane, factory: factory, config: fleet, os: os, budget: budget)
+        orch.onChange = { [weak self] in self?.sync() }
+        orch.onRunFinished = { [weak self] record in self?.recordRun(record) }
+        orchestrators[key] = orch
+        fleetOS[key] = os
+        fleetRepo[key] = repo.fullName
+        discoveredKeys.insert(key)
+        await orch.start()
+        // goOffline can land DURING start() — its teardown snapshot won't
+        // include an orchestrator added after it ran, so roll this one back
+        // ourselves or a live runner survives "Offline"/quit. The identity
+        // check matters: stop() suspends, and a full goOffline→goOnline cycle
+        // can re-create the SAME key with a NEW orchestrator before we resume —
+        // blindly nil-ing the key would orphan the new generation's fleet.
+        guard fleetEpoch == myEpoch, state == .online else {
+          await orch.stop()
+          if orchestrators[key] === orch {
+            orchestrators[key] = nil
+            fleetOS[key] = nil
+            fleetRepo[key] = nil
+          }
+          discoveredKeys.remove(key)
+          discoveryQuietScans[key] = nil
+          return
+        }
+      }
+    }
+    // Reap discovered orchestrators whose repo went quiet — the decision per
+    // key is the pure, unit-tested `discoveryReapDecision`: failed polls HOLD,
+    // demand (this scan's match, the orchestrator's OWN last poll — which also
+    // covers repos that fell out of the candidate window — or live runners)
+    // RESETS, and only 2 consecutive genuinely-quiet scans reap.
+    for key in Array(discoveredKeys) {
+      guard fleetEpoch == myEpoch, state == .online else { return }
+      guard let orch = orchestrators[key] else {
+        discoveredKeys.remove(key)
+        discoveryQuietScans[key] = nil
+        continue
+      }
+      let repoName = fleetRepo[key] ?? ""
+      let decision = discoveryReapDecision(
+        matched: matchedKeys.contains(key) || orch.demand.queuedMatching > 0,
+        // "Unknown" comes from EITHER probe: this scan's (unknownRepos) or the
+        // orchestrator's own last poll — which also covers repos that fell out
+        // of the candidate window and were not probed at all this scan.
+        pollFailed: unknownRepos.contains(repoName) || orch.demand.lastPollFailed,
+        liveRunners: orch.runners.count,
+        quietScans: discoveryQuietScans[key] ?? 0)
+      switch decision {
+      case .hold:
+        continue
+      case .reset:
+        discoveryQuietScans[key] = 0
+      case .countQuiet(let quietScans):
+        discoveryQuietScans[key] = quietScans
+      case .reap:
+        await orch.stop()
+        orchestrators[key] = nil
+        fleetOS[key] = nil
+        fleetRepo[key] = nil
+        discoveredKeys.remove(key)
+        discoveryQuietScans[key] = nil
+        sync()
+      }
+    }
   }
 
   // MARK: Windows runner (opt-in)
@@ -1713,13 +2019,16 @@ final class AppState: ObservableObject {
   /// online runner. Cheap: one `listRunners` per selected repo. Driven by the
   /// Runners pane's `.task` while it's visible; clears itself when offline.
   func refreshRunnerBusy() async {
-    guard state == .online, let token = TokenStore.load() else {
+    guard state == .online, TokenStore.load() != nil else {
       if !busyRunnerNames.isEmpty { busyRunnerNames = [] }
       return
     }
     var busy: Set<String> = []
-    for repo in selectedRepos {
-      let client = GitHubClient(owner: repo.owner, repo: repo.name, token: token)
+    // Poll every repo with a live orchestrator — fleetRepo covers the explicit
+    // plan AND all-repos discovered fleets (whose runners would otherwise never
+    // show the activity ring).
+    for repoName in Set(fleetRepo.values) {
+      guard let client = client(forRepo: repoName) else { continue }
       if let remote = try? await client.listRunners() {
         for runner in remote where runner.busy { busy.insert(runner.name) }
       }
@@ -1758,6 +2067,10 @@ final class AppState: ObservableObject {
     // orch.lastError onto statusMessage on every change — that clobbered the
     // status line and made a single transient error look permanent.
     var rows: [FleetRunnerRow] = []
+    var demand: [String: Int] = [:]
+    var pollFailing: Set<String> = []
+    var waitingCapacity: Set<String> = []
+    var launchFailures: [String: String] = [:]
     for (key, orch) in orchestrators {
       let os = fleetOS[key] ?? .macOS
       // Map back to the bare repo via fleetRepo (the OS is conveyed by the row's
@@ -1766,7 +2079,19 @@ final class AppState: ObservableObject {
       for runner in orch.runners {
         rows.append(FleetRunnerRow(os: os, repoFullName: repoName, runner: runner))
       }
+      demand[repoName, default: 0] += orch.demand.queuedMatching
+      if orch.demand.lastPollFailed { pollFailing.insert(repoName) }
+      if orch.demand.waitingForCapacity { waitingCapacity.insert(repoName) }
+      if orch.launchFailing, let error = orch.lastError {
+        launchFailures[repoName] = error
+      }
     }
     runners = rows.sorted { $0.id < $1.id }
+    if demand != repoQueuedJobs { repoQueuedJobs = demand }
+    let watched = Set(fleetRepo.values)
+    if watched != watchedRepos { watchedRepos = watched }
+    if pollFailing != repoPollFailing { repoPollFailing = pollFailing }
+    if waitingCapacity != repoWaitingForCapacity { repoWaitingForCapacity = waitingCapacity }
+    if launchFailures != repoLaunchFailure { repoLaunchFailure = launchFailures }
   }
 }

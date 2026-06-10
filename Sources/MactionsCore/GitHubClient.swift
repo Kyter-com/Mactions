@@ -36,14 +36,19 @@ private final class RedirectAuthStripper: NSObject, URLSessionTaskDelegate, @unc
 
 /// A minimal workflow-run summary — just enough to find the run that contains
 /// the job our ephemeral runner executed (we scan recent runs by creation time).
+/// `updatedAt` matters for the queued-jobs poll: a RE-RUN keeps the original
+/// `created_at` and bumps `updated_at` when its jobs re-queue, so freshness
+/// filters must key on the latest of the two.
 public struct WorkflowRunSummary: Decodable, Sendable, Equatable {
   public let id: Int
   public let createdAt: Date?
+  public let updatedAt: Date?
   public let status: String?
 
   enum CodingKeys: String, CodingKey {
     case id
     case createdAt = "created_at"
+    case updatedAt = "updated_at"
     case status
   }
 }
@@ -67,6 +72,10 @@ public struct WorkflowJob: Decodable, Sendable, Equatable, Identifiable {
   public let name: String
   public let status: String  // queued | in_progress | completed
   public let conclusion: String?  // success | failure | cancelled | skipped | null
+  /// The job's `runs-on` label set — what decides which runner it can route to
+  /// (job labels must all be present on the runner). Optional only for decoding
+  /// safety; GitHub always sends it.
+  public let labels: [String]?
   public let runnerName: String?
   public let runnerId: Int?
   public let htmlURL: String?
@@ -75,7 +84,7 @@ public struct WorkflowJob: Decodable, Sendable, Equatable, Identifiable {
   public let steps: [WorkflowStep]?
 
   enum CodingKeys: String, CodingKey {
-    case id, name, status, conclusion, steps
+    case id, name, status, conclusion, steps, labels
     case runId = "run_id"
     case runnerName = "runner_name"
     case runnerId = "runner_id"
@@ -85,12 +94,51 @@ public struct WorkflowJob: Decodable, Sendable, Equatable, Identifiable {
   }
 }
 
+/// GitHub's routing rule for `runs-on`: labels are cumulative, so a job can run
+/// on a runner iff EVERY job label is present on the runner (extra runner
+/// labels are fine). Matching is case-insensitive, like GitHub's. An empty job
+/// label set never routes to a self-hosted runner.
+public func jobLabelsMatchRunner(job: [String], runner: [String]) -> Bool {
+  guard !job.isEmpty else { return false }
+  let runnerSet = Set(runner.map { $0.lowercased() })
+  return job.allSatisfy { runnerSet.contains($0.lowercased()) }
+}
+
+/// Thread-safe ETag store for the polled GET endpoints. A 304 response is FREE
+/// against the primary rate limit (GitHub docs; verified live 2026-06-10), so
+/// the queued-jobs poll attaches `If-None-Match` and replays the cached body on
+/// 304 — an idle fleet polls at effectively zero quota cost.
+final class ETagStore: @unchecked Sendable {
+  private let lock = NSLock()
+  private var entries: [String: (etag: String, body: Data)] = [:]
+
+  func entry(for key: String) -> (etag: String, body: Data)? {
+    lock.lock()
+    defer { lock.unlock() }
+    return entries[key]
+  }
+
+  func set(etag: String, body: Data, for key: String) {
+    lock.lock()
+    defer { lock.unlock() }
+    // Crude bound: the polling paths use 2 runs-list keys + ≤30 per-run jobs
+    // keys per client, so eviction should never fire in practice — it only
+    // guards a leak.
+    if entries.count > 256, entries[key] == nil { entries.removeAll() }
+    entries[key] = (etag, body)
+  }
+}
+
 /// The slice of the GitHub Actions API the orchestrator needs. A protocol so
 /// tests can drive the orchestrator with a fake (no network).
 public protocol RunnerControlPlane: Sendable {
   func generateJITConfig(name: String, labels: [String]) async throws -> JITConfig
   func listRunners() async throws -> [RemoteRunner]
   func deleteRunner(id: Int) async throws
+  /// The label sets of every job currently QUEUED in this repo — the demand
+  /// signal for scale-from-zero. Throws on any fetch failure so the caller can
+  /// HOLD fleet state rather than mistake a transient error for an empty queue.
+  func listQueuedJobLabels() async throws -> [[String]]
 }
 
 /// Talks to `api.github.com` for a single `owner/repo`. Repo-level runners,
@@ -101,6 +149,9 @@ public struct GitHubClient: RunnerControlPlane {
   public let token: String
   public var apiBase = URL(string: "https://api.github.com")!
   public var session: URLSession = .shared
+  /// Shared across copies of this struct (it's a reference): the queued-jobs
+  /// poll reuses one store per client so idle 304s stay free all session.
+  let etags = ETagStore()
 
   public init(owner: String, repo: String, token: String) {
     self.owner = owner
@@ -155,7 +206,11 @@ public struct GitHubClient: RunnerControlPlane {
       resolvingAgainstBaseURL: false
     )!
     components.queryItems = [URLQueryItem(name: "per_page", value: "100")]
-    return request(url: components.url!, method: "GET")
+    var req = request(url: components.url!, method: "GET")
+    // Busy-ness drives trim/refresh decisions — a URLCache-stale `busy=false`
+    // could reap a runner that just took a job. Always hit the network.
+    req.cachePolicy = .reloadIgnoringLocalCacheData
+    return req
   }
 
   public func deleteRunnerRequest(id: Int) -> URLRequest {
@@ -198,13 +253,22 @@ public struct GitHubClient: RunnerControlPlane {
     return decoder
   }
 
-  public func listWorkflowRunsRequest(perPage: Int = 40) -> URLRequest {
+  /// `status` filters at the RUN level (`queued` / `in_progress` / …). NOTE
+  /// (verified live 2026-06-10): run-level status is NOT a reliable queued-jobs
+  /// signal on its own — an `in_progress` run can still contain individually
+  /// queued jobs, and run status flaps — which is why `listQueuedJobLabels`
+  /// fetches BOTH states and filters on job-level status. Status-filtered
+  /// requests bypass URLCache so our explicit ETag handling is deterministic.
+  public func listWorkflowRunsRequest(perPage: Int = 40, status: String? = nil) -> URLRequest {
     var components = URLComponents(
       url: apiBase.appendingPathComponent("repos/\(owner)/\(repo)/actions/runs"),
       resolvingAgainstBaseURL: false)!
-    components.queryItems = [URLQueryItem(name: "per_page", value: String(perPage))]
+    var items = [URLQueryItem(name: "per_page", value: String(perPage))]
+    if let status { items.append(URLQueryItem(name: "status", value: status)) }
+    components.queryItems = items
     var req = request(url: components.url!, method: "GET")
     req.timeoutInterval = 20  // bound each call so a slow network can't stall findJob's loop
+    if status != nil { req.cachePolicy = .reloadIgnoringLocalCacheData }
     return req
   }
 
@@ -227,15 +291,77 @@ public struct GitHubClient: RunnerControlPlane {
     base("repos/\(owner)/\(repo)/actions/jobs/\(jobId)/logs", method: "GET")
   }
 
-  public func listRecentWorkflowRuns(perPage: Int = 40) async throws -> [WorkflowRunSummary] {
+  public func listRecentWorkflowRuns(perPage: Int = 40, status: String? = nil) async throws
+    -> [WorkflowRunSummary]
+  {
     struct Response: Decodable { let workflow_runs: [WorkflowRunSummary] }
-    let data = try await send(listWorkflowRunsRequest(perPage: perPage))
+    let data = try await send(
+      listWorkflowRunsRequest(perPage: perPage, status: status),
+      etagKey: status.map { "runs?status=\($0)" })
     return try Self.actionsDecoder().decode(Response.self, from: data).workflow_runs
   }
 
-  public func listJobs(runId: Int) async throws -> [WorkflowJob] {
+  /// The label sets of every job currently QUEUED in this repo.
+  ///
+  /// Job-level status is the only reliable signal (verified live 2026-06-10
+  /// against the real API): a run whose overall status is `in_progress` can
+  /// still contain individually queued jobs (matrix legs, `needs:` chains), and
+  /// run-level status flaps in both directions — so we list jobs for runs in
+  /// BOTH states and keep only `job.status == "queued"`.
+  ///
+  /// Freshness filter: runs whose LATEST activity (`max(created, updated)`) is
+  /// older than 25 h are skipped — GitHub fails any job queued > 24 h, so they
+  /// are zombies (observed live: months-old runs stuck in the queued listing).
+  /// Keying on `updated_at` too is what keeps RE-RUNS visible: a re-run reuses
+  /// the run id and original `created_at`, but re-queuing its jobs bumps
+  /// `updated_at`.
+  ///
+  /// Bounds (deliberate, laptop-scale): one page of 100 runs per state, and
+  /// jobs fetched for at most the 30 freshest active runs (each costs one
+  /// request; ETags make unchanged re-polls free). A backlog deeper than that
+  /// is beyond what one Mac serves anyway — the next tick catches up.
+  ///
+  /// THROWS on any fetch failure — the orchestrator HOLDS the fleet on a failed
+  /// poll, because a transient API error must not read as "queue is empty" and
+  /// scale a fleet to zero out from under pending work.
+  public func listQueuedJobLabels() async throws -> [[String]] {
+    var runs: [WorkflowRunSummary] = []
+    runs += try await listRecentWorkflowRuns(perPage: 100, status: "queued")
+    runs += try await listRecentWorkflowRuns(perPage: 100, status: "in_progress")
+    let earliest = Date().addingTimeInterval(-25 * 3600)
+    var seen = Set<Int>()
+    let active =
+      runs
+      .filter { run in
+        max(run.createdAt ?? .distantPast, run.updatedAt ?? .distantPast) >= earliest
+          && seen.insert(run.id).inserted
+      }
+      .sorted {
+        max($0.createdAt ?? .distantPast, $0.updatedAt ?? .distantPast)
+          > max($1.createdAt ?? .distantPast, $1.updatedAt ?? .distantPast)
+      }
+    var labelSets: [[String]] = []
+    for run in active.prefix(30) {
+      for job in try await listJobs(runId: run.id, etagged: true) where job.status == "queued" {
+        labelSets.append(job.labels ?? [])
+      }
+    }
+    return labelSets
+  }
+
+  /// `etagged` opts the call into the conditional-request store — used by the
+  /// queued-jobs poll, where most runs are unchanged between ticks and the 304
+  /// replay keeps the per-run cost off the rate limit. Etagged calls ALSO
+  /// bypass URLCache (a 60s-stale cached jobs list would re-show an already-
+  /// picked-up job as queued → a phantom VM per pickup); the dashboard's
+  /// findJob/recentJobs paths keep the default policy — forcing ~30 full-quota
+  /// requests onto that 4s UI poll would burn the rate limit for freshness the
+  /// step checklist doesn't need.
+  public func listJobs(runId: Int, etagged: Bool = false) async throws -> [WorkflowJob] {
     struct Response: Decodable { let jobs: [WorkflowJob] }
-    let data = try await send(listJobsRequest(runId: runId))
+    var req = listJobsRequest(runId: runId)
+    if etagged { req.cachePolicy = .reloadIgnoringLocalCacheData }
+    let data = try await send(req, etagKey: etagged ? "jobs/\(runId)" : nil)
     return try Self.actionsDecoder().decode(Response.self, from: data).jobs
   }
 
@@ -321,11 +447,25 @@ public struct GitHubClient: RunnerControlPlane {
     return nil
   }
 
+  /// `etagKey` opts a GET into conditional requests: we attach `If-None-Match`
+  /// from the store and replay the cached body on 304 (free against the primary
+  /// rate limit). Non-polled calls pass nil and behave exactly as before.
   @discardableResult
-  private func send(_ request: URLRequest, allowEmpty: Bool = false) async throws -> Data {
+  private func send(_ request: URLRequest, allowEmpty: Bool = false, etagKey: String? = nil)
+    async throws -> Data
+  {
+    var request = request
+    let cached = etagKey.flatMap { etags.entry(for: $0) }
+    if let cached { request.setValue(cached.etag, forHTTPHeaderField: "If-None-Match") }
     let (data, response) = try await session.data(for: request)
-    if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-      throw ClientError.http(http.statusCode, String(data: data, encoding: .utf8) ?? "")
+    if let http = response as? HTTPURLResponse {
+      if http.statusCode == 304, let cached { return cached.body }
+      guard (200..<300).contains(http.statusCode) else {
+        throw ClientError.http(http.statusCode, String(data: data, encoding: .utf8) ?? "")
+      }
+      if let etagKey, let etag = http.value(forHTTPHeaderField: "ETag") {
+        etags.set(etag: etag, body: data, for: etagKey)
+      }
     }
     return data
   }

@@ -2,15 +2,16 @@ import Foundation
 
 /// How many concurrent Win11-ARM VMs the host can run without thrashing.
 ///
-/// Each per-job runner is a full VM (default 8 GB RAM / 4 vCPU), so N selected
-/// repos each booting one simultaneously would otherwise exhaust physical RAM
-/// and lag the whole Mac. This is the pure, unit-testable budget the app uses to
-/// cap how many Windows fleets it stamps on go-online.
+/// Each per-job runner is a full VM (default 8 GB RAM / 4 vCPU), so N combos
+/// each booting one simultaneously would otherwise exhaust physical RAM and lag
+/// the whole Mac. This is the pure, unit-testable formula go-online uses to
+/// seed the shared `HostBudget` ledger's Windows ceiling — capacity is spent
+/// live at provision time and refunded on exit, not granted per fleet up front.
 ///
 /// SCOPE (important): this bounds the **Windows VMs** in isolation — `reservedGB`
 /// is a flat allowance for macOS + the app + IDLE macOS runner agents, NOT a
 /// per-active-macOS-job reserve. A macOS runner mid-job can consume several GB,
-/// so on a small Mac with many repos / high `runnersPerRepo` the macOS fleet
+/// so on a small Mac with many repos / high per-combo max counts the macOS fleet
 /// plus the budgeted Windows VMs can still exceed physical RAM. The budget keeps
 /// Windows VMs from thrashing the host on their own; it does not model total
 /// fleet RAM. (`8 GB` per VM is the default the base-build scripts also use; the

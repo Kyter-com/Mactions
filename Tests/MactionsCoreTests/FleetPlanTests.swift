@@ -207,4 +207,47 @@ final class FleetPlanTests: XCTestCase {
     let plan = RepoPlan(repo: RepoRef(owner: "a", name: "b"))
     XCTAssertEqual(plan.summary(), "No platforms — open Configure")
   }
+
+  // MARK: All-repos scope
+
+  /// A plan persisted BEFORE the `allRepos` field existed must decode unchanged
+  /// (the field is optional on purpose), and the flag must round-trip once set.
+  func testAllReposDecodesCompatAndRoundTrips() throws {
+    let legacy = Data(
+      #"{"repos": [], "defaultMacOSLabels": ["self-hosted"], "defaultMacOSCount": 1, "defaultPlatforms": ["macOS"]}"#
+        .utf8)
+    let plan = try JSONDecoder().decode(FleetPlan.self, from: legacy)
+    XCTAssertFalse(plan.isAllRepos)
+
+    var enabled = plan
+    enabled.allRepos = true
+    let decoded = try JSONDecoder().decode(
+      FleetPlan.self, from: JSONEncoder().encode(enabled))
+    XCTAssertTrue(decoded.isAllRepos)
+  }
+
+  /// Discovery routes a queued job to the default platforms whose SEED labels
+  /// satisfy the job's `runs-on` set — and only to platforms the defaults
+  /// actually enable.
+  func testDiscoveryMatchesRoutesByDefaultPlatformSeeds() {
+    let plan = FleetPlan(defaultPlatforms: ["macOS", "linux"], allRepos: true)
+
+    // Matches the macOS seed labels (subset, case-insensitive).
+    XCTAssertEqual(
+      plan.discoveryMatches(for: [["self-hosted", "macos"]]), [.macOS])
+    // Matches the Linux seed (which carries ARM64).
+    XCTAssertEqual(
+      plan.discoveryMatches(for: [["self-hosted", "Linux", "ARM64"]]), [.linux])
+    // A Windows job can't route anywhere: windows isn't a default platform.
+    XCTAssertEqual(
+      plan.discoveryMatches(for: [["self-hosted", "Windows", "mactions"]]), [])
+    // Hosted-runner jobs route nowhere.
+    XCTAssertEqual(plan.discoveryMatches(for: [["ubuntu-latest"]]), [])
+    // One sweep can match several platforms at once.
+    XCTAssertEqual(
+      plan.discoveryMatches(for: [
+        ["self-hosted", "macOS", "mactions"], ["self-hosted", "Linux", "ARM64", "mactions"],
+      ]),
+      [.macOS, .linux])
+  }
 }

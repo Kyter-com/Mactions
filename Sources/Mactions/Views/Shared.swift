@@ -427,16 +427,29 @@ struct ChipRow: View {
 // MARK: - StatusStrip
 
 /// The thin bottom strip on the primary window: the live fleet summary on the
-/// left, and a budget-cap note on the right shown ONLY when a platform is
-/// actually capped (the contextual home for what the old capacity chips carried).
+/// left; on the right a LIVE budget-pressure readout (e.g. "Windows VMs 1/2",
+/// orange at the ceiling) and/or a budget-cap warning shown ONLY when a
+/// platform is actually capped (the contextual home for the old capacity chips).
 struct StatusStrip: View {
   let message: String
   var capNote: String?
+  /// Live "in use / max" readout; `isWarning` renders it in the cap vocabulary
+  /// (orange + triangle) when the pool is exhausted.
+  var liveNote: (text: String, isWarning: Bool)?
 
   var body: some View {
     HStack(spacing: MactionsTheme.Spacing.control) {
       Text(message).font(.caption).foregroundStyle(.secondary).lineLimit(1)
       Spacer(minLength: MactionsTheme.Spacing.control)
+      if let liveNote {
+        HStack(spacing: 4) {
+          if liveNote.isWarning {
+            Image(systemName: "exclamationmark.triangle.fill").font(.caption2)
+          }
+          Text(liveNote.text).font(.caption).monospacedDigit().lineLimit(1)
+        }
+        .foregroundStyle(liveNote.isWarning ? Color.orange : Color.secondary)
+      }
       if let capNote {
         HStack(spacing: 4) {
           Image(systemName: "exclamationmark.triangle.fill").font(.caption2)

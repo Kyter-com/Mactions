@@ -16,6 +16,7 @@ import SwiftUI
 struct DashboardView: View {
   @EnvironmentObject private var app: AppState
   @State private var tab: Tab? = .runners
+  @State private var confirmRestart = false
   /// The Runners grid selection — a repo header id (`owner/name`) or a runner
   /// child id (`owner/name#runner`). Lifted here so the Configure panel can bind
   /// to whichever repo is in focus. Selecting a repo opens its config on the
@@ -77,7 +78,7 @@ struct DashboardView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
       }
       Divider()
-      StatusStrip(message: statusText, capNote: capNote)
+      StatusStrip(message: statusText, capNote: capNote, liveNote: liveNote)
     }
     .frame(minWidth: 900, minHeight: 560)
     .onAppear {
@@ -118,16 +119,19 @@ struct DashboardView: View {
       .disabled(
         // The empty-combos gate only blocks GOING online — never disable "Go
         // offline" (you can disable every platform while online now, which would
-        // otherwise strand the fleet on).
-        (app.state == .offline && app.plan.enabledCombos().isEmpty)
+        // otherwise strand the fleet on). ALL-REPOS mode needs no explicit
+        // combos: discovery finds demand across every admin repo.
+        (app.state == .offline && app.plan.enabledCombos().isEmpty && !app.plan.isAllRepos)
           || app.windowsSetupBusy  // can't clone the base while it's being (re)built
           || app.state == .starting || app.state == .stopping)
       .help(
         app.windowsSetupBusy
           ? "Wait for the Windows base image to finish building before going online."
-          : app.plan.enabledCombos().isEmpty
+          : app.plan.enabledCombos().isEmpty && !app.plan.isAllRepos
             ? "Add a repo and select it on the left to enable a platform first."
-            : "Bring the configured runner fleet online / offline (⌘O).")
+            : app.state == .offline
+              ? "Start watching for queued jobs — runners start on demand (⌘O)."
+              : "Stop watching and tear down any live runners (⌘O).")
     }
     .padding(.horizontal, MactionsTheme.Spacing.section)
     .padding(.vertical, MactionsTheme.Spacing.control)
@@ -196,19 +200,35 @@ struct DashboardView: View {
   /// Shown while the live fleet's config has been edited but not yet applied —
   /// edits are allowed online and staged, and this is the one-click way to apply
   /// them (restart = go offline, then back online reading the fresh plan).
+  /// Restarting with LIVE runners is destructive (deregistration fails their
+  /// in-flight jobs on GitHub, and they are NOT re-queued), so it confirms
+  /// first — gated on `app.runners`, not `busyRunnerNames` (the busy poll only
+  /// runs while the Runners pane is visible; this bar shows on every tab).
   private var restartBar: some View {
     HStack(spacing: MactionsTheme.Spacing.tight) {
       Image(systemName: "arrow.triangle.2.circlepath").foregroundStyle(.orange)
       Text("Configuration changed — restart the fleet to apply.")
         .font(.callout).foregroundStyle(.orange)
       Spacer(minLength: MactionsTheme.Spacing.control)
-      Button("Restart fleet") { app.restartFleet() }
-        .controlSize(.small)
-        .disabled(app.state == .starting || app.state == .stopping)
+      Button("Restart fleet") {
+        if app.runners.isEmpty { app.restartFleet() } else { confirmRestart = true }
+      }
+      .controlSize(.small)
+      .disabled(app.state == .starting || app.state == .stopping)
     }
     .padding(.horizontal, MactionsTheme.Spacing.section)
     .padding(.vertical, MactionsTheme.Spacing.control)
     .background(Color.orange.opacity(0.12))
+    .confirmationDialog(
+      "Restart the fleet now?", isPresented: $confirmRestart, titleVisibility: .visible
+    ) {
+      Button("Restart and cancel running jobs", role: .destructive) { app.restartFleet() }
+      Button("Cancel", role: .cancel) {}
+    } message: {
+      Text(
+        "Restarting deregisters the live runners, and GitHub fails any job they are "
+          + "running. Failed jobs are not re-queued — re-run them from GitHub afterward.")
+    }
   }
 
   /// Shown when a runner base image is stale — the prominent dashboard analog of
@@ -244,8 +264,28 @@ struct DashboardView: View {
     case .starting: return "Starting…"
     case .stopping: return "Stopping…"
     case .online:
+      // Scale-from-zero: zero live runners is the NORMAL armed state — say
+      // "watching", not a runner count that reads like a failure to start.
       let n = app.runners.count
-      return "Online · \(n) runner\(n == 1 ? "" : "s")"
+      let queued = app.repoQueuedJobs.values.reduce(0, +)
+      if n == 0 {
+        // All-repos arms orchestrators LAZILY (per queued job, reaped when
+        // quiet), so a live count would flutter and undercount the scope.
+        if app.plan.isAllRepos {
+          return queued > 0 ? "Online · watching all repos · \(queued) queued"
+            : "Online · watching all repos"
+        }
+        let repos = app.watchedRepoCount
+        guard repos > 0 else {
+          // Combos were configured (the gate blocks otherwise) but every one
+          // was skipped — the status strip carries the "skipped — …" reason.
+          return "Online — nothing armed (see status below)"
+        }
+        let base = "Online · watching \(repos) repo\(repos == 1 ? "" : "s")"
+        return queued > 0 ? "\(base) · \(queued) queued" : base
+      }
+      let base = "Online · \(n) runner\(n == 1 ? "" : "s")"
+      return queued > 0 ? "\(base) · \(queued) queued" : base
     }
   }
 
@@ -260,15 +300,32 @@ struct DashboardView: View {
   }
 
   /// Bottom-strip right note: shown ONLY when Windows VMs are actually capped
-  /// below what the plan requests (the contextual home for the old budget chip).
+  /// below what the plan could demand (the contextual home for the old budget
+  /// chip). Compares the Σ of per-combo MAX counts — under scale-from-zero a
+  /// burst of queued jobs is what would hit this ceiling. All-repos discovery
+  /// draws on the same budget with no explicit combos, so a 0 budget must warn
+  /// whenever discovery could route Windows jobs here at all.
   private var capNote: String? {
     guard app.state == .online, app.windowsImageReady else { return nil }
-    let windowsCombos = app.plan.enabledCombos().filter { $0.os == .windows }.count
+    let requested = app.plan.enabledCombos().filter { $0.os == .windows }
+      .reduce(0) { $0 + $1.config.count }
+    let discoveryWantsWindows = app.plan.isAllRepos && app.isDefaultPlatform(.windows)
     let budget = app.capacity.windowsMaxConcurrentVMs
-    guard windowsCombos > budget else { return nil }
+    guard requested > budget || (discoveryWantsWindows && budget == 0) else { return nil }
     return budget == 0
       ? "Windows paused — not enough RAM for a VM"
       : "Windows VMs capped at \(budget) (RAM budget)"
+  }
+
+  /// Live budget-pressure readout: "Windows VMs n/max" whenever any are up —
+  /// orange at the ceiling, where a queued job is genuinely WAITING on
+  /// capacity. (capacity is computed over the published `runners`, so this
+  /// updates live with no extra plumbing.)
+  private var liveNote: (text: String, isWarning: Bool)? {
+    guard app.state == .online, app.capacity.liveWindowsRunners > 0 else { return nil }
+    let live = app.capacity.liveWindowsRunners
+    let max = app.capacity.windowsMaxConcurrentVMs
+    return ("Windows VMs \(live)/\(max)", live >= max)
   }
 }
 
@@ -295,13 +352,29 @@ private struct RunnersPane: View {
 
   private var groups: [RepoGroup] {
     let byRepo = Dictionary(grouping: app.runners, by: { $0.repoFullName })
-    return app.plan.repos.map { plan in
+    var seen = Set<String>()
+    var result = app.plan.repos.map { plan -> RepoGroup in
+      seen.insert(plan.repo.fullName)
       let rs = byRepo[plan.repo.fullName] ?? []
       let active = rs.filter { app.busyRunnerNames.contains($0.runner.id) }.count
       return RepoGroup(
         repo: plan.repo, summary: plan.summary(), enabledPlatforms: plan.enabledPlatforms,
         runners: rs, activeCount: active)
     }
+    // Repos picked up by ALL-REPOS discovery: ARMED orchestrators (watching /
+    // spinning up) and any runner rows, with no plan entry. They must be
+    // visible — an invisible fleet reads as a leak. Stable name order.
+    let discovered = Set(byRepo.keys).union(app.watchedRepos).subtracting(seen)
+    for repoName in discovered.sorted() {
+      guard let ref = RepoRef(fullName: repoName) else { continue }
+      let rs = byRepo[repoName] ?? []
+      let active = rs.filter { app.busyRunnerNames.contains($0.runner.id) }.count
+      result.append(
+        RepoGroup(
+          repo: ref, summary: "Discovered — all repositories", enabledPlatforms: [],
+          runners: rs, activeCount: active))
+    }
+    return result
   }
 
   var body: some View {
@@ -325,9 +398,26 @@ private struct RunnersPane: View {
 
   @ViewBuilder private var gridColumn: some View {
     VStack(spacing: 0) {
-      if app.plan.repos.isEmpty {
+      // Discovered (all-repos) groups can exist with an EMPTY explicit plan —
+      // the list must render whenever any group does, or watched fleets hide.
+      if app.plan.repos.isEmpty && groups.isEmpty {
         VStack(spacing: MactionsTheme.Spacing.section) {
-          if app.isSignedIn {
+          if app.isSignedIn, app.plan.isAllRepos {
+            DashboardEmptyState(
+              systemImage: "antenna.radiowaves.left.and.right",
+              title: "Watching all repositories",
+              message: app.state == .online
+                ? "No queued jobs discovered yet — a repo appears here the moment one of its jobs queues. Add a repository explicitly to pin its own settings."
+                : "All-repositories mode is on. Go online to start watching every repo you admin for queued jobs — or add a repository explicitly to pin its own settings.")
+            Button {
+              showAddRepo = true
+            } label: {
+              Label("Add repository…", systemImage: "plus")
+            }
+            .glassProminentButton()
+            .keyboardShortcut("n", modifiers: .command)
+            .disabled(app.state != .offline)
+          } else if app.isSignedIn {
             DashboardEmptyState(
               systemImage: "tray", title: "No repositories",
               message: "Add a repository to manage its self-hosted runners. Then pick a platform for it on the right.")
@@ -425,7 +515,17 @@ private struct RunnersPane: View {
       }
       // Decorative: the badge text + summary already convey runner state, so keep
       // the color-only dot out of VoiceOver rather than announcing a bare "image".
-      Circle().fill(hasRunners ? Color.green : Color.secondary).frame(width: 7, height: 7)
+      // Solid green = live runners; faded green = ARMED and watching (this repo
+      // actually has an orchestrator — global .online isn't enough, a skipped
+      // combo's repo is not watching anything); grey = offline / not armed.
+      Circle()
+        .fill(
+          hasRunners
+            ? Color.green
+            : (app.state == .online && app.watchedRepos.contains(group.repo.fullName)
+              ? Color.green.opacity(0.35) : Color.secondary)
+        )
+        .frame(width: 7, height: 7)
         .accessibilityHidden(true)
       VStack(alignment: .leading, spacing: 1) {
         Text(group.repo.name).font(.callout.weight(.medium)).lineLimit(1).truncationMode(.middle)
@@ -445,17 +545,54 @@ private struct RunnersPane: View {
         .accessibilityHidden(true)
       }
       if !badge(group).isEmpty {
-        Text(badge(group)).font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+        Text(badge(group)).font(.caption2).foregroundStyle(badgeColor(group)).monospacedDigit()
       }
     }
     .padding(.vertical, 2)
     .contentShape(Rectangle())
   }
 
+  /// Aggregate badge per repo. Under scale-from-zero an online repo with no
+  /// runners is healthy — it reads "watching" (or "N queued · starting…" while
+  /// runners spin up for detected demand) — and the failure states that would
+  /// make "starting…" a lie get their own words: budget exhaustion, repeated
+  /// launch deaths, and a failing queue poll (unknown ≠ quiet).
   private func badge(_ group: RepoGroup) -> String {
     let n = group.runners.count
-    if n == 0 { return app.state == .online ? "starting…" : "" }
-    return group.activeCount > 0 ? "\(n) · \(group.activeCount) active" : "\(n)"
+    let repoName = group.repo.fullName
+    let queued = app.repoQueuedJobs[repoName] ?? 0
+    if n == 0 {
+      guard app.state == .online else { return "" }
+      guard app.watchedRepos.contains(repoName) else {
+        // Configured but no orchestrator armed (image not built / budget 0) —
+        // the status strip carries the reason.
+        return "not armed"
+      }
+      if app.repoLaunchFailure[repoName] != nil {
+        return "\(queued) queued · runner failing to launch"
+      }
+      if app.repoWaitingForCapacity.contains(repoName) {
+        return "\(queued) queued · waiting for capacity"
+      }
+      if app.repoPollFailing.contains(repoName) { return "watching · poll failing" }
+      return queued > 0 ? "\(queued) queued · starting…" : "watching"
+    }
+    if group.activeCount > 0 { return "\(n) · \(group.activeCount) active" }
+    return queued > 0 ? "\(n) · \(queued) queued" : "\(n)"
+  }
+
+  /// Warning states read orange (the capNote vocabulary); everything else stays
+  /// secondary.
+  private func badgeColor(_ group: RepoGroup) -> Color {
+    let repoName = group.repo.fullName
+    guard app.state == .online, group.runners.isEmpty else { return .secondary }
+    if app.repoLaunchFailure[repoName] != nil
+      || app.repoWaitingForCapacity.contains(repoName)
+      || app.repoPollFailing.contains(repoName)
+    {
+      return .orange
+    }
+    return .secondary
   }
 
   // MARK: Right — the selected runner's live detail OR the repo's Configure panel
@@ -469,6 +606,25 @@ private struct RunnersPane: View {
     } else if let repoID = selectedRepoID, app.plan.repos.contains(where: { $0.id == repoID }) {
       // A repo is selected → configure its platforms, runner count, and labels.
       RepoInspector(repoID: repoID)
+    } else if let repoID = selectedRepoID, groups.contains(where: { $0.id == repoID }) {
+      // A DISCOVERED repo (all-repos mode): it runs on the default platform
+      // settings and has no per-repo config to edit until added explicitly.
+      // Name the repo and the offline gate: this panel only shows while
+      // online, where "Add repository" is disabled — and going offline clears
+      // the discovered row, so the user needs the name to find it again.
+      VStack(spacing: MactionsTheme.Spacing.section) {
+        DashboardEmptyState(
+          systemImage: "antenna.radiowaves.left.and.right", title: "Discovered repository",
+          message:
+            "All-repositories mode spun this up from a queued job using your default platform "
+            + "settings; its fleet retires when the repo goes quiet. Go offline, then add "
+            + "\(repoID) explicitly to customize platforms, max runners, and labels. "
+            + MactionsTheme.Copy.offlineToManageRepos)
+        if let launchError = app.repoLaunchFailure[repoID] {
+          Banner(launchError, severity: .warning, icon: "exclamationmark.triangle")
+            .padding(.horizontal, MactionsTheme.Spacing.section)
+        }
+      }
     } else {
       DashboardEmptyState(
         systemImage: "slider.horizontal.3", title: "Select a repository",
@@ -575,7 +731,7 @@ private struct RunnerDetailView: View {
           case .notFound:
             VStack(alignment: .leading, spacing: 4) {
               Text("No job running on this runner right now.").font(.callout)
-              Text("Ephemeral runners idle until GitHub assigns a job; the full log appears under History once it finishes.")
+              Text("This runner was started for a queued job and is waiting for GitHub to assign it; if the job went elsewhere, the fleet retires it shortly. The full log appears under History once a job finishes.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
           case .error(let message):

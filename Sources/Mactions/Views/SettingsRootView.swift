@@ -73,8 +73,24 @@ private struct GeneralSettingsTab: View {
       if let message = app.statusMessage {
         Section { Banner(message, severity: .info) }
       }
+      // The toggle/defaults below stage while online, but the restart bar lives
+      // on the MAIN window (possibly behind this one) — without this banner an
+      // edit here just looks applied. One banner for the whole tab: the flag is
+      // global, and pendingRestart ⟹ online (no extra gating needed).
+      if app.pendingRestart {
+        Section {
+          Banner(
+            "Configuration changed — restart the fleet to apply.",
+            severity: .warning, icon: "arrow.triangle.2.circlepath"
+          ) {
+            Button("Restart fleet") { app.restartFleet() }
+              .disabled(app.isTransitioning)
+          }
+        }
+      }
       if app.isSignedIn {
         accountSection
+        scopeSection
         defaultsSection
       } else {
         connectSection
@@ -158,7 +174,7 @@ private struct GeneralSettingsTab: View {
       Toggle("Windows", isOn: defaultPlatformBinding(.windows))
       Toggle("Linux", isOn: defaultPlatformBinding(.linux))
       Stepper(
-        "Default macOS runners: \(app.plan.defaultMacOSCount)",
+        "Default max macOS runners: \(app.plan.defaultMacOSCount)",
         value: Binding(get: { app.plan.defaultMacOSCount }, set: { app.setDefaultMacOSCount($0) }),
         in: 1...5)
       LabeledContent("Default macOS labels") {
@@ -175,7 +191,26 @@ private struct GeneralSettingsTab: View {
     } header: {
       Text("Defaults for new repositories")
     } footer: {
-      Text("Applied when you add a repo. Per-repo platforms, counts, and labels are tuned by selecting the repo on the main window.")
+      Text("Applied when you add a repo — and to repos discovered by “all repositories” mode. Per-repo platforms, max runners, and labels are tuned by selecting the repo on the main window.")
+    }
+  }
+
+  // MARK: Scope (all-repos discovery)
+
+  private var scopeSection: some View {
+    Section {
+      Toggle(
+        "Watch all repositories I can admin",
+        isOn: Binding(get: { app.plan.isAllRepos }, set: { app.setAllRepos($0) }))
+        .disabled(app.isTransitioning)
+    } header: {
+      Text("Scope")
+    } footer: {
+      Text(
+        "While online, queued jobs in any repository you administer spin up runners using the "
+          + "defaults above (most recently pushed repos are watched; fleets retire when a repo "
+          + "goes quiet). Explicitly added repositories always use their own settings. "
+          + "Changes made while online take effect after a fleet restart.")
     }
   }
 

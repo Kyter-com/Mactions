@@ -137,4 +137,47 @@ final class GitHubRequestTests: XCTestCase {
       XCTAssertEqual(error as? GitHubAuth.AuthError, .noClientId)
     }
   }
+
+  // MARK: Scale-from-zero (queued-jobs demand signal)
+
+  func testListWorkflowRunsRequestStatusFilterShape() {
+    let queued = client.listWorkflowRunsRequest(perPage: 40, status: "queued")
+    XCTAssertEqual(
+      queued.url?.absoluteString,
+      "https://api.github.com/repos/Kyter-com/sweep-collector/actions/runs?per_page=40&status=queued"
+    )
+    // Status-filtered (polled) requests bypass URLCache so the explicit ETag
+    // handling is the only caching layer in play.
+    XCTAssertEqual(queued.cachePolicy, .reloadIgnoringLocalCacheData)
+
+    // No status → the original shape, untouched.
+    let plain = client.listWorkflowRunsRequest(perPage: 40)
+    XCTAssertEqual(
+      plain.url?.absoluteString,
+      "https://api.github.com/repos/Kyter-com/sweep-collector/actions/runs?per_page=40")
+  }
+
+  func testWorkflowJobDecodesRunsOnLabels() throws {
+    let json = Data(
+      #"{"id": 1, "run_id": 2, "name": "build", "status": "queued", "labels": ["self-hosted", "Windows", "mactions"]}"#
+        .utf8)
+    let job = try JSONDecoder().decode(WorkflowJob.self, from: json)
+    XCTAssertEqual(job.labels, ["self-hosted", "Windows", "mactions"])
+    XCTAssertEqual(job.status, "queued")
+  }
+
+  /// GitHub's `runs-on` routing rule: every job label must be present on the
+  /// runner (cumulative), matching is case-insensitive, extra runner labels are
+  /// fine, and a label-less job never routes to self-hosted.
+  func testJobLabelsMatchRunnerRule() {
+    let runner = ["self-hosted", "Windows", "mactions"]
+    XCTAssertTrue(jobLabelsMatchRunner(job: ["self-hosted", "windows"], runner: runner))
+    XCTAssertTrue(
+      jobLabelsMatchRunner(job: ["SELF-HOSTED", "Windows", "MACTIONS"], runner: runner))
+    XCTAssertFalse(
+      jobLabelsMatchRunner(job: ["self-hosted", "windows", "gpu"], runner: runner),
+      "a job label the runner lacks blocks routing")
+    XCTAssertFalse(jobLabelsMatchRunner(job: ["windows-latest"], runner: runner))
+    XCTAssertFalse(jobLabelsMatchRunner(job: [], runner: runner))
+  }
 }

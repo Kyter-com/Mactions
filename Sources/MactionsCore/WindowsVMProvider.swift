@@ -176,16 +176,20 @@ public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
   /// Default `jobTimeout`: GitHub's job-execution allowance (the
   /// `timeout-minutes: 360` default = 6 h) + 30 min of lifecycle headroom. The
   /// provider clock starts at VM BOOT, not job start, so it must cover
-  /// registration + the idle wait for a job (bounded by the orchestrator's
-  /// ~8-min idle refresh) + the job itself + GitHub's cancellation wind-down +
-  /// guest shutdown — an exactly-6h watchdog would kill a legal full-length job
-  /// minutes before it finished. This is a last-resort watchdog for a WEDGED
-  /// guest, not the duration enforcer: GitHub cancels the job at the workflow's
-  /// `timeout-minutes` (default 360; self-hosted jobs may configure up to
-  /// 5 days), after which the guest powers itself off and the poll below sees
-  /// it. Idle/staleness is the orchestrator's: `idleJITRefreshInterval` (~8 min)
-  /// recycles idle runners and the sustained-offline prune reaps dead agents,
-  /// both keyed off GitHub's authoritative runner state. (An earlier 50-min
+  /// registration + the wait for GitHub to assign the queued job that triggered
+  /// this provision (scale-from-zero: VMs boot in RESPONSE to demand, and a
+  /// runner whose job vanished is trimmed by the orchestrator's demand loop
+  /// within a couple of ticks) + the job itself + GitHub's cancellation
+  /// wind-down + guest shutdown — an exactly-6h watchdog would kill a legal
+  /// full-length job minutes before it finished. This is a last-resort watchdog
+  /// for a WEDGED guest, not the duration enforcer: GitHub cancels the job at
+  /// the workflow's `timeout-minutes` (default 360; self-hosted jobs may
+  /// configure up to 5 days), after which the guest powers itself off and the
+  /// poll below sees it. Idle/staleness is the orchestrator's: the demand-driven
+  /// trim retires surplus idle runners, `idleJITRefreshInterval` (~8 min)
+  /// refreshes a runner whose matching job sits queued-but-unclaimed, and the
+  /// sustained-offline prune reaps dead agents — all keyed off GitHub's
+  /// authoritative runner + queue state. (An earlier 50-min
   /// budget tried to stay under the JIT token's ~60-min expiry, but that expiry
   /// bounds REGISTRATION — an unused jitconfig going stale — not job duration:
   /// the macOS/Linux providers run the same JIT mechanism with no provider-level

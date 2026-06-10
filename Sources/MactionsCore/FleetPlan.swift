@@ -16,10 +16,11 @@ import Foundation
 /// exact GitHub `runs-on` label set those runners register with.
 public struct PlatformConfig: Codable, Equatable, Sendable {
   public var enabled: Bool
-  /// Desired runner count, clamped 1...5, for every platform: macOS runs this
-  /// many agent processes, Windows/Linux this many VMs/containers. go-online
-  /// further caps the LIVE Windows/Linux total to what the host RAM (and, for
-  /// Linux, CPU) budget allows, so the realized count can be below this target.
+  /// MAX concurrent runners (scale-from-zero CEILING), clamped 1...5: runners
+  /// are provisioned on demand when matching jobs queue, up to this many at
+  /// once — macOS agent processes, Windows VMs, Linux containers — and torn
+  /// down when the queue empties. The live `HostBudget` (RAM/CPU) additionally
+  /// bounds Windows/Linux host-wide at provision time.
   public var count: Int
   /// This combo's OWN labels (e.g. `["self-hosted", "macOS", "mactions"]`).
   public var labels: [String]
@@ -57,8 +58,9 @@ public struct RepoPlan: Codable, Equatable, Sendable, Identifiable {
   }
 
   /// A one-line subtitle for the repo header — e.g. `"macOS ×2 · Linux ×3"`. A
-  /// platform shows `×N` only when it runs more than one runner; a lone runner is
-  /// left implicit. Empty selection reads as a nudge.
+  /// platform shows `×N` only when it allows more than one concurrent runner
+  /// (the on-demand cap); a lone runner is left implicit. Empty selection reads
+  /// as a nudge.
   public func summary() -> String {
     let parts = RunnerOS.allCases.compactMap { os -> String? in
       guard let config = platforms[os.rawValue], config.enabled else { return nil }
@@ -94,17 +96,27 @@ public struct FleetPlan: Codable, Equatable, Sendable {
   public var defaultMacOSCount: Int
   /// `RunnerOS.rawValue`s auto-enabled when a repo is added (default: macOS only).
   public var defaultPlatforms: [String]
+  /// Scope: when true, the fleet ALSO watches every repo the user can admin —
+  /// queued jobs in undiscovered repos spin up runners seeded from the defaults
+  /// above, and those fleets are reaped when the repo goes quiet. Explicitly
+  /// configured repos keep their own per-combo configs. Optional (`nil` ==
+  /// false) so plans persisted before this field decode unchanged.
+  public var allRepos: Bool?
+
+  public var isAllRepos: Bool { allRepos ?? false }
 
   public init(
     repos: [RepoPlan] = [],
     defaultMacOSLabels: [String] = ["self-hosted", "macOS", "mactions"],
     defaultMacOSCount: Int = 1,
-    defaultPlatforms: [String] = ["macOS"]
+    defaultPlatforms: [String] = ["macOS"],
+    allRepos: Bool? = nil
   ) {
     self.repos = repos
     self.defaultMacOSLabels = defaultMacOSLabels
     self.defaultMacOSCount = max(1, min(5, defaultMacOSCount))
     self.defaultPlatforms = defaultPlatforms
+    self.allRepos = allRepos
   }
 
   // MARK: Seeds
@@ -137,6 +149,18 @@ public struct FleetPlan: Codable, Equatable, Sendable {
   /// that never starts.
   public func invalidCombos() -> [FleetCombo] {
     enabledCombos().filter { $0.config.labels.isEmpty || !$0.config.labels.contains("self-hosted") }
+  }
+
+  /// ALL-REPOS discovery: which default-enabled platforms any of these queued
+  /// jobs' label sets would route to (job labels ⊆ the platform's seed labels —
+  /// GitHub's cumulative `runs-on` rule). Drives lazy orchestrator creation for
+  /// repos outside the explicit plan.
+  public func discoveryMatches(for queuedLabelSets: [[String]]) -> [RunnerOS] {
+    RunnerOS.allCases.filter { os in
+      guard defaultPlatforms.contains(os.rawValue) else { return false }
+      let runnerLabels = seed(for: os).labels
+      return queuedLabelSets.contains { jobLabelsMatchRunner(job: $0, runner: runnerLabels) }
+    }
   }
 
   // MARK: Mutation (offline-gated by the caller; saved by the caller)

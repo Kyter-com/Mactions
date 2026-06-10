@@ -6,7 +6,7 @@ Sibling docs: **[BASE.md](BASE.md)** (base-image philosophy: bake runner/OS sema
 
 ## What this is
 
-**Mactions** is a macOS menubar app that turns your Mac into an **on-demand, ephemeral GitHub Actions runner host**. Open the app and it brings self-hosted runners online for a repo; quit it and they go offline. Each runner is single-use (JIT / `--ephemeral`): it registers, runs exactly one job, deregisters, and is replaced while you're online.
+**Mactions** is a macOS menubar app that turns your Mac into an **on-demand, ephemeral GitHub Actions runner host**. Open the app and it watches your repos for queued jobs, starting self-hosted runners on demand (scale-from-zero — zero runners is the normal idle state); quit it and the watching stops. Each runner is single-use (JIT / `--ephemeral`): it registers, runs exactly one job, deregisters, and is torn down — replaced only while matching jobs remain queued.
 
 Think of it as a laptop-scale, multi-OS, app-controlled version of [actions-runner-controller](https://github.com/actions/actions-runner-controller). The novel part is the UX: "runners exist while the app is open."
 
@@ -18,7 +18,7 @@ Kyter's `sweep-collector` CI leans on self-hosted runners, and the GitHub-hosted
 
 Proof-of-concept. Honest accounting:
 
-- ✅ **Core control loop** (auth → JIT config → provider → ephemeral runner → recycle → teardown) is implemented and unit-tested.
+- ✅ **Core control loop** (auth → queued-jobs poll → JIT config → provider → ephemeral runner → demand-gated replace/trim → teardown) is implemented and unit-tested — **scale-from-zero** (2026-06-10, issue #41): runners exist only while matching jobs are queued.
 - ✅ **Auth, three ways:** one-click **GitHub CLI** reuse (`gh auth token`), device-flow sign-in, or paste-a-PAT. Token stored in a `0600` file (not the keychain — see Auth for why).
 - ✅ **Searchable multi-repo picker** (lists repos you can admin) + one ephemeral fleet per selected repo, run concurrently.
 - ✅ **Local-process provider**: runs the actions-runner agent directly on the Mac (no VM isolation, but each run is an isolated clone that's wiped on exit — see Host hygiene). This is the runnable MVP path.
@@ -47,7 +47,8 @@ MactionsCore (library, pure Foundation)        Mactions (executable, SwiftUI/App
   RunnerInstaller downloads the runner agent       DashboardWindowController  optional window (dockless until open)
   Providers       Local + Tart + Windows + Linux + factories  DashboardView  Pulse-style console: runners / history+inline GH logs / live memory
   LinuxContainer* provider + budget + image + setup-progress (container-per-job)
-  Orchestrator    start/stop/maintain-N (+ run-finished events)  OSLogo  custom-SF-Symbol tiles (+ SVGSymbol glyph fallback)
+  Orchestrator    start/stop/scale-from-zero (+ run-finished events)  OSLogo  custom-SF-Symbol tiles (+ SVGSymbol glyph fallback)
+  HostBudget      live shared Windows/Linux capacity ledger (acquired per provision)
   RunHistory      RunRecord + on-disk run-history store (~/.mactions/logs)
   MemorySampler   host (host_statistics64) + per-process RSS (ps) → Memory tab
   WindowsPreflight prereq detect (Fusion + converters + xorriso) + brew installer
@@ -63,13 +64,14 @@ scripts/                                       (driven by AppState + provider)
   autounattend.xml, bootstrap.ps1  unattended Setup + base-image bootstrap
 ```
 
-**The loop** (`RunnerOrchestrator`):
+**The loop** (`RunnerOrchestrator`) — **SCALE-FROM-ZERO** (2026-06-10; issue #41). Runners exist only while queued jobs need them; **zero runners is the normal armed state** (the old model — keep `desiredCount` warm + an 8-min idle-JIT churn — is gone):
 
-1. `start()` → for each desired runner, call `GitHubClient.generateJITConfig` (a single-use ephemeral registration).
-2. Hand the encoded JIT config to a `RunnerProvider`, which launches the agent (`run.sh --jitconfig …`).
-3. The agent registers, runs **one** job, deregisters, exits. The provider's `onExit` fires.
-4. While `state == .online`, an exit triggers re-provisioning to keep the fleet at `desiredCount`.
-5. `stop()` (or app quit) tears down every provider and best-effort deletes any runner still registered under our `mactions-…` name prefix.
+1. Each reconcile tick (30s active / 60s idle-at-zero) reads GitHub's runner list (busy/idle health), then polls the repo's **queued jobs**: job-level status across runs in BOTH `queued` and `in_progress` states (run-level status flaps; an in_progress run can carry queued matrix legs), freshness-filtered on `max(created_at, updated_at)` (re-runs keep the original `created_at`). ETag conditional requests make the idle poll free against the rate limit (304s aren't billed).
+2. Demand = queued jobs whose labels ⊆ this combo's labels (GitHub's cumulative `runs-on` rule, case-insensitive). Target = `min(busy + matchingQueued, maxRunners)`, where `maxRunners` (the per-combo count, 1–5) is a **ceiling**, not a floor. A **failed poll HOLDS the fleet** — never scale on missing info.
+3. Scale-up: mint `generateJITConfig` → `RunnerProvider.start` per shortfall, each drawing on the live shared `HostBudget` (Windows RAM / Linux RAM+CPU, host-wide, refunded on every exit). The agent registers, runs **one** job, deregisters, exits; `onExit` → re-reconcile (demand-gated — no blind replace).
+4. Scale-down: surplus confirmed-idle runners (job taken elsewhere / cancelled) are trimmed after a two-snapshot grace, **deregister-first** (GitHub refuses to delete a busy runner — the server-side race guard), then stopped; trims/reaps never land in run history (`reaped` flag).
+5. `stop()` deregisters **this orchestrator's own runners** (never a machine-prefix sweep — sibling combos keep running under all-repos discovery), then tears down providers. Crash ghosts are reaped by the go-online sweep + GitHub's 1-day auto-prune.
+6. Optional **all-repos discovery** (`FleetPlan.allRepos`): while online, AppState scans the ~50 most-recently-pushed admin repos each minute and lazily creates (then quiet-reaps) orchestrators seeded from the default platforms.
 
 **Lifecycle:** the app is an accessory (menubar-only, no dock icon). `AppDelegate.applicationShouldTerminate` returns `.terminateLater`, runs `goOfflineAndWait()`, then replies — with a 6s hard timeout so a hung network call can't wedge quit. Ephemeral runners + GitHub's offline sweep are the backstop for force-quit/crash.
 
@@ -264,7 +266,7 @@ Friendly by design — no env vars, no hand-copied long tokens.
 
 ```bash
 swift build          # compiles MactionsCore + the app
-swift test           # 139 unit tests (requests, device-flow guard, repo lister, orchestrator, cleanup, Windows VM command shapes + image/preflight logic, Linux container command shapes + budget + setup-progress, RunnerOS labels)
+swift test           # 206 unit tests (requests, device-flow guard, queued-jobs polling + ETags, repo lister, scale-from-zero orchestrator, host budget, shared repo control plane + discovery ledger, cleanup, Windows VM command shapes + image/preflight logic, Linux container command shapes + budget + setup-progress, RunnerOS labels)
 swift run Mactions   # launches the menubar app for dev (look in the menubar)
 ```
 
@@ -305,7 +307,7 @@ Crucially, **your repos don't change.** Workflows target **labels** (`runs-on: [
 ## Roadmap
 
 - **Windows** support: VMware Fusion backend — **proven end to end via the UI** (automated base build → green job → clean teardown) + hardened (see [Windows support](#windows-support)). Deferred Windows follow-ups: **atomic rebuild** (build to a temp VM + swap, so a failed update can't lose the working base — today `fusion-windows-base` wipes-then-rebuilds); **concurrent teardown on quit** (would need `RunnerOrchestrator` as an `actor` under Swift 6 — the launch-sweep + GitHub's ephemeral deregister self-heal leaks meanwhile); **GA `knownGAMajors` auto-derivation** (no false-positive-free GA signal from UUP dump, so it stays a documented manual touchpoint, kept in sync between `WindowsImage` + `prepare-windows-image`); **hung-guest watchdog** (already bounded by `bootTimeout` + `jobTimeout`); **per-clone guest password** (accepted: the guest is outbound-only + destroyed per job).
-- **Scale-from-zero:** instead of N idle runners, listen for `workflow_job` queued events (webhook or API poll) and provision on demand. This is what ARC does.
+- ~~**Scale-from-zero:** instead of N idle runners, provision on demand~~ — **DONE (2026-06-10, issue #41)**: poll-based (REST queued-jobs detection + ETags; no webhook — a menubar app has no ingress). See "The loop" above. Possible v2 demand signal: GitHub's official runner **scale-set long-poll client** (`github.com/actions/scaleset`, public preview) for near-instant pickup — verify its routing model (scale sets may replace free-form labels) before adopting.
 - **Distributable `.app`:** Xcode/`xcodebuild` bundle step, `LSUIElement`, Developer ID + notarization, and a Login Item so it can auto-start.
 - **Tart image automation:** a `mactions prepare-image` flow that bakes the runner + SSH into a base image.
 - **Org-level runners** (repo-level today; multi-repo across selected repos is supported).

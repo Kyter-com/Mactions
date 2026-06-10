@@ -41,6 +41,14 @@ struct RepoInspector: View {
       VStack(alignment: .leading, spacing: MactionsTheme.Spacing.section) {
         header(repoPlan)
 
+        // Runners for this repo repeatedly dying during launch (dead container
+        // daemon, broken base image): the badge says "failing to launch"; the
+        // actual error is only useful HERE, where the user is looking at the
+        // repo. Without this, the failure loop is invisible diagnostically.
+        if let launchError = app.repoLaunchFailure[repoPlan.repo.fullName] {
+          Banner(launchError, severity: .warning, icon: "exclamationmark.triangle")
+        }
+
         VStack(alignment: .leading, spacing: MactionsTheme.Spacing.tight) {
           SectionHeader("Platforms")
           HStack(spacing: MactionsTheme.Spacing.control) {
@@ -218,18 +226,18 @@ struct RepoInspector: View {
 
       let defaultCount = os == .macOS ? app.plan.defaultMacOSCount : 1
       Stepper(
-        "Runners: \(config?.count ?? defaultCount)",
+        "Max runners: \(config?.count ?? defaultCount)",
         value: countBinding(repoID: repoPlan.id, os: os), in: 1...5)
         .disabled(app.isTransitioning)
-      if os != .macOS {
-        // Each runner is a full VM/container, so how many actually run at once is
-        // capped by this Mac's RAM (Linux also by CPU) — the count is the target,
-        // and go-online's status line says when the budget delivers fewer.
-        Text(
-          "Each is a throwaway \(os == .windows ? "VM" : "container"); how many run "
-            + "at once is capped by this Mac's \(os == .windows ? "RAM" : "RAM/CPU").")
-          .font(.caption).foregroundStyle(.secondary)
-      }
+      // Scale-from-zero: the count is a CEILING, not a warm pool — runners
+      // start when matching jobs queue and retire when the queue empties.
+      Text(
+        os == .macOS
+          ? "Runners start on demand when jobs queue — up to this many at once."
+          : "Runners start on demand when jobs queue — up to this many throwaway "
+            + "\(os == .windows ? "VMs" : "containers") at once, further capped by "
+            + "this Mac's \(os == .windows ? "RAM" : "RAM/CPU").")
+        .font(.caption).foregroundStyle(.secondary)
 
       VStack(alignment: .leading, spacing: MactionsTheme.Spacing.tight) {
         SectionHeader("Labels")
