@@ -6,8 +6,8 @@ import SwiftUI
 /// window, shown when a repo (not a live runner) is selected in the grid. The
 /// platforms are picked with **logo tiles** (a brand mark in a box whose border
 /// highlights when that platform is enabled for this repo — the box IS the
-/// checkbox), and each enabled platform gets its own card: runner count (macOS)
-/// + a label editor with read-only "effective labels" chips. Everything is
+/// checkbox), and each enabled platform gets its own card: runner count +
+/// the read-only workflow `runs-on` label set. Everything is
 /// offline-gated, matching the rest of the app — you configure while offline,
 /// then watch the fleet you configured.
 struct RepoInspector: View {
@@ -29,7 +29,7 @@ struct RepoInspector: View {
       } else {
         DashboardEmptyState(
           systemImage: "slider.horizontal.3", title: "No repo selected",
-          message: "Select a repository in the list to configure its platforms, runner count, and labels.")
+          message: "Select a repository in the list to configure its platforms and runner count.")
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -81,7 +81,7 @@ struct RepoInspector: View {
   private func header(_ repoPlan: RepoPlan) -> some View {
     HStack(spacing: MactionsTheme.Spacing.control) {
       VStack(alignment: .leading, spacing: 1) {
-        Text("CONFIGURE").eyebrow()
+        Text(app.plan.isAllRepos ? "REPOSITORY OVERRIDE" : "CONFIGURE").eyebrow()
         Text(repoPlan.repo.name).font(.headline).lineLimit(1).truncationMode(.middle)
         Text(repoPlan.repo.owner).font(.caption).foregroundStyle(.secondary)
           .lineLimit(1).truncationMode(.middle)
@@ -224,7 +224,7 @@ struct RepoInspector: View {
           severity: .warning, icon: "wrench.and.screwdriver")
       }
 
-      let defaultCount = os == .macOS ? app.plan.defaultMacOSCount : 1
+      let defaultCount = app.defaultCount(for: os)
       Stepper(
         "Max runners: \(config?.count ?? defaultCount)",
         value: countBinding(repoID: repoPlan.id, os: os), in: 1...5)
@@ -240,35 +240,9 @@ struct RepoInspector: View {
         .font(.caption).foregroundStyle(.secondary)
 
       VStack(alignment: .leading, spacing: MactionsTheme.Spacing.tight) {
-        SectionHeader("Labels")
-        LabelEditor(
-          text: labelsBinding(repoPlan: repoPlan, os: os),
-          editable: os == .macOS)
-          .disabled(app.isTransitioning)
-        // Surface the SAME rule goOnline() hard-blocks on (non-empty + must
-        // include `self-hosted`) right here, so a bad label set is caught while
-        // editing instead of as a cryptic blocked "Go online" later. Only macOS
-        // labels are editable; the derived Windows/Linux sets are always valid.
-        if os == .macOS, let problem = labelProblem(repoPlan) {
-          Banner(problem, severity: .error)
-        }
-        if os != .macOS {
-          Text("Derived from the OS (arch-explicit for Linux); not editable.")
-            .font(.caption).foregroundStyle(.tertiary)
-        }
+        WorkflowRunsOnLabels(labels: labels(for: repoPlan, os: os))
       }
     }
-  }
-
-  /// The label-validity message for this repo's macOS combo, or nil when valid —
-  /// mirrors `FleetPlan.invalidCombos()` (the go-online hard block).
-  private func labelProblem(_ repoPlan: RepoPlan) -> String? {
-    let labels = repoPlan.config(for: .macOS)?.labels ?? app.plan.defaultMacOSLabels
-    if labels.isEmpty { return "Add at least one label, including `self-hosted`." }
-    if !labels.contains("self-hosted") {
-      return "Labels must include `self-hosted`, or no workflow will match these runners."
-    }
-    return nil
   }
 
   // MARK: Readiness
@@ -284,7 +258,7 @@ struct RepoInspector: View {
   // MARK: Bindings (each write goes through the offline-gated AppState mutators)
 
   private func countBinding(repoID: String, os: RunnerOS) -> Binding<Int> {
-    let fallback = os == .macOS ? app.plan.defaultMacOSCount : 1
+    let fallback = app.defaultCount(for: os)
     return Binding(
       get: {
         app.plan.repos.first { $0.id == repoID }?.config(for: os)?.count ?? fallback
@@ -292,21 +266,189 @@ struct RepoInspector: View {
       set: { app.setCount($0, os: os, repoID: repoID) })
   }
 
-  /// macOS: a two-way binding through `setLabels`. Windows/Linux: a read-only
-  /// view of the effective (derived) labels for the chip row.
-  private func labelsBinding(repoPlan: RepoPlan, os: RunnerOS) -> Binding<String> {
-    let current = repoPlan.config(for: os)?.labels ?? defaultLabels(for: os)
-    let joined = current.joined(separator: ", ")
-    guard os == .macOS else { return .constant(joined) }
-    return Binding(
-      get: {
-        (app.plan.repos.first { $0.id == repoPlan.id }?.config(for: .macOS)?.labels
-          ?? app.plan.defaultMacOSLabels).joined(separator: ", ")
-      },
-      set: { app.setLabels($0, os: .macOS, repoID: repoPlan.id) })
+  private func labels(for repoPlan: RepoPlan, os: RunnerOS) -> [String] {
+    repoPlan.config(for: os)?.labels ?? os.defaultLabels
+  }
+}
+
+// MARK: - All Repositories Defaults
+
+/// The root configuration surface for all-repos discovery. Explicit repository
+/// rows remain in the selector as overrides; discovered repos use these defaults
+/// until they are added explicitly.
+struct AllRepositoriesInspector: View {
+  @EnvironmentObject private var app: AppState
+
+  var body: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: MactionsTheme.Spacing.section) {
+        header
+        Banner(
+          "Named repositories are overrides. Other admin repos use these defaults when queued jobs appear.",
+          severity: .info, icon: "antenna.radiowaves.left.and.right")
+
+        VStack(alignment: .leading, spacing: MactionsTheme.Spacing.tight) {
+          SectionHeader("Default Platforms")
+          ForEach(RunnerOS.allCases) { os in
+            defaultPlatformCard(os)
+          }
+        }
+
+        VStack(alignment: .leading, spacing: MactionsTheme.Spacing.tight) {
+          SectionHeader("Host Capacity")
+          Card {
+            InfoRow("macOS runners", value: macOSCapacityText, systemImage: "desktopcomputer")
+            InfoRow("Windows VMs", value: windowsCapacityText, systemImage: "memorychip")
+            InfoRow("Linux containers", value: linuxCapacityText, systemImage: "cpu")
+          }
+        }
+      }
+      .padding(MactionsTheme.Spacing.section)
+      .frame(maxWidth: .infinity, alignment: .leading)
+    }
   }
 
-  private func defaultLabels(for os: RunnerOS) -> [String] {
-    os == .macOS ? app.plan.defaultMacOSLabels : os.defaultLabels
+  private var header: some View {
+    HStack(spacing: MactionsTheme.Spacing.control) {
+      VStack(alignment: .leading, spacing: 1) {
+        Text("DEFAULTS").eyebrow()
+        Text("All repositories").font(.headline)
+        Text(defaultSummary).font(.caption).foregroundStyle(.secondary)
+          .lineLimit(1).truncationMode(.tail)
+      }
+      Spacer(minLength: 0)
+      Toggle(
+        "Watch all",
+        isOn: Binding(get: { app.plan.isAllRepos }, set: { app.setAllRepos($0) }))
+        .toggleStyle(.switch)
+        .controlSize(.small)
+        .labelsHidden()
+        .disabled(app.isTransitioning)
+        .help("Watch all repositories you can administer")
+    }
+  }
+
+  private var defaultSummary: String {
+    let parts = RunnerOS.allCases.compactMap { os -> String? in
+      guard app.isDefaultPlatform(os) else { return nil }
+      let count = app.defaultCount(for: os)
+      return count > 1 ? "\(os.displayName) ×\(count)" : os.displayName
+    }
+    return parts.isEmpty ? "No default platforms" : parts.joined(separator: " · ")
+  }
+
+  private func defaultPlatformCard(_ os: RunnerOS) -> some View {
+    let enabled = app.isDefaultPlatform(os)
+    let ready = isReady(os)
+    return Card {
+      HStack(spacing: MactionsTheme.Spacing.tight) {
+        OSLogo(os: os, size: 15).frame(width: 18)
+        Text(os.displayName).font(.callout.weight(.semibold))
+        Spacer(minLength: 0)
+        Toggle(
+          os.displayName,
+          isOn: Binding(get: { app.isDefaultPlatform(os) }, set: { app.setDefaultPlatform(os, on: $0) }))
+          .labelsHidden()
+          .toggleStyle(.switch)
+          .controlSize(.small)
+          .disabled(app.isTransitioning)
+      }
+
+      if enabled {
+        Stepper(
+          "Max runners per repo: \(app.defaultCount(for: os))",
+          value: Binding(get: { app.defaultCount(for: os) }, set: { app.setDefaultCount($0, os: os) }),
+          in: 1...5)
+          .disabled(app.isTransitioning)
+        Text(defaultCountHelp(for: os))
+          .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        WorkflowRunsOnLabels(labels: os.defaultLabels)
+        if !ready {
+          setupBanner(for: os)
+        }
+      } else {
+        Text("Off for discovered repositories.")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+    }
+  }
+
+  private func defaultCountHelp(for os: RunnerOS) -> String {
+    switch os {
+    case .macOS:
+      return "Each discovered repo can request this many macOS jobs; \(macOSCapacitySentence)."
+    case .windows:
+      return "Each discovered repo can request this many Windows jobs; \(windowsCapacitySentence)."
+    case .linux:
+      return "Each discovered repo can request this many Linux jobs; \(linuxCapacitySentence)."
+    }
+  }
+
+  @ViewBuilder
+  private func setupBanner(for os: RunnerOS) -> some View {
+    switch os {
+    case .macOS:
+      EmptyView()
+    case .windows:
+      Banner(
+        "Windows defaults are enabled, but the Windows base image is not ready.",
+        severity: .warning, icon: "wrench.and.screwdriver"
+      ) {
+        Button("Open Windows Settings") { app.presentSettings(.windows) }
+          .controlSize(.small)
+      }
+    case .linux:
+      Banner(
+        "Linux defaults are enabled, but the Linux runner image is not ready.",
+        severity: .warning, icon: "wrench.and.screwdriver"
+      ) {
+        Button("Open Linux Settings") { app.presentSettings(.linux) }
+          .controlSize(.small)
+      }
+    }
+  }
+
+  private func isReady(_ os: RunnerOS) -> Bool {
+    switch os {
+    case .macOS: return true
+    case .windows: return app.windowsImageReady
+    case .linux: return app.linuxImageReady && app.linuxBackendAvailable
+    }
+  }
+
+  private var windowsCapacityText: String {
+    let max = app.capacity.windowsMaxConcurrentVMs
+    return max == 0 ? "0" : "\(max)"
+  }
+
+  private var macOSCapacityText: String {
+    let max = app.capacity.macOSMaxConcurrentRunners
+    return max == 0 ? "0" : "\(max) soft"
+  }
+
+  private var linuxCapacityText: String {
+    let max = app.capacity.linuxMaxConcurrentContainers
+    return max == 0 ? "0" : "\(max)"
+  }
+
+  private var windowsCapacitySentence: String {
+    let max = app.capacity.windowsMaxConcurrentVMs
+    return max == 0
+      ? "no Windows VMs can run until setup or RAM budget is available"
+      : "this Mac can run \(max) Windows VM\(max == 1 ? "" : "s") host-wide"
+  }
+
+  private var macOSCapacitySentence: String {
+    let max = app.capacity.macOSMaxConcurrentRunners
+    return max == 0
+      ? "CPU/RAM/storage budget cannot safely admit a macOS job"
+      : "this Mac can admit \(max) macOS runner\(max == 1 ? "" : "s") host-wide"
+  }
+
+  private var linuxCapacitySentence: String {
+    let max = app.capacity.linuxMaxConcurrentContainers
+    return max == 0
+      ? "no Linux containers can run until setup or capacity is available"
+      : "this Mac can run \(max) Linux container\(max == 1 ? "" : "s") host-wide"
   }
 }

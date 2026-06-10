@@ -1,6 +1,6 @@
 import Foundation
 
-/// Thin wrapper around `Process` for shelling out to CLIs (`tart`, `tar`, the
+/// Thin wrapper around `Process` for shelling out to CLIs (`tar`, `vmrun`, the
 /// actions-runner `run.sh`). Synchronous `run` for quick commands; `launch`
 /// for long-lived processes (a runner agent) whose exit we observe via a
 /// termination handler.

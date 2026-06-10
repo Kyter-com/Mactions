@@ -21,9 +21,8 @@ final class LinuxSetupProgressTests: XCTestCase {
   }
 
   func testStepForLineMapsDaemonMarkers() {
-    XCTAssertEqual(LinuxSetupProgress.step(for: "Starting colima..."), .verifyDaemon)
-    XCTAssertEqual(LinuxSetupProgress.step(for: "colima is running"), .verifyDaemon)
     XCTAssertEqual(LinuxSetupProgress.step(for: "container system start"), .verifyDaemon)
+    XCTAssertEqual(LinuxSetupProgress.step(for: "Verifying container daemon"), .verifyDaemon)
   }
 
   func testStepForLineReturnsNilOnNoise() {
@@ -35,7 +34,7 @@ final class LinuxSetupProgressTests: XCTestCase {
     XCTAssertEqual(LinuxSetupProgress.detail(for: "latest: Pulling from x"), "Fetching image layers…")
     XCTAssertEqual(LinuxSetupProgress.detail(for: "Extracting [==> ]"), "Extracting image layers…")
     XCTAssertEqual(LinuxSetupProgress.detail(for: "Status: Downloaded newer image"), "Image ready.")
-    XCTAssertEqual(LinuxSetupProgress.detail(for: "Starting colima (vz)…"), "Starting the container VM (Colima)…")
+    XCTAssertEqual(LinuxSetupProgress.detail(for: "container system start"), "Starting the container daemon…")
     XCTAssertNil(LinuxSetupProgress.detail(for: "noise"))
   }
 
@@ -46,12 +45,11 @@ final class LinuxSetupProgressTests: XCTestCase {
     XCTAssertTrue(LinuxSetupProgress.isLikelyTransientFailure("could not resolve host: ghcr.io"))
     XCTAssertTrue(LinuxSetupProgress.isLikelyTransientFailure("received unexpected HTTP 503 Service Unavailable"))
     // A genuine local failure is NOT mislabeled as transient.
-    XCTAssertFalse(LinuxSetupProgress.isLikelyTransientFailure("Cannot connect to the Docker daemon. Is the docker daemon running?"))
-    XCTAssertFalse(LinuxSetupProgress.isLikelyTransientFailure("docker: command not found"))
-    // A dead docker socket reads as "connection refused" but is LOCAL, not a
-    // transient network blip — must be classified local (the bug Copilot caught).
+    XCTAssertFalse(LinuxSetupProgress.isLikelyTransientFailure("container: command not found"))
+    // A local daemon failure can read as "connection refused" but is LOCAL, not
+    // a transient network blip.
     XCTAssertFalse(LinuxSetupProgress.isLikelyTransientFailure(
-      "error during connect: Get \"http://docker/info\": dial unix /var/run/docker.sock: connect: connection refused"))
+      "container system is not running: connect: connection refused"))
     // …but a real registry-side "connection refused" (no local-daemon markers) is still transient.
     XCTAssertTrue(LinuxSetupProgress.isLikelyTransientFailure("ghcr.io: connection refused"))
   }

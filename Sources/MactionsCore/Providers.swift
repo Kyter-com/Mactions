@@ -1,9 +1,8 @@
 import Foundation
 
-/// A runner *provider* is the substrate a single ephemeral runner executes on:
-/// a local process, a Tart VM, etc. It takes a JIT config, runs the agent for
-/// exactly one job, and reports when the agent exits so the orchestrator can
-/// recycle it.
+/// A runner *provider* is the substrate a single ephemeral runner executes on.
+/// It takes a JIT config, runs the agent for exactly one job, and reports when
+/// the agent exits so the orchestrator can recycle it.
 public protocol RunnerProvider: AnyObject, Sendable {
   /// Stable id for logging/UI (usually the runner name).
   var id: String { get }
@@ -197,88 +196,5 @@ public struct LocalProcessProviderFactory: RunnerProviderFactory {
   }
   public func makeProvider(name: String) -> RunnerProvider {
     LocalProcessProvider(id: name, templateDirectory: templateDirectory, runsRoot: runsRoot)
-  }
-}
-
-// MARK: - Tart VM (isolated; experimental)
-
-/// Runs each ephemeral runner inside a throwaway Tart VM cloned from a prepared
-/// base image (Apple Silicon, Virtualization.framework). The base image must
-/// have the actions-runner installed and an SSH login; we clone it, boot it,
-/// SSH in to launch the agent with the JIT config, and delete the clone on
-/// stop. Marked experimental: image prep + the SSH bootstrap are environment
-/// specific. See AGENTS.md → "Providers".
-public final class TartProvider: RunnerProvider, @unchecked Sendable {
-  public let id: String
-  private let baseImage: String
-  private let tartPath: String
-  private let sshUser: String
-  private var cloneName: String { "mactions-\(id)" }
-  private var running = false
-  private let lock = NSLock()
-
-  public init(id: String, baseImage: String, tartPath: String, sshUser: String = "admin") {
-    self.id = id
-    self.baseImage = baseImage
-    self.tartPath = tartPath
-    self.sshUser = sshUser
-  }
-
-  public var isRunning: Bool {
-    lock.lock(); defer { lock.unlock() }
-    return running
-  }
-
-  public func start(jitConfig: String, onExit: @escaping @Sendable (Int32) -> Void) throws {
-    try Shell.runChecked(tartPath, ["clone", baseImage, cloneName])
-    lock.lock(); running = true; lock.unlock()
-
-    // Boot + run + teardown happen on a background thread so `start` returns
-    // promptly; `onExit` fires when the job (and the VM) is done.
-    Thread.detachNewThread { [self] in
-      var status: Int32 = 0
-      do {
-        // `tart run` blocks until the VM powers off. We launch the agent over
-        // SSH in parallel; an ephemeral runner powers the VM off after one job
-        // if the base image is wired to shut down on agent exit.
-        let runner = Process()
-        runner.executableURL = URL(fileURLWithPath: tartPath)
-        runner.arguments = ["run", cloneName, "--no-graphics"]
-        try runner.run()
-
-        let ip = try waitForIP()
-        // Assumes the base image has actions-runner at ~/actions-runner.
-        let remote = "cd ~/actions-runner && ./run.sh --jitconfig \(jitConfig)"
-        try Shell.runChecked("/usr/bin/ssh", [
-          "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-          "\(sshUser)@\(ip)", remote,
-        ])
-        runner.waitUntilExit()
-        status = runner.terminationStatus
-      } catch {
-        status = 1
-      }
-      _ = try? Shell.run(tartPath, ["delete", cloneName])
-      lock.lock(); running = false; lock.unlock()
-      onExit(status)
-    }
-  }
-
-  public func stop() {
-    lock.lock(); running = false; lock.unlock()
-    _ = try? Shell.run(tartPath, ["stop", cloneName])
-    _ = try? Shell.run(tartPath, ["delete", cloneName])
-  }
-
-  private func waitForIP(timeout: TimeInterval = 60) throws -> String {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-      if let r = try? Shell.run(tartPath, ["ip", cloneName]), r.ok {
-        let ip = r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !ip.isEmpty { return ip }
-      }
-      Thread.sleep(forTimeInterval: 2)
-    }
-    throw Shell.ShellError.nonZeroExit(command: "tart ip \(cloneName)", status: -1, stderr: "timed out waiting for VM IP")
   }
 }

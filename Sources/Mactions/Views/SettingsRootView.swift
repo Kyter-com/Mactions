@@ -60,10 +60,6 @@ struct SettingsRootView: View {
 private struct GeneralSettingsTab: View {
   @EnvironmentObject private var app: AppState
   @State private var pat = ""
-  /// Local draft for the default-labels field — committed on Return / focus loss,
-  /// so live typing isn't normalized away (same reason as LabelEditor's draft).
-  @State private var labelsDraft = ""
-  @FocusState private var labelsFocused: Bool
 
   var body: some View {
     Form {
@@ -98,7 +94,6 @@ private struct GeneralSettingsTab: View {
       capacitySection  // reads only ProcessInfo — useful signed-out too
     }
     .formStyle(.grouped)
-    .onAppear { labelsDraft = app.defaultMacOSLabelsText }
   }
 
   // MARK: Connect (signed out)
@@ -174,24 +169,13 @@ private struct GeneralSettingsTab: View {
       Toggle("Windows", isOn: defaultPlatformBinding(.windows))
       Toggle("Linux", isOn: defaultPlatformBinding(.linux))
       Stepper(
-        "Default max macOS runners: \(app.plan.defaultMacOSCount)",
-        value: Binding(get: { app.plan.defaultMacOSCount }, set: { app.setDefaultMacOSCount($0) }),
+        "Default max macOS runners: \(app.defaultCount(for: .macOS))",
+        value: Binding(get: { app.defaultCount(for: .macOS) }, set: { app.setDefaultMacOSCount($0) }),
         in: 1...5)
-      LabeledContent("Default macOS labels") {
-        TextField("self-hosted, macOS, mactions", text: $labelsDraft)
-          .focused($labelsFocused)
-          .onSubmit { app.setDefaultMacOSLabels(labelsDraft) }
-          .onChange(of: labelsFocused) { focused in
-            if !focused { app.setDefaultMacOSLabels(labelsDraft) }
-          }
-          .onChange(of: app.defaultMacOSLabelsText) { value in
-            if !labelsFocused { labelsDraft = value }
-          }
-      }
     } header: {
       Text("Defaults for new repositories")
     } footer: {
-      Text("Applied when you add a repo — and to repos discovered by “all repositories” mode. Per-repo platforms, max runners, and labels are tuned by selecting the repo on the main window.")
+      Text("Applied when you add a repo — and to repos discovered by “all repositories” mode. Per-repo platforms and max runners are tuned by selecting the repo on the main window.")
     }
   }
 
@@ -420,7 +404,7 @@ private struct LinuxSettingsTab: View {
         }
         .disabled(app.state != .offline)
       } else {
-        Text("Install a container runtime (free), then pull the image: Apple `container` from github.com/apple/container/releases (macOS 26+), or `brew install colima docker`.")
+        Text("Install Apple `container` from github.com/apple/container/releases (macOS 26+), then pull the image.")
           .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
       }
     } header: {
@@ -448,7 +432,7 @@ private struct LinuxSettingsTab: View {
       }
       .disabled(app.state != .offline || !app.linuxBackendAvailable)
       if !app.linuxBackendAvailable {
-        Text("Install a container runtime to re-pull.").font(.caption).foregroundStyle(.tertiary)
+        Text("Install Apple `container` to re-pull.").font(.caption).foregroundStyle(.tertiary)
       } else if app.state != .offline {
         Text("Go offline to re-pull.").font(.caption).foregroundStyle(.tertiary)
       }

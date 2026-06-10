@@ -1,7 +1,7 @@
 import Foundation
 
 /// The Linux runner **container image** acquisition story — the analog of
-/// `RunnerInstaller` for macOS, but a `docker pull` (seconds) instead of a
+/// `RunnerInstaller` for macOS, but a container image pull (seconds) instead of a
 /// tarball download or a 30–40 min Windows base build.
 ///
 /// We use the **official** `ghcr.io/actions/actions-runner` image: a multi-arch

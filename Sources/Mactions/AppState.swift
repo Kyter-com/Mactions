@@ -320,6 +320,11 @@ final class AppState: ObservableObject {
         linuxImageReady: linuxImageReady)
       defaults.set(try? JSONEncoder().encode(plan), forKey: "fleetPlanV2")
     }
+    let planBeforeLabelNormalization = plan
+    plan.normalizeWorkflowLabels()
+    if plan != planBeforeLabelNormalization {
+      defaults.set(try? JSONEncoder().encode(plan), forKey: "fleetPlanV2")
+    }
     isSignedIn = TokenStore.load() != nil
     // Restore past-run history (small JSON; cheap synchronous read like the
     // token/config loads above) so the dashboard has it immediately on open.
@@ -353,12 +358,12 @@ final class AppState: ObservableObject {
 
   // MARK: Plan mutation (the per-(repo,platform) config)
   //
-  // Per-combo edits (enable/count/labels) are allowed WHILE ONLINE: the live
+  // Per-combo edits (enable/count) are allowed WHILE ONLINE: the live
   // orchestrators snapshot the plan at go-online and don't re-read it, so editing
   // can't race them — it just won't take effect until the fleet restarts. We mark
   // `pendingRestart` so the UI offers a one-click "restart fleet to apply" instead
-  // of forcing a full manual offline→edit→online cycle for a one-character label
-  // fix. Repo ADD/REMOVE stays offline-only: the live grid is keyed off
+  // of forcing a full manual offline→edit→online cycle for a count tweak.
+  // Repo ADD/REMOVE stays offline-only: the live grid is keyed off
   // `plan.repos`, so removing a repo online would hide a still-running runner.
 
   /// Set true when a per-combo edit lands while the fleet is live (not offline),
@@ -454,12 +459,6 @@ final class AppState: ObservableObject {
     noteComboEdit()
   }
 
-  /// Set a combo's labels from a comma-separated string.
-  func setLabels(_ text: String, os: RunnerOS, repoID: String) {
-    plan.setLabels(Self.parseLabels(text), os: os, in: repoID)
-    noteComboEdit()
-  }
-
   /// Toggle the ALL-REPOS scope: when on, the online fleet also watches every
   /// admin repo (discovery seeded from the default platforms) — not just the
   /// explicit list. Staged like every other plan edit.
@@ -480,15 +479,17 @@ final class AppState: ObservableObject {
 
   // MARK: New-repo defaults (Settings → General)
 
-  var defaultMacOSLabelsText: String { plan.defaultMacOSLabels.joined(separator: ", ") }
-
-  func setDefaultMacOSLabels(_ text: String) {
-    plan.defaultMacOSLabels = Self.parseLabels(text)
+  func setDefaultMacOSCount(_ count: Int) {
+    plan.setDefaultCount(count, for: .macOS)
     noteDefaultsEdit()
   }
 
-  func setDefaultMacOSCount(_ count: Int) {
-    plan.defaultMacOSCount = max(1, min(5, count))
+  func defaultCount(for os: RunnerOS) -> Int {
+    plan.defaultCount(for: os)
+  }
+
+  func setDefaultCount(_ count: Int, os: RunnerOS) {
+    plan.setDefaultCount(count, for: os)
     noteDefaultsEdit()
   }
 
@@ -497,7 +498,7 @@ final class AppState: ObservableObject {
 
   /// Defaults edits normally affect only future repo adds (plain save). Under
   /// ALL-REPOS mode they are live discovery inputs (the platform match set and
-  /// seed labels/counts) while the armed factories stay frozen from goOnline —
+  /// seed counts) while the armed factories stay frozen from goOnline —
   /// so stage a restart like any other combo edit instead of half-applying.
   private func noteDefaultsEdit() {
     if plan.isAllRepos { noteComboEdit() } else { saveConfig() }
@@ -628,7 +629,11 @@ final class AppState: ObservableObject {
       reportBlockingError("Enable at least one platform for a repo (select it on the left to configure).")
       return
     }
-    // Per-combo editable labels are the top silent-failure risk — a combo whose
+    guard !combos.isEmpty || !plan.defaultPlatforms.isEmpty else {
+      reportBlockingError("Enable at least one default platform for all repositories.")
+      return
+    }
+    // Persisted label sets still need the GitHub routing floor: a combo whose
     // labels are empty or drop `self-hosted` would register a runner no workflow
     // can target. Hard-block here rather than let the job hang unmatched.
     let invalid = plan.invalidCombos()
@@ -682,6 +687,7 @@ final class AppState: ObservableObject {
         let wantsMac =
           combos.contains { $0.os == .macOS }
           || discoveryPlatforms.contains(RunnerOS.macOS.rawValue)
+        let macOSCombos = combos.filter { $0.os == .macOS }
         let windowsCombos = combos.filter { $0.os == .windows }
         let linuxCombos = combos.filter { $0.os == .linux }
         let wantsWindows =
@@ -691,12 +697,31 @@ final class AppState: ObservableObject {
         // Concurrent runners the plan could ask for per OS (Σ per-combo caps) —
         // the denominator for the "capped at X" status when the host budget
         // sits below the plan's ceiling.
-        let windowsRequested = windowsCombos.reduce(0) { $0 + $1.config.count }
-        let linuxRequested = linuxCombos.reduce(0) { $0 + $1.config.count }
+        let macOSDiscoveryRequested =
+          discoveryPlatforms.contains(RunnerOS.macOS.rawValue) ? plan.defaultCount(for: .macOS) : 0
+        let windowsDiscoveryRequested =
+          discoveryPlatforms.contains(RunnerOS.windows.rawValue) ? plan.defaultCount(for: .windows) : 0
+        let linuxDiscoveryRequested =
+          discoveryPlatforms.contains(RunnerOS.linux.rawValue) ? plan.defaultCount(for: .linux) : 0
+        let macOSRequested =
+          macOSCombos.reduce(macOSDiscoveryRequested) { $0 + $1.config.count }
+        let windowsRequested =
+          windowsCombos.reduce(windowsDiscoveryRequested) { $0 + $1.config.count }
+        let linuxRequested =
+          linuxCombos.reduce(linuxDiscoveryRequested) { $0 + $1.config.count }
+        let maxMacOS =
+          wantsMac
+          ? MacOSLocalBudget.maxConcurrentRunners(
+            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+            activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount,
+            availableStorageBytes: Self.availableStorageBytes(for: HostCleanup.mactionsRoot()))
+          : 0
         // Only fetch the macOS agent template when a macOS combo is actually
-        // wanted — a Windows/Linux-only plan needs no local agent.
+        // wanted and this host has admission budget — a Windows/Linux-only plan
+        // needs no local agent, and a 0-cap macOS plan should say so rather than
+        // arming runners that can never start.
         let factory: LocalProcessProviderFactory?
-        if wantsMac {
+        if wantsMac && maxMacOS > 0 {
           let template = try await RunnerInstaller.ensureInstalled(token: token)
           guard fleetEpoch == myEpoch else { return }  // went offline during download
           factory = LocalProcessProviderFactory(
@@ -726,8 +751,8 @@ final class AppState: ObservableObject {
           ? 0
           : WindowsVMBudget.maxConcurrentVMs(
             physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory, perVMGB: perVMGB)
-        // Linux fleet: only when Linux is wanted, a container runtime is
-        // installed, AND it's actually ready right now. Re-verify ready() (daemon
+        // Linux fleet: only when Linux is wanted, Apple container is installed,
+        // AND it's actually ready right now. Re-verify ready() (daemon
         // up + image present) here because the persisted linuxImageReady can be
         // stale (image pruned / daemon stopped) — and a dead-daemon `<cli> run`
         // fails ASYNC (not a throw from start()), so without this gate the
@@ -761,10 +786,10 @@ final class AppState: ObservableObject {
         // demand bursty and concurrent, so capacity is spent when a runner is
         // actually provisioned and refunded when it exits — N combos can no
         // longer pre-claim the whole budget while idle.
-        let budget = HostBudget(limits: [.windows: maxWindowsVMs, .linux: maxLinux])
+        let budget = HostBudget(limits: [.macOS: maxMacOS, .windows: maxWindowsVMs, .linux: maxLinux])
         fleetBudget = budget
         fleetFactories = [:]
-        if let factory { fleetFactories[.macOS] = factory }
+        if let factory, maxMacOS > 0 { fleetFactories[.macOS] = factory }
         // A factory whose budget is 0 must NOT arm discovery: it would create
         // orchestrators whose every provision is budget-denied — queued jobs
         // would match, spin up nothing, and wait silently.
@@ -847,6 +872,15 @@ final class AppState: ObservableObject {
         // If the host budget caps concurrency below what the plan could ask
         // for, say so up front (a silent cap reads as a bug when a burst of
         // jobs only gets some runners). Denominator = Σ per-combo caps.
+        if wantsMac, maxMacOS < macOSRequested {
+          let why =
+            maxMacOS == 0
+            ? "CPU/RAM/storage budget can't safely run a macOS job"
+            : "CPU/RAM/storage budget allows \(maxMacOS) at once"
+          statusMessage =
+            (statusMessage ?? "")
+            + " macOS capped at \(maxMacOS)/\(macOSRequested) (\(why))."
+        }
         if windowsFactory != nil, maxWindowsVMs < windowsRequested {
           let why =
             maxWindowsVMs == 0
@@ -870,10 +904,12 @@ final class AppState: ObservableObject {
         // discovered repo would just silently never start — explicit combos
         // get the messages below, discovery-only demand got nothing.
         if plan.isAllRepos {
-          for os: RunnerOS in [.windows, .linux]
+          for os: RunnerOS in [.macOS, .windows, .linux]
           where discoveryPlatforms.contains(os.rawValue) && fleetFactories[os] == nil {
             let why: String
             switch os {
+            case .macOS:
+              why = "CPU/RAM/storage budget can't safely run a macOS job"
             case .windows:
               why =
                 windowsFactory == nil
@@ -884,14 +920,17 @@ final class AppState: ObservableObject {
             case .linux:
               why =
                 linuxFactory == nil
-                ? "set up the container runtime (Settings → Linux)"
+                ? "set up Apple container (Settings → Linux)"
                 : "this Mac can't safely run a Linux container"
-            default:
-              continue
             }
             statusMessage =
               (statusMessage ?? "") + " All-repos \(os.displayName) discovery off — \(why)."
           }
+        }
+        if !macOSCombos.isEmpty, factory == nil {
+          statusMessage =
+            (statusMessage ?? "")
+            + " macOS skipped — CPU/RAM/storage budget can't safely run a macOS job."
         }
         // A Windows combo was enabled but no base image / Fusion → say so instead
         // of silently skipping it.
@@ -908,9 +947,9 @@ final class AppState: ObservableObject {
           if !linuxImageReady {
             detail = "pull the runner image (Settings → Linux)"
           } else if linuxCLI == nil {
-            detail = "install a container runtime (Settings → Linux)"
+            detail = "install Apple container (Settings → Linux)"
           } else {
-            detail = "start the container daemon or re-pull (Settings → Linux)"
+            detail = "start Apple container or re-pull (Settings → Linux)"
           }
           statusMessage = (statusMessage ?? "") + " Linux skipped — \(detail)."
         }
@@ -1198,10 +1237,8 @@ final class AppState: ObservableObject {
   /// (which auto-downloads the latest Win11 ARM64 ISO if none is supplied, then
   /// builds the base VM) and surfaces progress in `statusMessage`.
   ///
-  /// EXPERIMENTAL + LONG: the conversion/install is multi-GB and multi-minute,
-  /// and the live VM path is not yet verified end to end. The button only kicks
-  /// off the prep; a human still completes the one-time install per the script's
-  /// printed next steps.
+  /// LONG: the conversion/install is multi-GB and multi-minute, but the Fusion
+  /// flow is fully automated once prerequisites are present.
   /// `force: true` (the "Rebuild / update Windows image" button) skips the
   /// already-built fast-path and rebuilds from scratch — that's how a newer
   /// Windows build actually gets installed once `checkForWindowsImageUpdate`
@@ -1594,16 +1631,15 @@ final class AppState: ObservableObject {
 
   // MARK: Linux runner (opt-in)
 
-  /// True if a container runtime — Apple `container` (macOS 26+) or a `docker`
-  /// CLI (typically Colima-managed) — is installed. Linux runners aren't
-  /// offerable without one. Presence-only, like `windowsBackendAvailable`.
+  /// True if Apple `container` (macOS 26+) is installed. Linux runners aren't
+  /// offerable without it. Presence-only, like `windowsBackendAvailable`.
   var linuxBackendAvailable: Bool { LinuxContainerProviderFactory.detectInstalledCLI() != nil }
 
   /// Human name of the detected container backend (for the preflight line), or
   /// `nil` if none is installed.
   var linuxBackendName: String? { LinuxContainerProviderFactory.detectInstalledCLI()?.displayName }
 
-  /// Set up the Linux runner: confirm a container daemon is up (starting it
+  /// Set up the Linux runner: confirm Apple container is up (starting it
   /// idempotently if needed), then pull the official runner image. FAST — the
   /// pull is seconds, not the Windows base build's 30–40 min, so the stepper is
   /// just verify-daemon → pull-image. `force: true` (the "Re-pull / update image"
@@ -1614,7 +1650,7 @@ final class AppState: ObservableObject {
     guard !linuxSetupBusy else { return }
     guard let cli = LinuxContainerProviderFactory.detectInstalledCLI() else {
       statusMessage =
-        "No container runtime found. Install one (free): Apple container from github.com/apple/container/releases (macOS 26+), or `brew install colima docker`. Then tap Linux again."
+        "Apple container not found. Install it from github.com/apple/container/releases (macOS 26+), then tap Linux again."
       return
     }
     let image = linuxRunnerImage
@@ -1634,10 +1670,7 @@ final class AppState: ObservableObject {
     linuxSetupFailure = nil
     statusMessage = "Setting up the Linux runner…"
     Task {
-      // 1) Ensure the daemon is up; start it if down. Apple `container` starts
-      //    via its own `system start` (daemonStartArgs); the docker CLI has NO
-      //    daemon-start verb (its daemonStartArgs is empty), so start Colima if
-      //    installed — Docker Desktop / OrbStack must be started by the user.
+      // 1) Ensure the daemon is up; start it if down via `container system start`.
       //    Off the main actor; these can block briefly.
       var daemonUp = await Task.detached {
         (try? Shell.run(cli.executable, cli.daemonStatusArgs()))?.ok ?? false
@@ -1646,11 +1679,7 @@ final class AppState: ObservableObject {
         linuxSetupDetail = "Starting the container daemon…"
         let startArgs = cli.daemonStartArgs()
         await Task.detached {
-          if !startArgs.isEmpty {
-            _ = try? Shell.run(cli.executable, startArgs)
-          } else if let colima = Shell.which("colima") {
-            _ = try? Shell.run(colima, ["start"])
-          }
+          _ = try? Shell.run(cli.executable, startArgs)
         }.value
         daemonUp = await Task.detached {
           (try? Shell.run(cli.executable, cli.daemonStatusArgs()))?.ok ?? false
@@ -1659,18 +1688,18 @@ final class AppState: ObservableObject {
       guard daemonUp else {
         linuxSetupFailureIsExternal = false
         linuxSetupFailure =
-          "The container daemon (\(cli.displayName)) isn't running and couldn't be started. Start it manually, then retry."
-        statusMessage = "Linux setup failed: container daemon not running."
+          "\(cli.displayName) isn't running and couldn't be started. Start it manually, then retry."
+        statusMessage = "Linux setup failed: Apple container not running."
         endLinuxSetup()
         return
       }
 
       // 1b) One-time backend prep: Apple `container` needs a default Linux kernel
       // installed before any container can run (`system start` only prompts for
-      // it). Runs only when needed (gated so the non-idempotent kernel download
-      // isn't repeated). Docker/Colima need nothing here. Slow (~one download).
+      // it). Runs only when needed so the non-idempotent kernel download isn't
+      // repeated. Slow (~one download).
       if cli.daemonPrepareNeeded() {
-        linuxSetupDetail = "Installing the container runtime kernel (one-time)…"
+        linuxSetupDetail = "Installing the Apple container kernel (one-time)…"
         _ = await Task.detached { try? Shell.run(cli.executable, cli.daemonPrepareArgs()) }.value
       }
 
@@ -1712,7 +1741,7 @@ final class AppState: ObservableObject {
         linuxSetupFailure =
           transient
           ? "The image pull hit a transient registry/network issue — not a problem with your Mac or setup. It's safe to retry."
-          : "Couldn't pull the runner image '\(image)'. Check the container runtime and try again."
+          : "Couldn't pull the runner image '\(image)'. Check Apple container and try again."
         statusMessage =
           (transient
             ? "Linux image pull hit a transient issue — safe to retry."
@@ -1816,10 +1845,15 @@ final class AppState: ObservableObject {
   /// NOT live per-VM memory sampling (that's a later phase). Computed on demand.
   struct CapacitySnapshot {
     let hostRAMBytes: UInt64
+    /// Soft host-wide admission cap for bare-host macOS runner processes.
+    let macOSMaxConcurrentRunners: Int
     let windowsPerVMGB: Int
     /// Max concurrent Windows VMs the budget allows (0 if no image / too little
     /// RAM). Mirrors what `goOnline` enforces.
     let windowsMaxConcurrentVMs: Int
+    /// Max concurrent Linux containers the host budget allows (0 if the runner
+    /// image/runtime is not ready, or the host is too constrained).
+    let linuxMaxConcurrentContainers: Int
     let liveMacRunners: Int
     let liveWindowsRunners: Int
     /// RAM the *currently live* Windows VMs are budgeted to use (count × per-VM).
@@ -1844,12 +1878,39 @@ final class AppState: ObservableObject {
     let ram = ProcessInfo.processInfo.physicalMemory
     return CapacitySnapshot(
       hostRAMBytes: ram,
+      macOSMaxConcurrentRunners: MacOSLocalBudget.maxConcurrentRunners(
+        physicalMemoryBytes: ram,
+        activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount,
+        availableStorageBytes: Self.availableStorageBytes(for: HostCleanup.mactionsRoot())),
       windowsPerVMGB: perVM,
       windowsMaxConcurrentVMs: windowsImageReady
         ? WindowsVMBudget.maxConcurrentVMs(physicalMemoryBytes: ram, perVMGB: perVM)
         : 0,
+      linuxMaxConcurrentContainers: linuxImageReady
+        ? LinuxContainerBudget.maxConcurrentContainers(
+          physicalMemoryBytes: ram,
+          activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount)
+        : 0,
       liveMacRunners: runners.filter { $0.os == .macOS }.count,
       liveWindowsRunners: runners.filter { $0.os == .windows }.count)
+  }
+
+  static func availableStorageBytes(for url: URL, fileManager: FileManager = .default) -> UInt64? {
+    var probe = url
+    while !fileManager.fileExists(atPath: probe.path) {
+      let parent = probe.deletingLastPathComponent()
+      guard parent.path != probe.path else { break }
+      probe = parent
+    }
+    if let values = try? probe.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+      let capacity = values.volumeAvailableCapacityForImportantUsage
+    {
+      return UInt64(max(0, capacity))
+    }
+    guard let attrs = try? fileManager.attributesOfFileSystem(forPath: probe.path),
+      let free = attrs[.systemFreeSize] as? NSNumber
+    else { return nil }
+    return free.uint64Value
   }
 
   // MARK: Live memory sampling (dashboard Memory tab)

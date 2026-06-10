@@ -149,10 +149,6 @@ final class WindowsVMProviderTests: XCTestCase {
       // Fusion (vmrun) and/or the helper aren't installed on this host.
       XCTAssertNil(cli)
     }
-    // The free-first alias is identical with a single backend.
-    XCTAssertEqual(
-      WindowsVMProviderFactory.detectFreeFirstCLI() is VMwareCLI,
-      cli is VMwareCLI)
   }
 
   // MARK: Teardown guard

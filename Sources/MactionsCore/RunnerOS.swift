@@ -8,8 +8,8 @@ import Foundation
 /// - windows: the `WindowsVMProvider` path — available only once the Win11-ARM
 ///   base image is built (gated by `windowsImageReady`) + VMware Fusion present.
 /// - linux: the `LinuxContainerProvider` path — available once the runner image
-///   is pulled (gated by `linuxImageReady`) + a container daemon (Apple
-///   `container` / Colima `docker`) is installed and running.
+///   is pulled (gated by `linuxImageReady`) + Apple `container` is installed and
+///   running.
 public enum RunnerOS: String, CaseIterable, Codable, Sendable, Identifiable {
   case macOS
   case windows
@@ -19,7 +19,7 @@ public enum RunnerOS: String, CaseIterable, Codable, Sendable, Identifiable {
 
   /// Human label + the GitHub `runs-on` label this OS registers with. The fleet
   /// labels are `[self-hosted, <githubLabel>, mactions]` (mirrors a CI matrix's
-  /// per-OS arm). macOS's set is user-editable in the UI; the rest derive here.
+  /// per-OS arm), with Linux adding `ARM64`.
   public var displayName: String {
     switch self {
     case .macOS: return "macOS"

@@ -85,7 +85,7 @@ final class WindowsPreflightTests: XCTestCase {
 
   func testMissingFreeFormulaeIncludesXorriso() {
     // xorriso (for the no-prompt boot ISO) is brew-able and folded into the free
-    // install list — but is NOT required for `ready` (the build falls back).
+    // install list.
     let r = report(which: Set(WindowsImage.converterDependencies.map(\.binary)))  // converters present, no xorriso
     XCTAssertTrue(r.missingConverterFormulae.isEmpty)
     XCTAssertFalse(r.xorrisoInstalled)
@@ -140,14 +140,14 @@ final class WindowsPreflightTests: XCTestCase {
     XCTAssertEqual(WindowsPreflight.installPlan(for: everything), .nothingToInstall)
   }
 
-  func testReadyDoesNotRequireXorriso() {
-    // Fusion + brew + converters present, xorriso absent -> still "ready" (the
-    // no-prompt ISO gracefully falls back to a one-keypress prompting ISO).
+  func testReadyRequiresXorriso() {
+    // Fusion + brew + converters present, xorriso absent -> not ready. The
+    // no-prompt ISO remaster is now mandatory.
     let r = report(
       which: Set(["brew"] + WindowsImage.converterDependencies.map(\.binary)),
       paths: [WindowsPreflight.vmrunPath])
     XCTAssertFalse(r.xorrisoInstalled)
-    XCTAssertTrue(r.ready)
+    XCTAssertFalse(r.ready)
   }
 
   // MARK: runInstall accounting (with an injected runner — no shelling out)

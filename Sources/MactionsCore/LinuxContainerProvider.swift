@@ -3,10 +3,8 @@ import Foundation
 // MARK: - Linux container CLI abstraction
 
 /// The pull/run/stop/rm/inspect verbs a container-per-job provider drives,
-/// expressed as **pure command builders** so the per-tool shapes are
-/// unit-testable without a live daemon (mirrors `WindowsVMCLI`). `DockerCLI`
-/// (the `docker` CLI, typically Colima-managed) and `ContainerCLI` (Apple's
-/// `container`) are the conformers.
+/// expressed as **pure command builders** so the Apple `container` command
+/// shape is unit-testable without a live daemon (mirrors `WindowsVMCLI`).
 ///
 /// CONTAINER-PER-JOB / FOREGROUND model (see AGENTS.md → Linux support): per job
 /// we run ONE ephemeral container whose command is the agent's `run.sh`,
@@ -24,7 +22,7 @@ import Foundation
 /// `--filter`). The pure-builder + unit-test split keeps any future flag change
 /// a one-line edit.
 public protocol LinuxContainerCLI: Sendable {
-  /// Absolute path to the CLI binary (e.g. `/opt/homebrew/bin/docker`).
+  /// Absolute path to the CLI binary (e.g. `/usr/local/bin/container`).
   var executable: String { get }
   /// Human label for the substrate (shown in the UI / logs).
   var displayName: String { get }
@@ -49,22 +47,20 @@ public protocol LinuxContainerCLI: Sendable {
   /// Probe daemon liveness (the "ready" gate; analog of Fusion's base-status).
   /// Non-zero exit == daemon down.
   func daemonStatusArgs() -> [String]
-  /// Idempotently bring the daemon/VM up (e.g. `colima start` /
-  /// `container system start`). Safe to run when already up.
+  /// Idempotently bring the daemon/VM up (`container system start`). Safe to run
+  /// when already up.
   func daemonStartArgs() -> [String]
-  /// One-time daemon preparation needed before the FIRST container can run
-  /// (Apple `container` must install a default Linux kernel — `system start`
-  /// only PROMPTS for it, which fails non-interactively). `[]` when nothing is
-  /// needed (docker). Run only when `daemonPrepareNeeded()` is true — it's not
-  /// idempotent (re-installing re-downloads and errors).
+  /// One-time daemon preparation needed before the FIRST container can run.
+  /// Apple `container` must install a default Linux kernel — `system start`
+  /// only PROMPTS for it, which fails non-interactively. Run only when
+  /// `daemonPrepareNeeded()` is true; it is not idempotent.
   func daemonPrepareArgs() -> [String]
   /// Whether `daemonPrepareArgs()` still needs to run (e.g. no default kernel is
-  /// installed yet). `false` for backends that need no prep.
+  /// installed yet).
   func daemonPrepareNeeded() -> Bool
-  /// List candidate container refs for the orphan sweep. Scoped to OUR
-  /// containers by the backend: docker filters by `--label`, while Apple
-  /// `container` (no label filter) lists all and the parser scopes by the
-  /// `mactions-` name prefix (the `--name` we set IS the container ID).
+  /// List candidate container refs for the orphan sweep. Apple `container` has
+  /// no label filter, so `sweepRefs(from:)` scopes by the `mactions-` name
+  /// prefix (the `--name` we set IS the container ID).
   func sweepListArgs() -> [String]
   /// Parse the refs to force-remove from `sweepListArgs()` output.
   func sweepRefs(from output: String) -> [String]
@@ -77,97 +73,26 @@ extension LinuxContainerCLI {
   /// backend (it's a property of the agent, not the container engine).
   public var jitEnvName: String { "ACTIONS_RUNNER_INPUT_JITCONFIG" }
 
-  /// Default: no extra daemon prep (docker/colima just need the daemon up).
-  public func daemonPrepareArgs() -> [String] { [] }
-  public func daemonPrepareNeeded() -> Bool { false }
-
-  /// Default sweep listing: filter by our `mactions` label (docker). The output
-  /// is already scoped to our containers, so every non-empty line is a ref.
-  public func sweepListArgs() -> [String] { ["ps", "-aq", "--filter", "label=mactions"] }
-  public func sweepRefs(from output: String) -> [String] {
-    output.split(whereSeparator: \.isNewline)
-      .map { $0.trimmingCharacters(in: .whitespaces) }
-      .filter { !$0.isEmpty }
-  }
-
   /// Default: a running container reports "running" in its inspected state.
   public func parseIsRunning(from output: String) -> Bool {
     output.lowercased().contains("running")
   }
 }
 
-// MARK: - Docker CLI backend (Colima-managed, or a docker the user already has)
-
-/// The `docker`-CLI backend. The free path is `brew install colima docker`;
-/// `colima start` auto-registers a `docker` context, so the standard `docker`
-/// CLI drives native `linux/arm64` containers on Apple Silicon. Also matches a
-/// `docker` provided by Docker Desktop / OrbStack / Podman-shim the user already
-/// has (we detect, we never auto-install those paid daemons).
-public struct DockerCLI: LinuxContainerCLI {
-  public let executable: String
-  public init(executable: String) { self.executable = executable }
-  public var displayName: String { "Docker CLI (Colima)" }
-
-  public func runArgs(name: String, image: String, label: String, cpus: Int, memoryGB: Int) -> [String] {
-    // Foreground (no -d): the Foundation Process blocks on the agent and reaps
-    // on exit via terminationHandler — identical to LocalProcessProvider. `--rm`
-    // destroys the writable layer; `--label` scopes the orphan sweep; NO volumes,
-    // NO bind-mounts, NO docker.sock (clean slate). `--platform` pins arm64 so we
-    // never silently QEMU-emulate amd64. The JIT rides in via `-e <name>` (value
-    // pulled from the process environment) so it stays out of `ps`. The trailing
-    // command is the agent's run.sh — the official image defines no ENTRYPOINT.
-    //
-    // RUNNER_TOOL_CACHE/AGENT_TOOLSDIRECTORY (BASE.md OS/runner-identity parity,
-    // hosted-paired): hosted Ubuntu sets both to one path. We use the
-    // runner-WRITABLE, --rm-ephemeral `/home/runner/_work/_tool` — exactly where
-    // the agent already defaults the tool cache (uid 1001 owns /home/runner) —
-    // NOT hosted's `/opt/hostedtoolcache`, which is root-owned in this official
-    // image and would EACCES every setup-* write. Inlined (not secret, unlike the
-    // name-only JIT `-e`); kept identical so setup-*'s "AGENT_TOOLSDIRECTORY
-    // overrides RUNNER_TOOL_CACHE" rule is a no-op.
-    [
-      "run", "--rm", "--platform", "linux/arm64",
-      "--name", name, "--label", label,
-      "--cpus", String(cpus), "--memory", "\(memoryGB)g",
-      "-e", jitEnvName,
-      "-e", "RUNNER_TOOL_CACHE=/home/runner/_work/_tool",
-      "-e", "AGENT_TOOLSDIRECTORY=/home/runner/_work/_tool",
-      image,
-      "/home/runner/run.sh",
-    ]
-  }
-  public func stopArgs(name: String) -> [String] { ["stop", "-t", "30", name] }
-  public func rmArgs(name: String) -> [String] { ["rm", "-f", name] }
-  public func inspectArgs(name: String) -> [String] { ["inspect", "-f", "{{.State.Status}}", name] }
-  public func pullArgs(image: String) -> [String] { ["pull", "--platform", "linux/arm64", image] }
-  public func imageInspectArgs(image: String) -> [String] { ["image", "inspect", image] }
-  public func daemonStatusArgs() -> [String] { ["info"] }
-  /// The `docker` binary has NO daemon-start verb — `docker start` starts a
-  /// *container* (and errors without a name), not the engine. Return empty so
-  /// the app starts the actual daemon manager itself (`colima start` when Colima
-  /// is installed; Docker Desktop / OrbStack must be started by the user). See
-  /// `AppState.setUpLinuxRunner`.
-  public func daemonStartArgs() -> [String] { [] }
-  // sweepListArgs/sweepRefs + daemonPrepare* use the protocol defaults (label
-  // filter, non-empty lines, no prep) — docker needs nothing backend-specific.
-}
-
 // MARK: - Apple `container` backend (macOS 26+, per-container lightweight VM)
 
 /// Apple's `container` (Containerization framework) backend — Apache-2.0, free
-/// at any org size, native arm64, one lightweight VM per container (the
-/// strongest isolation of the container options). Requires macOS 26+ and is
-/// pre-1.0 (documented networking rough edges), so detection gates on the OS
-/// version and the default selection prefers it only when present.
+/// at any org size, native arm64, one lightweight VM per container. Requires
+/// macOS 26+.
 public struct ContainerCLI: LinuxContainerCLI {
   public let executable: String
   public init(executable: String) { self.executable = executable }
   public var displayName: String { "Apple container" }
 
   public func runArgs(name: String, image: String, label: String, cpus: Int, memoryGB: Int) -> [String] {
-    // RUNNER_TOOL_CACHE/AGENT_TOOLSDIRECTORY: same hosted-identity parity as the
-    // docker backend — the runner-writable, --rm-ephemeral `/home/runner/_work/
-    // _tool` (the agent's own default), never the root-owned `/opt/hostedtoolcache`.
+    // RUNNER_TOOL_CACHE/AGENT_TOOLSDIRECTORY: hosted-identity parity using the
+    // runner-writable, --rm-ephemeral `/home/runner/_work/_tool` (the agent's
+    // own default), never the root-owned `/opt/hostedtoolcache`.
     [
       "run", "--rm",
       "--name", name, "--label", label,
@@ -223,8 +148,8 @@ public struct ContainerCLI: LinuxContainerCLI {
 /// code IS the completion signal — so we reuse `LocalProcessProvider`'s exact
 /// `terminationHandler` reaping pattern (no boot/job/stop polling threads, no
 /// power-state classifier; those were only needed for Fusion's decoupled VM
-/// shutdown). Clean for TRUSTED/private repos; for untrusted code use a VM
-/// provider (Tart/Lima) for kernel isolation — same caveat as `LocalProcessProvider`.
+/// shutdown). Clean for TRUSTED/private repos; untrusted code needs full VM
+/// isolation — same caveat as `LocalProcessProvider`.
 public final class LinuxContainerProvider: RunnerProvider, @unchecked Sendable {
   public let id: String
   private let image: String
@@ -292,7 +217,7 @@ public final class LinuxContainerProvider: RunnerProvider, @unchecked Sendable {
   }
 
   /// Idempotent: `--rm` reaps the container on a normal exit, but a SIGKILL
-  /// mid-job (or the `docker`/`container` CLI client being terminated before it
+  /// mid-job (or the `container` CLI client being terminated before it
   /// reaps) can leave the container alive — so force-remove by name to guarantee
   /// nothing survives. Best-effort (a missing/dead daemon is harmless here).
   private func cleanup() {
@@ -323,10 +248,8 @@ public struct LinuxContainerProviderFactory: RunnerProviderFactory {
   }
 
   /// Presence-only detection, exactly like Fusion's `vmrun` probe — we never
-  /// install a daemon. Preference order (returns `nil` when nothing is present,
-  /// so no Linux fleet is offered and the UI points the user at `brew`):
-  ///   1. Apple `container` (arm64 + macOS 26+) — best isolation, free any size.
-  ///   2. `docker` (Colima-managed, or a Desktop/OrbStack the user already has).
+  /// install a daemon. Linux is offered only when Apple `container` is installed
+  /// on arm64 macOS 26+.
   public static func detectInstalledCLI(
     operatingSystemVersion: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
   ) -> LinuxContainerCLI? {
@@ -336,17 +259,11 @@ public struct LinuxContainerProviderFactory: RunnerProviderFactory {
     #else
     let isARM64 = false
     #endif
-    // Apple ships `container` as a signed .pkg installing under /usr/local
-    // (the Homebrew route is the CASK `brew install --cask container`, which
-    // wraps that pkg) — so probe /usr/local/bin first, then the Homebrew bin.
     if isARM64, operatingSystemVersion.majorVersion >= 26 {
       for bin in ["/usr/local/bin/container", "/opt/homebrew/bin/container"]
       where fm.isExecutableFile(atPath: bin) {
         return ContainerCLI(executable: bin)
       }
-    }
-    if let docker = Shell.which("docker") {
-      return DockerCLI(executable: docker)
     }
     return nil
   }

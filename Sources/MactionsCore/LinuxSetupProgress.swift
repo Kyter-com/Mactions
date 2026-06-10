@@ -1,10 +1,10 @@
 import Foundation
 
 /// The ordered, user-facing phases of Linux runner setup, and a PURE parser that
-/// maps a line of `docker`/`container` `pull` output to the phase it signals.
+/// maps a line of Apple `container` setup/pull output to the phase it signals.
 /// The Linux analog of `WindowsSetupProgress` — but where the Windows base build
 /// is a 5-phase, 30–40 min headless install, Linux setup is just **verify the
-/// container daemon** then **pull the runner image** (seconds), so it collapses
+/// Apple `container` daemon** then **pull the runner image** (seconds), so it collapses
 /// to two fast steps.
 ///
 /// The app streams the CLI's stdout/stderr (`Shell.runStreaming`) and feeds each
@@ -12,8 +12,8 @@ import Foundation
 /// ever advance FORWARD in the UI (see `Comparable`), so a stray marker can't
 /// regress the indicator.
 public enum LinuxSetupStep: Int, CaseIterable, Sendable, Comparable {
-  /// Confirm a container runtime is installed and its daemon is up
-  /// (`colima start` / `container system start` if needed). App-driven.
+  /// Confirm Apple `container` is installed and its daemon is up
+  /// (`container system start` if needed). App-driven.
   case verifyDaemon = 0
   /// Pull the official runner image (`ghcr.io/actions/actions-runner`, arm64).
   case pullImage
@@ -23,7 +23,7 @@ public enum LinuxSetupStep: Int, CaseIterable, Sendable, Comparable {
   /// Short label for the stepper row.
   public var title: String {
     switch self {
-    case .verifyDaemon: return "Checking container runtime"
+    case .verifyDaemon: return "Checking Apple container"
     case .pullImage: return "Pulling runner image"
     }
   }
@@ -31,7 +31,7 @@ public enum LinuxSetupStep: Int, CaseIterable, Sendable, Comparable {
   /// One-line hint shown under the active step.
   public var hint: String {
     switch self {
-    case .verifyDaemon: return "Verifying the container daemon is installed and running."
+    case .verifyDaemon: return "Verifying Apple container is installed and running."
     case .pullImage: return "Downloading ghcr.io/actions/actions-runner (arm64) — usually seconds."
     }
   }
@@ -42,16 +42,14 @@ public enum LinuxSetupProgress {
   /// isn't a recognizable marker. Checked most-advanced-first.
   public static func step(for line: String) -> LinuxSetupStep? {
     let l = line.lowercased()
-    // pull / image (docker: "Pulling from", "Pull complete", "Downloading",
-    // "Status: Downloaded"; container: "pulling image", "downloading")
+    // pull / image
     if l.contains("pulling") || l.contains("pull complete") || l.contains("downloading")
       || l.contains("downloaded") || l.contains("extracting") || l.contains("digest:")
     {
       return .pullImage
     }
     // daemon verify
-    if l.contains("starting colima") || l.contains("colima is running")
-      || l.contains("container runtime") || l.contains("daemon")
+    if l.contains("container runtime") || l.contains("daemon")
       || l.contains("system start") || l.contains("verifying")
     {
       return .verifyDaemon
@@ -68,7 +66,6 @@ public enum LinuxSetupProgress {
     if l.contains("pull complete") || l.contains("status: downloaded") || l.contains("digest:") {
       return "Image ready."
     }
-    if l.contains("starting colima") { return "Starting the container VM (Colima)…" }
     if l.contains("system start") { return "Starting the container daemon…" }
     return nil
   }
@@ -81,12 +78,10 @@ public enum LinuxSetupProgress {
     let s = output.lowercased()
     // LOCAL daemon/runtime misconfig is NOT transient — the user has to fix it,
     // so don't frame "your daemon is down" as "retry, it's the network".
-    // Checked FIRST because a dead docker socket reads as
-    // "…/docker.sock: connect: connection refused", which would otherwise match
-    // the transient list below.
+    // Checked FIRST because a local daemon failure can include "connection
+    // refused", which would otherwise match the transient list below.
     let localFailure = [
-      "cannot connect to the docker daemon", "is the docker daemon running",
-      "docker.sock", "command not found", "daemon is not running",
+      "daemon is not running", "container system is not running", "command not found",
     ]
     if localFailure.contains(where: { s.contains($0) }) { return false }
     let transient = [

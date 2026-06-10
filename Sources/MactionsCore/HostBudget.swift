@@ -7,9 +7,9 @@ import Foundation
 /// orchestrator's count: scale-from-zero makes demand bursty and concurrent,
 /// so every combo must draw from one live pool — otherwise N combos could each
 /// scale to their own cap simultaneously and thrash the host. The per-OS
-/// ceilings still come from the pure budget formulas (`WindowsVMBudget`,
-/// `LinuxContainerBudget`) computed against the host's physical RAM/CPU; this
-/// type just makes spending them dynamic.
+/// ceilings still come from the pure budget formulas (`MacOSLocalBudget`,
+/// `WindowsVMBudget`, `LinuxContainerBudget`) computed against the host's
+/// physical RAM/CPU/storage; this type just makes spending them dynamic.
 ///
 /// `@MainActor` rather than an `actor` on purpose: every caller — `AppState`
 /// and each `RunnerOrchestrator` — is already main-actor-isolated, which keeps
@@ -17,8 +17,8 @@ import Foundation
 /// racing for the last unit).
 @MainActor
 public final class HostBudget {
-  /// Concurrent-runner ceiling per OS. A missing key = uncapped (macOS agents
-  /// are lightweight processes; their 1...5 per-combo clamp is bound enough).
+  /// Concurrent-runner ceiling per OS. A missing key = uncapped; AppState
+  /// normally supplies a limit for every currently armed OS.
   private let limits: [RunnerOS: Int]
   private var used: [RunnerOS: Int] = [:]
 

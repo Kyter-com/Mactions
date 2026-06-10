@@ -90,10 +90,16 @@ public struct FleetCombo: Equatable, Sendable {
 /// global state).
 public struct FleetPlan: Codable, Equatable, Sendable {
   public var repos: [RepoPlan]
-  /// Labels seeded into a new macOS combo (user-editable in Settings → General).
+  /// Legacy macOS label seed retained for persisted-plan compatibility. New
+  /// configs use `RunnerOS.macOS.defaultLabels` so all platform labels are fixed,
+  /// read-only workflow `runs-on` tokens.
   public var defaultMacOSLabels: [String]
   /// Runner count seeded into a new macOS combo.
   public var defaultMacOSCount: Int
+  /// Optional per-OS default runner ceilings for newly-added repos and all-repos
+  /// discovery. Plans persisted before this existed decode with `nil`; macOS
+  /// falls back to `defaultMacOSCount`, Windows/Linux fall back to 1.
+  public var defaultPlatformCounts: [String: Int]?
   /// `RunnerOS.rawValue`s auto-enabled when a repo is added (default: macOS only).
   public var defaultPlatforms: [String]
   /// Scope: when true, the fleet ALSO watches every repo the user can admin —
@@ -109,24 +115,50 @@ public struct FleetPlan: Codable, Equatable, Sendable {
     repos: [RepoPlan] = [],
     defaultMacOSLabels: [String] = ["self-hosted", "macOS", "mactions"],
     defaultMacOSCount: Int = 1,
+    defaultPlatformCounts: [String: Int]? = nil,
     defaultPlatforms: [String] = ["macOS"],
     allRepos: Bool? = nil
   ) {
     self.repos = repos
     self.defaultMacOSLabels = defaultMacOSLabels
     self.defaultMacOSCount = max(1, min(5, defaultMacOSCount))
+    self.defaultPlatformCounts = defaultPlatformCounts?.mapValues { max(1, min(5, $0)) }
     self.defaultPlatforms = defaultPlatforms
     self.allRepos = allRepos
   }
 
   // MARK: Seeds
 
-  /// The starting config for a newly-enabled `(repo, os)` combo: macOS uses the
-  /// editable defaults; Windows/Linux use their derived label set + count 1.
+  /// The starting config for a newly-enabled `(repo, os)` combo: macOS keeps its
+  /// saved default count; every platform uses its fixed workflow label set.
   public func seed(for os: RunnerOS) -> PlatformConfig {
-    os == .macOS
-      ? PlatformConfig(enabled: true, count: defaultMacOSCount, labels: defaultMacOSLabels)
-      : PlatformConfig(enabled: true, count: 1, labels: os.defaultLabels)
+    PlatformConfig(enabled: true, count: defaultCount(for: os), labels: os.defaultLabels)
+  }
+
+  public func defaultCount(for os: RunnerOS) -> Int {
+    let fallback = os == .macOS ? defaultMacOSCount : 1
+    return max(1, min(5, defaultPlatformCounts?[os.rawValue] ?? fallback))
+  }
+
+  public mutating func setDefaultCount(_ count: Int, for os: RunnerOS) {
+    let clamped = max(1, min(5, count))
+    var counts = defaultPlatformCounts ?? [:]
+    counts[os.rawValue] = clamped
+    defaultPlatformCounts = counts
+    if os == .macOS { defaultMacOSCount = clamped }
+  }
+
+  /// Normalize labels persisted by older builds that let macOS labels be edited.
+  /// Counts/platform enablement are preserved; only the workflow label tokens are
+  /// pinned back to the fixed per-OS contract.
+  public mutating func normalizeWorkflowLabels() {
+    defaultMacOSLabels = RunnerOS.macOS.defaultLabels
+    for repoIndex in repos.indices {
+      for raw in Array(repos[repoIndex].platforms.keys) {
+        guard let os = RunnerOS(rawValue: raw) else { continue }
+        repos[repoIndex].platforms[raw]?.labels = os.defaultLabels
+      }
+    }
   }
 
   // MARK: Queries (what go-online consumes)
@@ -187,13 +219,9 @@ public struct FleetPlan: Codable, Equatable, Sendable {
     mutate(os, in: repoID) { $0.count = max(1, min(5, count)) }
   }
 
-  public mutating func setLabels(_ labels: [String], os: RunnerOS, in repoID: String) {
-    mutate(os, in: repoID) { $0.labels = labels }
-  }
-
   /// Mutate a combo's config in place, seeding a DISABLED placeholder when the
-  /// platform was never configured (so editing labels before flipping Enable
-  /// doesn't silently switch the platform on).
+  /// platform was never configured (so changing a count doesn't silently switch
+  /// the platform on).
   private mutating func mutate(
     _ os: RunnerOS, in repoID: String, _ transform: (inout PlatformConfig) -> Void
   ) {
@@ -212,10 +240,10 @@ public struct FleetPlan: Codable, Equatable, Sendable {
   // MARK: Migration off the legacy flat keys
 
   /// Reproduce TODAY'S exact go-online fleet from the four legacy globals, so an
-  /// existing install comes up identically after the upgrade. macOS uses
-  /// `runnersPerRepo` + the user's labels; Windows/Linux are enabled only when
-  /// their image is actually ready (count 1, derived labels) — mirroring the old
-  /// `goOnline` readiness gating. Pure → unit-tested like
+  /// existing install comes up identically after the upgrade except for labels,
+  /// which are now fixed per OS. Windows/Linux are enabled only when their image
+  /// is actually ready (count 1, derived labels) — mirroring the old `goOnline`
+  /// readiness gating. Pure → unit-tested like
   /// `RunnerOS.restoreSelection`.
   public static func migrate(
     repoFullNames: [String],
@@ -225,13 +253,13 @@ public struct FleetPlan: Codable, Equatable, Sendable {
     windowsImageReady: Bool,
     linuxImageReady: Bool
   ) -> FleetPlan {
-    let macLabels = labels.isEmpty ? RunnerOS.macOS.defaultLabels : labels
+    _ = labels  // Legacy user-editable macOS labels are intentionally ignored.
     let count = max(1, min(5, runnersPerRepo))
     let repos = repoFullNames.compactMap(RepoRef.init(fullName:)).map { ref -> RepoPlan in
       var platforms: [String: PlatformConfig] = [:]
       if oses.contains(.macOS) {
         platforms[RunnerOS.macOS.rawValue] =
-          PlatformConfig(enabled: true, count: count, labels: macLabels)
+          PlatformConfig(enabled: true, count: count, labels: RunnerOS.macOS.defaultLabels)
       }
       if oses.contains(.windows), windowsImageReady {
         platforms[RunnerOS.windows.rawValue] =
@@ -244,7 +272,7 @@ public struct FleetPlan: Codable, Equatable, Sendable {
       return RepoPlan(repo: ref, platforms: platforms)
     }
     // Seed future-repo defaults from what the user was running: their macOS
-    // labels/count, and the platforms they had selected — but gate Windows/Linux
+    // count, and the platforms they had selected — but gate Windows/Linux
     // on readiness (mirroring the per-repo configs above), so a new repo doesn't
     // default to an enabled-but-unbuildable combo. macOS is always the floor (it
     // needs no setup), in stable RunnerOS.allCases order.
@@ -256,7 +284,8 @@ public struct FleetPlan: Codable, Equatable, Sendable {
       defaultPlatforms.append(RunnerOS.linux.rawValue)
     }
     return FleetPlan(
-      repos: repos, defaultMacOSLabels: macLabels, defaultMacOSCount: count,
+      repos: repos, defaultMacOSLabels: RunnerOS.macOS.defaultLabels, defaultMacOSCount: count,
+      defaultPlatformCounts: [RunnerOS.macOS.rawValue: count],
       defaultPlatforms: defaultPlatforms)
   }
 }

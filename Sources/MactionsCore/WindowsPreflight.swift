@@ -12,7 +12,7 @@ import Foundation
 /// download), so the preflight DETECTS it and points the user to install it
 /// manually — it never tries to `brew install` a hypervisor. What it DOES
 /// auto-install (free, brew-able) are the UUP-dump ISO converter tools + xorriso
-/// (used to remaster a no-prompt boot ISO). Homebrew is the install vehicle but
+/// (required to remaster a no-prompt boot ISO). Homebrew is the install vehicle but
 /// is never auto-installed — if it's absent we tell the user to get it from
 /// brew.sh.
 public enum WindowsPreflight {
@@ -64,10 +64,8 @@ public enum WindowsPreflight {
     /// The UUP-dump → ISO converter tools (aria2c, cabextract, wimlib-imagex,
     /// mkisofs, chntpw) — the convert script hard-requires all of them.
     public let converters: [Tool]
-    /// xorriso — remasters the Win11 install ISO into a NO-PROMPT boot ISO (so
-    /// the headless base build needs no "Press any key" keypress). Optional: the
-    /// build falls back to the prompting ISO without it, but we offer to install
-    /// it so the base build is fully hands-free.
+    /// xorriso — remasters the Win11 install ISO into a NO-PROMPT boot ISO so
+    /// the headless base build needs no "Press any key" keypress.
     public let xorriso: Tool
 
     public init(homebrew: Tool, fusion: Tool, converters: [Tool], xorriso: Tool) {
@@ -110,10 +108,10 @@ public enum WindowsPreflight {
     }
 
     /// `true` when everything the no-ISO auto-download Windows path needs is in
-    /// place: Homebrew (for installs), VMware Fusion, and all converter tools.
-    /// (xorriso isn't required — the build falls back to a prompting ISO.)
+    /// place: Homebrew (for installs), VMware Fusion, all converter tools, and
+    /// xorriso for the mandatory no-prompt ISO remaster.
     public var ready: Bool {
-      homebrewInstalled && fusionInstalled && missingConverterFormulae.isEmpty
+      homebrewInstalled && fusionInstalled && missingConverterFormulae.isEmpty && xorrisoInstalled
     }
   }
 

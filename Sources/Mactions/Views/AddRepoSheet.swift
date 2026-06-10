@@ -32,9 +32,14 @@ struct AddRepoSheet: View {
 
   private var header: some View {
     HStack {
-      Text("Manage Repositories").font(.headline)
+      Text(app.plan.isAllRepos ? "Repository Overrides" : "Manage Repositories").font(.headline)
       Spacer()
-      Text("\(app.plan.repos.count) configured").font(.caption).foregroundStyle(.secondary)
+      Text(
+        app.plan.isAllRepos
+          ? "\(app.plan.repos.count) override\(app.plan.repos.count == 1 ? "" : "s")"
+          : "\(app.plan.repos.count) configured"
+      )
+      .font(.caption).foregroundStyle(.secondary)
     }
     .padding(.horizontal, MactionsTheme.Spacing.section)
     .padding(.vertical, MactionsTheme.Spacing.card)
@@ -106,6 +111,10 @@ struct AddRepoSheet: View {
     HStack {
       if app.state != .offline {
         Label(MactionsTheme.Copy.offlineToManageRepos, systemImage: "info.circle")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+      if app.state == .offline, app.plan.isAllRepos {
+        Text("Selected repositories use explicit overrides.")
           .font(.caption).foregroundStyle(.secondary)
       }
       Spacer()

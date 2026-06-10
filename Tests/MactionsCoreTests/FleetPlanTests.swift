@@ -73,6 +73,14 @@ final class FleetPlanTests: XCTestCase {
     XCTAssertEqual(plan.repos[0].config(for: .macOS)?.labels, RunnerOS.macOS.defaultLabels)
   }
 
+  func testMigrateIgnoresLegacyCustomLabels() {
+    let plan = FleetPlan.migrate(
+      repoFullNames: ["acme/web"], oses: [.macOS], labels: ["self-hosted", "custom"],
+      runnersPerRepo: 1, windowsImageReady: false, linuxImageReady: false)
+    XCTAssertEqual(plan.repos[0].config(for: .macOS)?.labels, RunnerOS.macOS.defaultLabels)
+    XCTAssertEqual(plan.defaultMacOSLabels, RunnerOS.macOS.defaultLabels)
+  }
+
   func testMigrateDropsUnparseableRepoNames() {
     let plan = FleetPlan.migrate(
       repoFullNames: ["acme/web", "not-a-full-name", ""], oses: [.macOS],
@@ -155,19 +163,69 @@ final class FleetPlanTests: XCTestCase {
   // MARK: Mutation
 
   func testAddRepoSeedsDefaultPlatformsAndIsIdempotent() {
-    var plan = FleetPlan(defaultMacOSLabels: ["self-hosted", "macOS", "mactions"], defaultMacOSCount: 3)
+    var plan = FleetPlan(
+      defaultMacOSLabels: ["self-hosted", "custom"],
+      defaultMacOSCount: 3,
+      defaultPlatforms: ["macOS", "linux"])
     plan.addRepo(RepoRef(owner: "acme", name: "web"))
     plan.addRepo(RepoRef(owner: "acme", name: "web"))  // dupe → no-op
     XCTAssertEqual(plan.repos.count, 1)
     XCTAssertEqual(plan.repos[0].config(for: .macOS)?.count, 3)
+    XCTAssertEqual(plan.repos[0].config(for: .macOS)?.labels, RunnerOS.macOS.defaultLabels)
+    XCTAssertEqual(plan.repos[0].config(for: .linux)?.count, 1)
     XCTAssertEqual(plan.repos[0].config(for: .macOS)?.enabled, true)
   }
 
-  func testSetLabelsBeforeEnableLeavesPlatformDisabled() {
-    var plan = FleetPlan(repos: [RepoPlan(repo: RepoRef(owner: "a", name: "b"))])
-    plan.setLabels(["self-hosted", "Linux"], os: .linux, in: "a/b")
-    XCTAssertEqual(plan.repos[0].config(for: .linux)?.labels, ["self-hosted", "Linux"])
-    XCTAssertEqual(plan.repos[0].config(for: .linux)?.enabled, false)  // not silently enabled
+  func testDefaultCountsArePerOSAndClamped() {
+    var plan = FleetPlan(defaultMacOSCount: 2)
+
+    XCTAssertEqual(plan.defaultCount(for: .macOS), 2)
+    XCTAssertEqual(plan.defaultCount(for: .windows), 1)
+    XCTAssertEqual(plan.defaultCount(for: .linux), 1)
+
+    plan.setDefaultCount(4, for: .windows)
+    plan.setDefaultCount(99, for: .linux)
+    plan.setDefaultCount(0, for: .macOS)
+
+    XCTAssertEqual(plan.defaultCount(for: .windows), 4)
+    XCTAssertEqual(plan.defaultCount(for: .linux), 5)
+    XCTAssertEqual(plan.defaultCount(for: .macOS), 1)
+    XCTAssertEqual(plan.defaultMacOSCount, 1)
+  }
+
+  func testSeedUsesPerOSDefaultCounts() {
+    var plan = FleetPlan(defaultMacOSCount: 2)
+    plan.setDefaultCount(3, for: .windows)
+    plan.setDefaultCount(4, for: .linux)
+
+    XCTAssertEqual(plan.seed(for: .macOS).count, 2)
+    XCTAssertEqual(plan.seed(for: .windows).count, 3)
+    XCTAssertEqual(plan.seed(for: .linux).count, 4)
+  }
+
+  func testNormalizeWorkflowLabelsPinsLegacySavedCustomLabels() {
+    var plan = FleetPlan(
+      repos: [
+        RepoPlan(
+          repo: RepoRef(owner: "a", name: "b"),
+          platforms: [
+            RunnerOS.macOS.rawValue: PlatformConfig(
+              enabled: true, count: 4, labels: ["self-hosted", "custom"]),
+            RunnerOS.linux.rawValue: PlatformConfig(
+              enabled: false, count: 2, labels: ["self-hosted", "Linux"]),
+          ])
+      ],
+      defaultMacOSLabels: ["self-hosted", "custom"],
+      defaultMacOSCount: 3)
+
+    plan.normalizeWorkflowLabels()
+
+    XCTAssertEqual(plan.defaultMacOSLabels, RunnerOS.macOS.defaultLabels)
+    XCTAssertEqual(plan.repos[0].config(for: .macOS)?.labels, RunnerOS.macOS.defaultLabels)
+    XCTAssertEqual(plan.repos[0].config(for: .macOS)?.count, 4)
+    XCTAssertEqual(plan.repos[0].config(for: .linux)?.labels, RunnerOS.linux.defaultLabels)
+    XCTAssertEqual(plan.repos[0].config(for: .linux)?.count, 2)
+    XCTAssertEqual(plan.repos[0].config(for: .linux)?.enabled, false)
   }
 
   func testSetCountClampsToOneThroughFive() {
@@ -218,6 +276,8 @@ final class FleetPlanTests: XCTestCase {
         .utf8)
     let plan = try JSONDecoder().decode(FleetPlan.self, from: legacy)
     XCTAssertFalse(plan.isAllRepos)
+    XCTAssertEqual(plan.defaultCount(for: .macOS), 1)
+    XCTAssertEqual(plan.defaultCount(for: .windows), 1)
 
     var enabled = plan
     enabled.allRepos = true

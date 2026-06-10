@@ -307,9 +307,12 @@ PY
   # RESUME: if a no-prompt boot ISO for THIS build is already cached, skip the
   # whole ~8 GB download + convert + remaster. A retry after an interrupted
   # install then jumps straight to the VM build (the "continue on the latest
-  # step" win). The cache + its build tag are written only on a successful
-  # remaster below, so a stale/partial ISO can't be mistaken for a finished one.
-  if [[ -f "$ISO_CACHE" && "$(cat "$ISO_BUILD_MARKER" 2>/dev/null)" == "$build" ]]; then
+  # step" win). The cache + its build/no-prompt tags are written only on a
+  # successful remaster below, so a stale/partial/prompting ISO can't be
+  # mistaken for a finished one.
+  if [[ -f "$ISO_CACHE" \
+        && "$(cat "$ISO_BUILD_MARKER" 2>/dev/null)" == "$build" \
+        && "$(cat "$ISO_NOPROMPT_MARKER" 2>/dev/null)" == "$build" ]]; then
     echo "==> Reusing cached Win11 ISO for build $build (resumed — skipping the ~8 GB download/convert)" >&2
     ISO="$ISO_CACHE"
     NEED_REMASTER=0
@@ -372,13 +375,16 @@ PY
 
 # --- Resumable-build paths ---------------------------------------------------
 # The no-prompt boot ISO is cached at $ISO_CACHE, tagged with the build id in
-# $ISO_BUILD_MARKER. The multi-GB UUP download lives under $CACHE_ROOT and
-# PERSISTS across a failed run, so a retry resumes (aria2 -c) instead of
-# re-downloading ~8 GB. All of this is reaped only after a FULLY successful build
-# (see the fusion arm), so "continue on the latest step" is the default on retry.
+# BOTH $ISO_BUILD_MARKER and $ISO_NOPROMPT_MARKER. The second marker prevents a
+# pre-cleanup prompting ISO cache from being reused after no-prompt became
+# mandatory. The multi-GB UUP download lives under $CACHE_ROOT and PERSISTS
+# across a failed run, so a retry resumes (aria2 -c) instead of re-downloading
+# ~8 GB. All of this is reaped only after a FULLY successful build (see the
+# fusion arm), so "continue on the latest step" is the default on retry.
 MACTIONS_ROOT="${HOME}/.mactions"
 ISO_CACHE="$MACTIONS_ROOT/win11-base.iso"
 ISO_BUILD_MARKER="$MACTIONS_ROOT/win11-base.iso.build"
+ISO_NOPROMPT_MARKER="$MACTIONS_ROOT/win11-base.iso.noprompt"
 CACHE_ROOT="$MACTIONS_ROOT/cache"
 NEED_REMASTER=1   # 1 = (re)build the no-prompt ISO; 0 = reuse the cached one (resumed)
 
@@ -421,29 +427,24 @@ build_unattend_iso() {
 # Re-master the Win11 install ISO so EFI boot doesn't stop on Microsoft's
 # "Press any key to boot from CD" prompt (cdboot). The source ISO ships
 # efisys_noprompt.bin next to efisys.bin; we rebuild the El Torito EFI boot image
-# from the no-prompt variant with xorriso. Falls back to the ORIGINAL ISO (one
-# Space-press at the VM's first boot) when xorriso is absent or the remaster /
-# validation fails — so there's never a regression. Echoes the ISO path to use;
-# progress to stderr. (The output ISO + its El Torito EFI entry are validated
-# here; a clean boot is confirmed on the live base build — the one live-verify
-# step. If it ever fails to boot, delete it and the build uses the prompting ISO.)
+# from the no-prompt variant with xorriso. This is a required part of the Fusion
+# base build: no prompting/manual boot fallback is supported.
 make_noprompt_iso() {
   # The source-ISO mountpoint is created + tracked by the PARENT (see the call
   # site) so the top-level EXIT trap can detach+remove it on a mid-remaster
   # interrupt — a var assigned in this $(...) subshell would NOT reach the parent.
   local src="$1" mnt="$2" out vol
   if ! command -v xorriso >/dev/null 2>&1; then
-    echo "    xorriso not installed (brew install xorriso) — using the prompting ISO (one Space-press at boot)" >&2
-    echo "$src"; return
+    die "xorriso not installed. Install it with: brew install xorriso"
   fi
   out="${MACTIONS_ROOT}/win11-base.iso"
   if ! hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$src" >/dev/null 2>&1; then
     rmdir "$mnt" 2>/dev/null || true
-    echo "    couldn't mount $src — using prompting ISO" >&2; echo "$src"; return
+    die "couldn't mount $src for the required no-prompt ISO remaster"
   fi
   if [[ ! -f "$mnt/efi/microsoft/boot/efisys_noprompt.bin" ]]; then
     hdiutil detach "$mnt" >/dev/null 2>&1 || true; rmdir "$mnt" 2>/dev/null || true
-    echo "    no efisys_noprompt.bin in $src — using prompting ISO" >&2; echo "$src"; return
+    die "no efisys_noprompt.bin in $src; cannot build the required no-prompt ISO"
   fi
   vol="$(/usr/sbin/diskutil info "$mnt" 2>/dev/null | sed -n 's/.*Volume Name: *//p' | head -1)"
   [[ -n "$vol" ]] || vol="CCCOMA_X64FRE"
@@ -467,8 +468,7 @@ make_noprompt_iso() {
     echo "$out"
   else
     rm -f "$out"; hdiutil detach "$mnt" >/dev/null 2>&1 || true; rmdir "$mnt" 2>/dev/null || true
-    echo "    xorriso remaster/validation failed — using prompting ISO (one Space-press at boot)" >&2
-    echo "$src"
+    die "xorriso remaster/validation failed; no prompting ISO fallback is supported"
   fi
 }
 
@@ -510,17 +510,15 @@ case "$TOOL" in
       # top-level EXIT trap detaches+reaps it even if interrupted mid-remaster.
       NOPROMPT_MNT="$(mktemp -d)"
       NOPROMPT_ISO="$(make_noprompt_iso "$ISO" "$NOPROMPT_MNT")"
-      if [[ "$NOPROMPT_ISO" != "$ISO_CACHE" ]]; then
-        # Fallback returned the original (prompting) ISO — stash it at the canonical path.
-        cp -f "$NOPROMPT_ISO" "$ISO_CACHE"
-      fi
-      # Tag the cached ISO with its build — written ONLY now that the ISO is in
-      # place, so a retry's resume check can never reuse a stale/partial ISO.
+      # Tag the cached ISO with its build and no-prompt provenance — written ONLY
+      # now that the ISO is in place, so a retry's resume check can never reuse a
+      # stale/partial/prompting ISO.
       # Guarded like windows-base.build below: a user --iso with no version in its
       # filename leaves RECORDED_BUILD empty, and an empty tag would be a pointless
       # file (the resume check only runs on the auto path, where it's never empty).
       if [[ -n "$RECORDED_BUILD" ]]; then
         printf '%s\n' "$RECORDED_BUILD" > "$ISO_BUILD_MARKER"
+        printf '%s\n' "$RECORDED_BUILD" > "$ISO_NOPROMPT_MARKER"
       fi
     else
       echo "==> Reusing the cached no-prompt Win11 ISO for build ${RECORDED_BUILD:-?} (resumed)"

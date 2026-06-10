@@ -7,7 +7,7 @@ import Foundation
 ///     copy of the agent and deletes that copy the instant the job exits, so a
 ///     job's `_work` checkout, `_tool`/`_actions` caches, `_diag` logs and
 ///     `.credentials` never accumulate.
-///   - Per launch / go-online: `purgeRuns()` + `purgeStrayTartClones()` sweep
+///   - Per launch / go-online: `purgeRuns()` plus provider-specific sweeps clear
 ///     anything a crash or force-quit orphaned last time.
 ///   - After a successful Windows base rebuild: old `.win11-runner-base.bak.*`
 ///     rescue copies are removed, reclaiming the multi-GB failed-build backups
@@ -93,18 +93,6 @@ public enum HostCleanup {
     }
   }
 
-  /// Best-effort: delete leftover ephemeral Tart VMs from a crashed session.
-  /// No-op if `tart` isn't installed. Only touches our `mactions-` clones.
-  public static func purgeStrayTartClones() {
-    guard let tart = Shell.which("tart") else { return }
-    guard let list = try? Shell.run(tart, ["list"]), list.ok else { return }
-    let tokens = list.stdout.components(separatedBy: .whitespacesAndNewlines)
-    let names = Set(tokens.filter { $0.hasPrefix("mactions-") })
-    for name in names {
-      _ = try? Shell.run(tart, ["delete", name])
-    }
-  }
-
   /// Best-effort: delete leftover ephemeral Windows VM clones from a crashed
   /// session. The Windows provider names its throwaway clones `mactions-…`, the
   /// same prefix we scope teardown to, so we never touch a non-Mactions VM.
@@ -185,16 +173,16 @@ public enum HostCleanup {
   /// a crashed/force-quit session. The provider runs each job in a `--rm`
   /// container labeled `mactions` and named `mactions-…`, so `--rm` reaps it on a
   /// normal exit — but a hard crash (or a daemon killed mid-job) can leave one
-  /// behind, holding its `_work` checkout and its GitHub registration. We list by
-  /// the `mactions` label and `rm -f` each. No-op if no container CLI is installed
-  /// or the daemon is down (we never START a daemon just to clean up).
+  /// behind, holding its `_work` checkout and its GitHub registration. Apple
+  /// `container` has no label filter, so the sweep scopes by the `mactions-`
+  /// name prefix. No-op if Apple `container` is not installed or the daemon is
+  /// down (we never START a daemon just to clean up).
   public static func purgeStrayLinuxContainers() {
     guard let cli = LinuxContainerProviderFactory.detectInstalledCLI() else { return }
     // Don't spin up a daemon during a cleanup sweep — only reap if it's already up.
     guard let info = try? Shell.run(cli.executable, cli.daemonStatusArgs()), info.ok else { return }
     guard let list = try? Shell.run(cli.executable, cli.sweepListArgs()), list.ok else { return }
-    // The CLI scopes refs to our own containers (docker by `--label`, Apple
-    // `container` by the `mactions-` name prefix) — never touches others'.
+    // The CLI scopes refs to our own containers by the `mactions-` name prefix.
     for ref in cli.sweepRefs(from: list.stdout) {
       _ = try? Shell.run(cli.executable, cli.rmArgs(name: ref))
     }
@@ -215,7 +203,6 @@ public enum HostCleanup {
   public static func sweepOrphans() {
     killOrphanRunnerProcesses()
     purgeRuns()
-    purgeStrayTartClones()
     purgeStrayWindowsClones()
     purgeStrayLinuxContainers()
   }

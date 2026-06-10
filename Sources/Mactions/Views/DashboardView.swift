@@ -2,6 +2,8 @@ import AppKit
 import MactionsCore
 import SwiftUI
 
+private let allRepositoriesSelectionID = "__mactions_all_repositories__"
+
 /// The dashboard window — now LIVE-FIRST: the primary surface is the runner
 /// fleet (repo-grouped), with **History** and **Memory** alongside it in the
 /// sidebar. Configuration is no longer a tab: per-(repo,platform) combos are
@@ -41,7 +43,8 @@ struct DashboardView: View {
   /// The repo the Configure panel edits — derived from the grid selection
   /// (everything before the first `#`, so a runner child resolves to its repo).
   private var selectedRepoID: String? {
-    selection?.split(separator: "#", maxSplits: 1).first.map(String.init)
+    guard selection != allRepositoriesSelectionID else { return nil }
+    return selection?.split(separator: "#", maxSplits: 1).first.map(String.init)
   }
 
   var body: some View {
@@ -121,20 +124,26 @@ struct DashboardView: View {
         // offline" (you can disable every platform while online now, which would
         // otherwise strand the fleet on). ALL-REPOS mode needs no explicit
         // combos: discovery finds demand across every admin repo.
-        (app.state == .offline && app.plan.enabledCombos().isEmpty && !app.plan.isAllRepos)
+        (app.state == .offline && !hasWatchableFleet)
           || app.windowsSetupBusy  // can't clone the base while it's being (re)built
           || app.state == .starting || app.state == .stopping)
       .help(
         app.windowsSetupBusy
           ? "Wait for the Windows base image to finish building before going online."
-          : app.plan.enabledCombos().isEmpty && !app.plan.isAllRepos
-            ? "Add a repo and select it on the left to enable a platform first."
+          : app.state == .offline && !hasWatchableFleet
+            ? (app.plan.isAllRepos
+              ? "Enable at least one default platform for all repositories."
+              : "Add a repo and select it on the left to enable a platform first.")
             : app.state == .offline
               ? "Start watching for queued jobs — runners start on demand (⌘O)."
               : "Stop watching and tear down any live runners (⌘O).")
     }
     .padding(.horizontal, MactionsTheme.Spacing.section)
     .padding(.vertical, MactionsTheme.Spacing.control)
+  }
+
+  private var hasWatchableFleet: Bool {
+    !app.plan.enabledCombos().isEmpty || (app.plan.isAllRepos && !app.plan.defaultPlatforms.isEmpty)
   }
 
   /// A persistent in-window indicator while a base image is building, so the
@@ -295,6 +304,13 @@ struct DashboardView: View {
     if let message = app.statusMessage { return message }
     let repoCount = app.plan.repos.count
     let comboCount = app.plan.enabledCombos().count
+    if app.plan.isAllRepos {
+      let overrideText =
+        repoCount == 0
+        ? "no repository overrides"
+        : "\(repoCount) repository override\(repoCount == 1 ? "" : "s")"
+      return "All repositories scope · \(overrideText)."
+    }
     if repoCount == 0 { return "No repositories configured — add one to begin." }
     return "\(repoCount) repo\(repoCount == 1 ? "" : "s") · \(comboCount) platform combo\(comboCount == 1 ? "" : "s") configured."
   }
@@ -358,7 +374,8 @@ private struct RunnersPane: View {
       let rs = byRepo[plan.repo.fullName] ?? []
       let active = rs.filter { app.busyRunnerNames.contains($0.runner.id) }.count
       return RepoGroup(
-        repo: plan.repo, summary: plan.summary(), enabledPlatforms: plan.enabledPlatforms,
+        repo: plan.repo, summary: app.plan.isAllRepos ? "Override · \(plan.summary())" : plan.summary(),
+        enabledPlatforms: plan.enabledPlatforms,
         runners: rs, activeCount: active)
     }
     // Repos picked up by ALL-REPOS discovery: ARMED orchestrators (watching /
@@ -391,6 +408,18 @@ private struct RunnersPane: View {
         try? await Task.sleep(nanoseconds: 6_000_000_000)
       }
     }
+    .onAppear {
+      if app.plan.isAllRepos && selection == nil {
+        selection = allRepositoriesSelectionID
+      }
+    }
+    .onChange(of: app.plan.isAllRepos) { isAllRepos in
+      if isAllRepos, selection == nil {
+        selection = allRepositoriesSelectionID
+      } else if !isAllRepos, selection == allRepositoriesSelectionID {
+        selection = nil
+      }
+    }
     .sheet(isPresented: $showAddRepo) { AddRepoSheet() }
   }
 
@@ -400,7 +429,7 @@ private struct RunnersPane: View {
     VStack(spacing: 0) {
       // Discovered (all-repos) groups can exist with an EMPTY explicit plan —
       // the list must render whenever any group does, or watched fleets hide.
-      if app.plan.repos.isEmpty && groups.isEmpty {
+      if !app.plan.isAllRepos && app.plan.repos.isEmpty && groups.isEmpty {
         VStack(spacing: MactionsTheme.Spacing.section) {
           if app.isSignedIn, app.plan.isAllRepos {
             DashboardEmptyState(
@@ -447,6 +476,9 @@ private struct RunnersPane: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {
         List(selection: $selection) {
+          if app.plan.isAllRepos {
+            allRepositoriesHeader.tag(allRepositoriesSelectionID)
+          }
           ForEach(groups) { group in
             repoHeader(group).tag(group.repo.fullName)
             // Live runners nest under the repo and are collapsible. Offline there
@@ -478,16 +510,59 @@ private struct RunnersPane: View {
       Button {
         showAddRepo = true
       } label: {
-        Label("Add repository", systemImage: "plus")
+        Label(app.plan.isAllRepos ? "Add override" : "Add repository", systemImage: "plus")
       }
       .buttonStyle(.borderless)
       .keyboardShortcut("n", modifiers: .command)
       .disabled(app.state != .offline)
-      .help(app.state == .offline ? "Add or remove repositories (⌘N)" : MactionsTheme.Copy.offlineToManageRepos)
+      .help(app.state == .offline ? addRepoHelp : MactionsTheme.Copy.offlineToManageRepos)
       Spacer(minLength: 0)
     }
     .padding(.horizontal, MactionsTheme.Spacing.control)
     .padding(.vertical, MactionsTheme.Spacing.tight)
+  }
+
+  private var addRepoHelp: String {
+    app.plan.isAllRepos ? "Add or remove repository overrides (⌘N)" : "Add or remove repositories (⌘N)"
+  }
+
+  private var allRepositoriesHeader: some View {
+    HStack(spacing: MactionsTheme.Spacing.tight) {
+      Image(systemName: "antenna.radiowaves.left.and.right")
+        .font(.caption)
+        .foregroundStyle(app.state == .online ? Color.green : Color.secondary)
+        .frame(width: 12)
+      Circle()
+        .fill(app.state == .online ? Color.green.opacity(0.35) : Color.secondary)
+        .frame(width: 7, height: 7)
+        .accessibilityHidden(true)
+      VStack(alignment: .leading, spacing: 1) {
+        Text("All repositories").font(.callout.weight(.medium)).lineLimit(1)
+        Text(allRepositoriesSummary).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+      }
+      Spacer(minLength: MactionsTheme.Spacing.tight)
+      if app.state == .online {
+        Text(allRepositoriesBadge).font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+      }
+    }
+    .padding(.vertical, 2)
+    .contentShape(Rectangle())
+  }
+
+  private var allRepositoriesSummary: String {
+    let parts = RunnerOS.allCases.compactMap { os -> String? in
+      guard app.isDefaultPlatform(os) else { return nil }
+      let count = app.defaultCount(for: os)
+      return count > 1 ? "\(os.displayName) ×\(count)" : os.displayName
+    }
+    return parts.isEmpty ? "No default platforms" : "Defaults · " + parts.joined(separator: " · ")
+  }
+
+  private var allRepositoriesBadge: String {
+    let watched = app.watchedRepos.count
+    let queued = app.repoQueuedJobs.values.reduce(0, +)
+    if queued > 0 { return "\(queued) queued" }
+    return watched > 0 ? "\(watched) active" : "watching"
   }
 
   /// A selectable repo header: a status dot, name + combo summary, configured-
@@ -603,8 +678,10 @@ private struct RunnersPane: View {
       let row = app.runners.first(where: { $0.id == id })
     {
       RunnerDetailView(row: row)
+    } else if selection == allRepositoriesSelectionID || (selection == nil && app.plan.isAllRepos) {
+      AllRepositoriesInspector()
     } else if let repoID = selectedRepoID, app.plan.repos.contains(where: { $0.id == repoID }) {
-      // A repo is selected → configure its platforms, runner count, and labels.
+      // A repo is selected → configure its platform/count override.
       RepoInspector(repoID: repoID)
     } else if let repoID = selectedRepoID, groups.contains(where: { $0.id == repoID }) {
       // A DISCOVERED repo (all-repos mode): it runs on the default platform
@@ -618,7 +695,7 @@ private struct RunnersPane: View {
           message:
             "All-repositories mode spun this up from a queued job using your default platform "
             + "settings; its fleet retires when the repo goes quiet. Go offline, then add "
-            + "\(repoID) explicitly to customize platforms, max runners, and labels. "
+            + "\(repoID) explicitly to override platforms and max runners. "
             + MactionsTheme.Copy.offlineToManageRepos)
         if let launchError = app.repoLaunchFailure[repoID] {
           Banner(launchError, severity: .warning, icon: "exclamationmark.triangle")
@@ -630,7 +707,7 @@ private struct RunnersPane: View {
         systemImage: "slider.horizontal.3", title: "Select a repository",
         message: app.plan.repos.isEmpty
           ? "Add a repository on the left, then pick a platform for it here."
-          : "Pick a repository on the left to choose its platforms, runner count, and labels.")
+          : "Pick a repository on the left to choose its platforms and runner count.")
     }
   }
 }

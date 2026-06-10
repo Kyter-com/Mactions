@@ -6,9 +6,9 @@ import Foundation
 /// Containers are far lighter than the Windows Fusion VM (sub-second start/stop,
 /// shared kernel, CPU overcommits gracefully), so the strict RAM-divide of
 /// `WindowsVMBudget` is overkill — but we still bound the count and put a hard
-/// `--cpus`/`--memory` limit on every container, because Docker's default is
-/// *unlimited* and N concurrent runner jobs would otherwise OOM the Mac. The cap
-/// binds on the tighter of a RAM divide and a CPU divide.
+/// `--cpus`/`--memory` limit on every container so N concurrent runner jobs
+/// cannot OOM the Mac. The cap binds on the tighter of a RAM divide and a CPU
+/// divide.
 ///
 /// SCOPE (same caveat as `WindowsVMBudget`): this bounds the **Linux containers**
 /// in isolation. `reservedGB` is a flat allowance for macOS + the app + idle

@@ -270,8 +270,8 @@ public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
       // orchestrator appends this provider's slot only AFTER start() returns, so
       // a thrown start() means no slot exists yet — its provisionOne catch is the
       // sole handler. Firing onExit too would drive a redundant reconcile against
-      // a phantom slot (and mismatches LocalProcessProvider/TartProvider, which
-      // throw without onExit). The thread below is never started on this path.
+      // a phantom slot (and mismatches LocalProcessProvider, which throws
+      // without onExit). The thread below is never started on this path.
       teardown()
       throw error
     }
@@ -493,10 +493,6 @@ public struct WindowsVMProviderFactory: RunnerProviderFactory {
     else { return nil }
     return VMwareCLI(executable: fusion)
   }
-
-  /// Alias retained for call sites that historically distinguished a "free-first"
-  /// pick. With Fusion the sole backend, this is the same as `detectInstalledCLI`.
-  public static func detectFreeFirstCLI() -> WindowsVMCLI? { detectInstalledCLI() }
 
   /// `true` iff the base image is built AND idle — the only state from which a
   /// per-job clone is reliable. For Fusion: the `mactions-fusion-vm base-status`

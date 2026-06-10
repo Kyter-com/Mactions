@@ -208,8 +208,8 @@ about the per-run isolation Mactions adds:
 - **`ImageOS`** is derived live from the host (`macos26` on Tahoe), and
   `GCM_INTERACTIVE=Never` is set per job so a host-configured Git Credential
   Manager can't hang a headless job.
-- Apple's EULA caps macOS **VMs** at 2 per host — moot for the bare-host
-  provider, relevant only to the experimental Tart path.
+- Apple's EULA caps macOS **VMs** at 2 per host — moot here because Mactions
+  ships only the bare-host macOS provider.
 
 ---
 

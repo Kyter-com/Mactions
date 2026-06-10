@@ -344,62 +344,19 @@ struct SetupStepper<Step: SetupStepProtocol>: View where Step.AllCases: RandomAc
   }
 }
 
-// MARK: - LabelEditor
+// MARK: - WorkflowRunsOnLabels
 
-/// The anti-typo control for a combo's `runs-on` labels: an editable CSV field
-/// (macOS combos) plus a read-only "Registers:" chip row showing the EFFECTIVE
-/// label set. Windows/Linux pass `editable: false` (their labels are derived) so
-/// only the chips show. Per-combo editable labels are the top silent-failure
-/// risk, so the chips make the result legible.
-///
-/// The TextField edits a LOCAL `draft`, not the bound `text` directly — `text`'s
-/// setter normalizes (parse → store → re-join), so binding the field straight to
-/// it would delete a trailing comma/space the instant it's typed, making a second
-/// label impossible to enter. The draft is committed back to `text` (which
-/// persists) only on Return or focus loss; external changes reseed it only while
-/// the field is idle.
-struct LabelEditor: View {
-  @Binding var text: String
-  var editable: Bool = true
-  var onCommit: () -> Void = {}
-
-  @State private var draft = ""
-  @FocusState private var focused: Bool
-
-  /// Parse whichever source is authoritative for the chips: the live draft while
-  /// editing, else the bound (normalized) text.
-  private var labels: [String] {
-    (editable ? draft : text)
-      .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-  }
+/// Read-only `runs-on` label set for the workflow. The runner registers with the
+/// same tokens shown here, so users can paste the chip sequence into a workflow
+/// array without translating app-specific wording.
+struct WorkflowRunsOnLabels: View {
+  let labels: [String]
 
   var body: some View {
-    VStack(alignment: .leading, spacing: MactionsTheme.Spacing.tight) {
-      if editable {
-        TextField("self-hosted, macOS, mactions", text: $draft)
-          .textFieldStyle(.roundedBorder)
-          .focused($focused)
-          .onSubmit { commit() }
-          .onChange(of: focused) { isFocused in if !isFocused { commit() } }
-          .onAppear { draft = text }
-          .onChange(of: text) { newValue in if !focused { draft = newValue } }
-          // Backstop: committing on focus loss covers tabbing/clicking away, but
-          // selecting another repo destroys this view synchronously — the focus
-          // event may not land first. Commit on disappear so a mid-edit draft
-          // (e.g. typing a label, then clicking a different repo) isn't lost.
-          // No-op when unchanged, so a normal dismiss costs nothing.
-          .onDisappear { commit() }
-      }
-      HStack(spacing: 4) {
-        Text("Registers").eyebrow()
-        ChipRow(labels: labels)
-      }
+    HStack(alignment: .firstTextBaseline, spacing: MactionsTheme.Spacing.tight) {
+      Text("runs-on").eyebrow()
+      ChipRow(labels: labels)
     }
-  }
-
-  private func commit() {
-    if text != draft { text = draft }  // triggers the bound setter (persist) once
-    onCommit()
   }
 }
 
