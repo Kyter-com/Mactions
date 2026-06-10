@@ -36,6 +36,8 @@
   <string>https://github.com/Kyter-com/Mactions/releases/latest/download/appcast.xml</string>
   <key>SUPublicEDKey</key>
   <string>$(SPARKLE_PUBLIC_ED_KEY)</string>
+  <key>SUScheduledCheckInterval</key>
+  <integer>3600</integer>
   <key>SUVerifyUpdateBeforeExtraction</key>
   <true/>
 </dict>
