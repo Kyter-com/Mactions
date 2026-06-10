@@ -1,5 +1,7 @@
 # Build
 /.build/
+/SourcePackages/
+/dist/
 *.xcodeproj
 # Xcode / SwiftPM per-user state (created when opening in Xcode)
 .swiftpm/

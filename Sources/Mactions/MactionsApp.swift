@@ -34,6 +34,9 @@ struct MactionsApp: App {
           Button("Settings…") { AppState.shared.presentSettings() }
             .keyboardShortcut(",", modifiers: .command)
         }
+        CommandGroup(after: .appInfo) {
+          CheckForUpdatesCommand()
+        }
       }
   }
 }

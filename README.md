@@ -40,6 +40,10 @@ open Mactions.xcodeproj   # pick the "MactionsApp" scheme, then Run (⌘R)
 
 The app target compiles the same `Sources/Mactions` and links a native `MactionsCore` framework target (the same sources as the SwiftPM library); `actool` composes `Mactions.icon` (Icon Composer) into the AppIcon. To change the icon, re-export from Icon Composer into `Sources/Mactions/Mactions.icon`.
 
+## Release
+
+Hosted releases are built on GitHub-hosted macOS from `.github/workflows/release.yml`: Developer ID signing, notarization/stapling, DMG/ZIP packaging, Sparkle appcast generation, and GitHub Release upload. See [docs/RELEASE.md](docs/RELEASE.md) for the required Actions secrets/variables and the tag flow.
+
 ## Security
 
 The default macOS **local-process** runner has no isolation — only point it at **trusted / private** repos. **Linux** runs each job in a **throwaway Apple `container`** (`--rm` discards the whole writable layer), which is clean for trusted/private repos but shares the host kernel; do not route untrusted/public macOS or Linux jobs here. **Windows** runs in a throwaway VMware Fusion VM. The GitHub token is stored in a `0600` file under `~/.mactions` (not the keychain — an unsigned dev build re-prompts on every keychain access; a signed build could use the keychain).

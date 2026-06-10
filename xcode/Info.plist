@@ -30,5 +30,13 @@
   <true/>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
+  <key>SUEnableAutomaticChecks</key>
+  <true/>
+  <key>SUFeedURL</key>
+  <string>https://github.com/Kyter-com/Mactions/releases/latest/download/appcast.xml</string>
+  <key>SUPublicEDKey</key>
+  <string>$(SPARKLE_PUBLIC_ED_KEY)</string>
+  <key>SUVerifyUpdateBeforeExtraction</key>
+  <true/>
 </dict>
 </plist>

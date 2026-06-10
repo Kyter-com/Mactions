@@ -19,6 +19,11 @@ options:
   deploymentTarget:
     macOS: "13.0"
 
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.9.3
+
 settings:
   base:
     # Our scripts-copy Run Script writes into the build's Resources; the user
@@ -35,12 +40,43 @@ targets:
       - path: Sources/Mactions
     dependencies:
       - target: MactionsCore
+      - package: Sparkle
+        product: Sparkle
+        embed: false
     # Bundle the repo's scripts/ into the app's Resources (with +x preserved) so
     # script-driven setup (the Windows base build / Fusion helper) is found in the
     # .app, not just under `swift run`. AppState already probes
     # Contents/Resources/scripts/…; cp -R preserves the executable bit. Runs before
     # the implicit code-sign, so the scripts are covered by the signature.
     postBuildScripts:
+      - name: Embed Sparkle.framework
+        basedOnDependencyAnalysis: false
+        script: |
+          set -e
+          SRC="${BUILT_PRODUCTS_DIR}/Sparkle.framework"
+          DEST="${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/Sparkle.framework"
+          if [ ! -d "$DEST" ]; then
+            if [ ! -d "$SRC" ]; then
+              echo "warning: Sparkle.framework not found at $SRC"
+              exit 0
+            fi
+            mkdir -p "$(dirname "$DEST")"
+            ditto "$SRC" "$DEST"
+          fi
+          if [ "${CODE_SIGNING_ALLOWED:-YES}" != "NO" ] && [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ] && [ "${EXPANDED_CODE_SIGN_IDENTITY}" != "-" ]; then
+            SIGN_TARGET="$DEST"
+            if [ -d "$DEST/Versions/Current" ]; then
+              SIGN_TARGET="$DEST/Versions/Current"
+            fi
+            SIGN_ARGS=(--force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --preserve-metadata=identifier,entitlements,flags)
+            if [ "${ENABLE_HARDENED_RUNTIME:-NO}" = "YES" ]; then
+              SIGN_ARGS+=(--options runtime)
+            fi
+            if [ "${CONFIGURATION:-}" = "Release" ]; then
+              SIGN_ARGS+=(--timestamp)
+            fi
+            /usr/bin/codesign "${SIGN_ARGS[@]}" "$SIGN_TARGET"
+          fi
       - name: Bundle scripts/ into Resources
         basedOnDependencyAnalysis: false
         script: |
@@ -60,8 +96,13 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: xcode/Info.plist
         CODE_SIGN_STYLE: Automatic
-        ENABLE_HARDENED_RUNTIME: NO
+        SPARKLE_PUBLIC_ED_KEY: ""
         COMBINE_HIDPI_IMAGES: YES
+      configs:
+        Debug:
+          ENABLE_HARDENED_RUNTIME: NO
+        Release:
+          ENABLE_HARDENED_RUNTIME: YES
 
   # The pure-Foundation control plane (same sources as the SwiftPM MactionsCore
   # target), built as an embedded framework so the app gets a real `MactionsCore`
@@ -79,3 +120,8 @@ targets:
         DEFINES_MODULE: YES
         SWIFT_VERSION: "6.0"
         CODE_SIGN_STYLE: Automatic
+      configs:
+        Debug:
+          ENABLE_HARDENED_RUNTIME: NO
+        Release:
+          ENABLE_HARDENED_RUNTIME: YES
