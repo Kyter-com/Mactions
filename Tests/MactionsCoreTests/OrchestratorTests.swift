@@ -200,6 +200,24 @@ final class OrchestratorTests: XCTestCase {
     try? await Task.sleep(nanoseconds: 80_000_000)
   }
 
+  /// Polls `condition` until it holds or `timeout` elapses, yielding between
+  /// checks so the background reconcile loop and exit→recycle hops can run.
+  /// Replaces fixed `Task.sleep` waits that raced the reconcile cadence: returns
+  /// the instant the fleet converges (faster than a fixed sleep on success) and
+  /// only waits out the timeout on a genuine regression — the assertion that
+  /// follows still reports the failure. This is what de-flakes the suite under
+  /// CI scheduler jitter, where a fixed 160–300ms budget didn't reliably cover
+  /// the expected number of reconcile ticks.
+  @discardableResult
+  private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while !condition() {
+      if Date() >= deadline { return false }
+      try? await Task.sleep(nanoseconds: 10_000_000)  // 10ms
+    }
+    return true
+  }
+
   // MARK: Demand-driven provisioning (scale-from-zero)
 
   func testStartProvisionsOnePerQueuedJob() async {
@@ -293,7 +311,7 @@ final class OrchestratorTests: XCTestCase {
       RemoteRunner(id: runner.remoteId!, name: runner.id, status: "online", busy: true)
     ]
     cp.queuedJobs = [["self-hosted"]]
-    try? await Task.sleep(nanoseconds: 200_000_000)
+    await waitUntil { orch.runners.count == 2 }
 
     XCTAssertEqual(orch.runners.count, 2)
     XCTAssertEqual(cp.jitCount, 2)
@@ -318,7 +336,7 @@ final class OrchestratorTests: XCTestCase {
       RemoteRunner(id: runner.remoteId!, name: runner.id, status: "online", busy: false)
     ]
     cp.queuedJobs = []  // the job vanished
-    try? await Task.sleep(nanoseconds: 200_000_000)
+    await waitUntil { orch.runners.isEmpty }
 
     XCTAssertTrue(orch.runners.isEmpty)
     XCTAssertTrue(factory.made[0].stopped)
@@ -390,7 +408,7 @@ final class OrchestratorTests: XCTestCase {
     cp.failListRunners = true
     // One job persists in the queue: with busy unknown, the existing slot is
     // assumed busy → scale up to slots(1) + demand(1) = 2, clamped at cap 2.
-    try? await Task.sleep(nanoseconds: 250_000_000)
+    await waitUntil { orch.runners.count == 2 }
 
     XCTAssertEqual(orch.runners.count, 2, "scale-up must not stall on a runners-list failure")
     XCTAssertTrue(cp.deleted.isEmpty, "never trim blind")
@@ -496,7 +514,7 @@ final class OrchestratorTests: XCTestCase {
     let collector = RecordCollector()
     orch.onRunFinished = { collector.records.append($0) }
     await orch.start()
-    try? await Task.sleep(nanoseconds: 300_000_000)
+    await waitUntil { orch.runners.isEmpty && cp.deleted.contains(1) }
 
     XCTAssertTrue(collector.records.isEmpty, "a launch death is not a run")
     XCTAssertEqual(cp.jitCount, 1, "no hot-loop replacement before the next tick")
@@ -515,7 +533,7 @@ final class OrchestratorTests: XCTestCase {
     XCTAssertTrue(orch.idleAtZero, "empty queue + zero runners = idle pace")
 
     cp.queuedJobs = [["self-hosted"]]
-    try? await Task.sleep(nanoseconds: 150_000_000)
+    await waitUntil { !orch.idleAtZero }
     XCTAssertFalse(orch.idleAtZero, "demand flips to the active pace")
 
     cp.failQueuedPoll = true
@@ -525,7 +543,7 @@ final class OrchestratorTests: XCTestCase {
 
     cp.failQueuedPoll = false
     factory.made.last?.fireExit(0)
-    try? await Task.sleep(nanoseconds: 150_000_000)
+    await waitUntil { orch.idleAtZero }
     XCTAssertTrue(orch.idleAtZero, "back to zero + empty queue = idle pace")
     await orch.stop()
   }
@@ -587,7 +605,7 @@ final class OrchestratorTests: XCTestCase {
     XCTAssertTrue(orch.demand.waitingForCapacity, "the second job's provision was denied")
 
     cp.queuedJobs = []  // demand drains → nothing is waiting any more
-    try? await Task.sleep(nanoseconds: 200_000_000)
+    await waitUntil { !orch.demand.waitingForCapacity }
     XCTAssertFalse(orch.demand.waitingForCapacity)
     await orch.stop()
   }
@@ -607,7 +625,7 @@ final class OrchestratorTests: XCTestCase {
     orch.onRunFinished = { collector.records.append($0) }
     await orch.start()
     XCTAssertFalse(orch.launchFailing, "one death isn't a pattern yet")
-    try? await Task.sleep(nanoseconds: 400_000_000)  // several tick-paced retries
+    await waitUntil { orch.launchFailing }
 
     XCTAssertTrue(orch.launchFailing)
     XCTAssertNotNil(orch.lastError)
@@ -679,7 +697,7 @@ final class OrchestratorTests: XCTestCase {
     await orch.start()
     XCTAssertEqual(cp.jitCount, 1)
 
-    try? await Task.sleep(nanoseconds: 220_000_000)
+    await waitUntil { cp.jitCount >= 2 }
 
     XCTAssertGreaterThanOrEqual(cp.jitCount, 2)
     XCTAssertTrue(factory.made[0].stopped)
@@ -707,7 +725,7 @@ final class OrchestratorTests: XCTestCase {
     cp.remote = [
       RemoteRunner(id: runner.remoteId!, name: runner.id, status: "online", busy: false)
     ]
-    try? await Task.sleep(nanoseconds: 160_000_000)
+    await waitUntil { factory.made[0].stopped }
     XCTAssertTrue(factory.made[0].stopped)
     // The SIGTERM'd agent's terminationHandler fires onExit — like
     // LocalProcessProvider/LinuxContainerProvider after a real stop().
@@ -792,7 +810,7 @@ final class OrchestratorTests: XCTestCase {
     cp.remote = [
       RemoteRunner(id: runner.remoteId!, name: runner.id, status: "offline", busy: true)
     ]
-    try? await Task.sleep(nanoseconds: 160_000_000)
+    await waitUntil { cp.jitCount >= 2 }
 
     XCTAssertTrue(factory.made[0].stopped)
     XCTAssertTrue(cp.deleted.contains(runner.remoteId!))
@@ -810,7 +828,7 @@ final class OrchestratorTests: XCTestCase {
       RemoteRunner(id: runner.remoteId!, name: runner.id, status: "online", busy: false)
     ]
 
-    try? await Task.sleep(nanoseconds: 220_000_000)
+    await waitUntil { cp.jitCount >= 2 }
 
     XCTAssertGreaterThanOrEqual(cp.jitCount, 2)
     XCTAssertTrue(factory.made[0].stopped)
