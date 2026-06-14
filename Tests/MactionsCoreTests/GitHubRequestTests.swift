@@ -3,14 +3,14 @@ import XCTest
 @testable import MactionsCore
 
 final class GitHubRequestTests: XCTestCase {
-  let client = GitHubClient(owner: "Kyter-com", repo: "sweep-collector", token: "tok_123")
+  let client = GitHubClient(owner: "acme", repo: "example", token: "tok_123")
 
   func testJITConfigRequestShape() throws {
     let req = try client.jitConfigRequest(name: "mactions-abc", labels: ["self-hosted", "macOS"])
     XCTAssertEqual(req.httpMethod, "POST")
     XCTAssertEqual(
       req.url?.absoluteString,
-      "https://api.github.com/repos/Kyter-com/sweep-collector/actions/runners/generate-jitconfig"
+      "https://api.github.com/repos/acme/example/actions/runners/generate-jitconfig"
     )
     XCTAssertEqual(req.value(forHTTPHeaderField: "Authorization"), "Bearer tok_123")
     XCTAssertEqual(req.value(forHTTPHeaderField: "X-GitHub-Api-Version"), "2022-11-28")
@@ -29,14 +29,14 @@ final class GitHubRequestTests: XCTestCase {
     XCTAssertEqual(list.httpMethod, "GET")
     XCTAssertEqual(
       list.url?.absoluteString,
-      "https://api.github.com/repos/Kyter-com/sweep-collector/actions/runners?per_page=100"
+      "https://api.github.com/repos/acme/example/actions/runners?per_page=100"
     )
 
     let del = client.deleteRunnerRequest(id: 42)
     XCTAssertEqual(del.httpMethod, "DELETE")
     XCTAssertEqual(
       del.url?.absoluteString,
-      "https://api.github.com/repos/Kyter-com/sweep-collector/actions/runners/42"
+      "https://api.github.com/repos/acme/example/actions/runners/42"
     )
     XCTAssertEqual(del.value(forHTTPHeaderField: "Authorization"), "Bearer tok_123")
   }
@@ -46,20 +46,20 @@ final class GitHubRequestTests: XCTestCase {
     XCTAssertEqual(runs.httpMethod, "GET")
     XCTAssertEqual(
       runs.url?.absoluteString,
-      "https://api.github.com/repos/Kyter-com/sweep-collector/actions/runs?per_page=40")
+      "https://api.github.com/repos/acme/example/actions/runs?per_page=40")
 
     let jobs = client.listJobsRequest(runId: 99)
     XCTAssertEqual(jobs.httpMethod, "GET")
     XCTAssertEqual(
       jobs.url?.absoluteString,
-      "https://api.github.com/repos/Kyter-com/sweep-collector/actions/runs/99/jobs?per_page=100&filter=all"
+      "https://api.github.com/repos/acme/example/actions/runs/99/jobs?per_page=100&filter=all"
     )
 
     let logs = client.jobLogsRequest(jobId: 7)
     XCTAssertEqual(logs.httpMethod, "GET")
     XCTAssertEqual(
       logs.url?.absoluteString,
-      "https://api.github.com/repos/Kyter-com/sweep-collector/actions/jobs/7/logs")
+      "https://api.github.com/repos/acme/example/actions/jobs/7/logs")
     XCTAssertEqual(logs.value(forHTTPHeaderField: "Authorization"), "Bearer tok_123")
   }
 
@@ -144,7 +144,7 @@ final class GitHubRequestTests: XCTestCase {
     let queued = client.listWorkflowRunsRequest(perPage: 40, status: "queued")
     XCTAssertEqual(
       queued.url?.absoluteString,
-      "https://api.github.com/repos/Kyter-com/sweep-collector/actions/runs?per_page=40&status=queued"
+      "https://api.github.com/repos/acme/example/actions/runs?per_page=40&status=queued"
     )
     // Status-filtered (polled) requests bypass URLCache so the explicit ETag
     // handling is the only caching layer in play.
@@ -154,7 +154,7 @@ final class GitHubRequestTests: XCTestCase {
     let plain = client.listWorkflowRunsRequest(perPage: 40)
     XCTAssertEqual(
       plain.url?.absoluteString,
-      "https://api.github.com/repos/Kyter-com/sweep-collector/actions/runs?per_page=40")
+      "https://api.github.com/repos/acme/example/actions/runs?per_page=40")
   }
 
   func testWorkflowJobDecodesRunsOnLabels() throws {

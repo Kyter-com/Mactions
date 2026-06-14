@@ -127,7 +127,7 @@ public enum GitHubAuth {
 /// so the keychain re-prompts on every read and "Always Allow" won't stick,
 /// and those modal prompts even steal focus from the menubar popover (which
 /// cancels in-flight requests). A `0600` file avoids all of that — the same
-/// choice homerun makes. Cached in memory so we touch disk at most once.
+/// choice a sibling app makes. Cached in memory so we touch disk at most once.
 ///
 /// A signed/notarized build could move this back to the keychain; see
 /// AGENTS.md → Roadmap.
