@@ -145,9 +145,14 @@ public final class LocalProcessProvider: RunnerProvider, @unchecked Sendable {
       }
     }
 
+    // Deliver the JIT registration secret via the environment, NOT the arg list,
+    // so it never appears in `ps`/proc args (parity with the Linux & Windows
+    // providers). The runner's CommandSettings strips the ACTIONS_RUNNER_INPUT_
+    // prefix and treats this exactly as `--jitconfig`.
+    env["ACTIONS_RUNNER_INPUT_JITCONFIG"] = jitConfig
+
     let process = Process()
     process.executableURL = runDirectory.appendingPathComponent("run.sh")
-    process.arguments = ["--jitconfig", jitConfig]
     process.currentDirectoryURL = runDirectory
     process.environment = env
     process.terminationHandler = { [weak self] proc in

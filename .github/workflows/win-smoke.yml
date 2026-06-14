@@ -5,7 +5,15 @@ name: Windows smoke (Mactions runner)
 # Windows loop end to end. Dispatch with:
 #   gh workflow run "Windows smoke (Mactions runner)"
 on:
+  # workflow_dispatch ONLY — never add pull_request / pull_request_target / push.
+  # This job runs on a SELF-HOSTED Windows VM; a fork-PR trigger would let
+  # untrusted code execute on maintainer-controlled hardware. Dispatch requires
+  # repo write access.
   workflow_dispatch:
+
+# Least privilege: this job only inspects the runner, so the GITHUB_TOKEN needs
+# no scopes.
+permissions: {}
 
 jobs:
   win-smoke:

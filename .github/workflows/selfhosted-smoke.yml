@@ -6,7 +6,16 @@ name: Self-hosted smoke (Mactions runner)
 # macos-latest runners are unavailable to the org. Dispatch with:
 #   gh workflow run "Self-hosted smoke (Mactions runner)"
 on:
+  # workflow_dispatch ONLY — never add pull_request / pull_request_target / push.
+  # This job runs on a SELF-HOSTED runner (the maintainer's Mac, no VM isolation);
+  # a fork-PR trigger would let untrusted code execute on that host. Dispatch
+  # requires repo write access, which keeps the self-hosted runner closed to
+  # outside contributors.
   workflow_dispatch:
+
+# Least privilege: this job only builds/tests and never touches repo contents or
+# the API, so the GITHUB_TOKEN needs no scopes.
+permissions: {}
 
 jobs:
   smoke:
