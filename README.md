@@ -165,3 +165,9 @@ Pick the `MactionsApp` scheme and run.
   and GitHub Release packaging.
 - [Maintainer notes](AGENTS.md): architecture, implementation history, and the
   detailed roadmap.
+- [Security policy](SECURITY.md): trust model, job isolation, and how to report
+  a vulnerability.
+
+## License
+
+Mactions is released under the [Apache License 2.0](LICENSE).
