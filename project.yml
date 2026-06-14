@@ -96,7 +96,12 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: xcode/Info.plist
         CODE_SIGN_STYLE: Automatic
-        SPARKLE_PUBLIC_ED_KEY: ""
+        # Sparkle EdDSA PUBLIC key — safe to commit (it is public by design; the
+        # matching PRIVATE key is a CI-only secret). Pinning the real value here
+        # makes the update trust anchor version-controlled and code-reviewable.
+        # CI still overrides it via the xcodebuild `SPARKLE_PUBLIC_ED_KEY=…` arg
+        # (sourced from the repo variable) so rotation doesn't require a commit.
+        SPARKLE_PUBLIC_ED_KEY: "ZPoe1Hw7/Z/UzcdsjUL+B6YeMu+NzPa4ho6AecEtytU="
         COMBINE_HIDPI_IMAGES: YES
       configs:
         Debug:

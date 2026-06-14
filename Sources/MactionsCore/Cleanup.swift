@@ -20,8 +20,8 @@ public enum HostCleanup {
   /// `~/.mactions`. A dot-dir in $HOME on purpose: the GitHub Actions runner
   /// breaks on spaces in its work path, and `~/Library/Application Support`
   /// contains one ("Application Support") — which fails jobs with a bash
-  /// "is a directory" / exit 126 the moment a step runs. homerun uses
-  /// `~/.homerun` for exactly this reason.
+  /// "is a directory" / exit 126 the moment a step runs. (A sibling app
+  /// landed on a `~/.<name>` dot-dir for the same reason.)
   public static func mactionsRoot() -> URL {
     FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent(".mactions", isDirectory: true)
