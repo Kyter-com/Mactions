@@ -222,8 +222,19 @@ require_converter_deps() {
     }
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
+    # chntpw resolves to a third-party tap (minacle/chntpw), not homebrew-core.
+    # Homebrew 5.2/6.0 makes tap-trust checks the default, at which point a bare
+    # `brew install minacle/chntpw/chntpw` is ignored until the tap is trusted
+    # once — so surface that step for any user/tap/formula in the missing list.
+    local trust_hint=""
+    for m in "${missing[@]}"; do
+      [[ "$m" == */*/* ]] || continue
+      trust_hint+="
+On Homebrew 5.2+/6.0+, \`$m\` is from a third-party tap and must be trusted once:
+  brew tap ${m%/*} && brew trust --formula $m"
+    done
     die "auto-download needs these tools first:
-  brew install ${missing[*]}
+  brew install ${missing[*]}${trust_hint}
 Or supply your own ISO with --iso /path/to/Win11_ARM64.iso (skips the converter)."
   fi
 }

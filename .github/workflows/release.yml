@@ -21,6 +21,11 @@ permissions:
 env:
   APP_NAME: Mactions
   SCHEME: MactionsApp
+  # Opt into Homebrew's upcoming tap-trust default early. We only install the
+  # core formula `xcodegen`, so enforcing trust changes nothing for us — it just
+  # silences the deprecation nag about the runner's preinstalled aws/tap &
+  # azure/bicep taps.
+  HOMEBREW_REQUIRE_TAP_TRUST: "1"
 
 jobs:
   release:
