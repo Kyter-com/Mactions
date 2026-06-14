@@ -111,8 +111,8 @@ public enum RunnerInstaller {
     // tag is like "v2.319.1" → strip the leading "v".
     let version = release.tag_name.hasPrefix("v") ? String(release.tag_name.dropFirst()) : release.tag_name
     var digests: [String: String] = [:]
-    for asset in release.assets where asset.digest != nil {
-      digests[asset.name] = asset.digest
+    for asset in release.assets {
+      if let digest = asset.digest { digests[asset.name] = digest }
     }
     return RunnerRelease(version: version, assetDigests: digests)
   }

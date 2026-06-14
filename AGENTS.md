@@ -257,7 +257,7 @@ Friendly by design — no env vars, no hand-copied long tokens.
 - **Device flow:** show a short user code, open `github.com/login/device`, poll for approval. Needs a registered **OAuth App client id** (not a secret; device flow has none) — bake one in (or paste it in Settings). This is how a signed app gives zero-per-user-setup sign-in once the client id ships.
 - **PAT fallback:** paste a token. Works immediately, no OAuth App needed.
 - **Scope:** `repo` (classic) or fine-grained **Administration: read & write** on the target repo — required to register/remove repo self-hosted runners.
-- **Storage:** a `0600` file at `~/.mactions/auth.token`, cached in memory — **not** the login keychain. An unsigned/dev build has no stable code identity, so the keychain re-prompts on every read, "Always Allow" won't stick, and the modal can steal focus from the app (cancelling in-flight requests). a sibling app makes the same file-based choice. A signed/notarized build could move back to the keychain — see Roadmap.
+- **Storage:** a `0600` file at `~/.mactions/auth.token`, cached in memory — **not** the login keychain. An unsigned/dev build has no stable code identity, so the keychain re-prompts on every read, "Always Allow" won't stick, and the modal can steal focus from the app (cancelling in-flight requests). A sibling app makes the same file-based choice. A signed/notarized build could move back to the keychain — see Roadmap.
 
 ## Build / run / test
 

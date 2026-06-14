@@ -13,9 +13,11 @@ on:
   # outside contributors.
   workflow_dispatch:
 
-# Least privilege: this job only builds/tests and never touches repo contents or
-# the API, so the GITHUB_TOKEN needs no scopes.
-permissions: {}
+# Least privilege: this job checks out the repo (actions/checkout) and then
+# builds/tests, so the GITHUB_TOKEN needs read access to contents and nothing
+# else.
+permissions:
+  contents: read
 
 jobs:
   smoke:
