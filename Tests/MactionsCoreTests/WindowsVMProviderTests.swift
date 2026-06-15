@@ -151,6 +151,63 @@ final class WindowsVMProviderTests: XCTestCase {
     }
   }
 
+  // MARK: Helper resolution (bundle-aware — the distributed-.app fix)
+
+  func testResolveFusionHelperPrefersBundledResource() {
+    // REGRESSION: a downloaded .app ships scripts/ in Contents/Resources/
+    // (project.yml's "Bundle scripts/ into Resources" step). Pre-fix resolution
+    // tried ONLY cwd / binary-walk-up / #filePath — all of which MISS inside a
+    // .app (cwd is "/", the binary sits under Contents/MacOS, #filePath is the
+    // CI builder's path), so Fusion read as "not installed" despite vmrun being
+    // present. The bundle strategy (0) must win. Inputs model the real bundle.
+    let resources = "/Applications/Mactions.app/Contents/Resources"
+    let expected = resources + "/scripts/mactions-fusion-vm"
+    let resolved = WindowsVMProviderFactory.resolveFusionHelper(
+      bundleResourceDir: resources,
+      cwd: "/",
+      binaryPath: "/Applications/Mactions.app/Contents/MacOS/Mactions",
+      sourceFilePath: "/Users/runner/work/Mactions/Mactions/Sources/MactionsCore/WindowsVMProvider.swift",
+      isExecutable: { $0 == expected })
+    XCTAssertEqual(resolved, expected)
+  }
+
+  func testResolveFusionHelperFallsBackToCwdUnderSwiftRun() {
+    // Under `swift run` from the repo there's no bundle resource dir; the cwd
+    // strategy (1) still resolves, so the fix leaves dev behavior unchanged.
+    let expected = "/repo/scripts/mactions-fusion-vm"
+    let resolved = WindowsVMProviderFactory.resolveFusionHelper(
+      bundleResourceDir: nil,
+      cwd: "/repo",
+      binaryPath: "/repo/.build/arm64-apple-macosx/debug/Mactions",
+      sourceFilePath: "/repo/Sources/MactionsCore/WindowsVMProvider.swift",
+      isExecutable: { $0 == expected })
+    XCTAssertEqual(resolved, expected)
+  }
+
+  func testResolveFusionHelperWalksUpFromBinaryWhenCwdMisses() {
+    // `swift run` from an unrelated cwd: walking up from the binary under
+    // .build/ reaches the repo root that has scripts/. Strategy (2).
+    let expected = "/repo/scripts/mactions-fusion-vm"
+    let resolved = WindowsVMProviderFactory.resolveFusionHelper(
+      bundleResourceDir: nil,
+      cwd: "/some/unrelated/dir",
+      binaryPath: "/repo/.build/arm64-apple-macosx/debug/Mactions",
+      sourceFilePath: "/nonexistent/WindowsVMProvider.swift",
+      isExecutable: { $0 == expected })
+    XCTAssertEqual(resolved, expected)
+  }
+
+  func testResolveFusionHelperReturnsNilWhenHelperAbsentEverywhere() {
+    // No bundle copy, no cwd/binary/source copy → nil (Fusion not offered).
+    let resolved = WindowsVMProviderFactory.resolveFusionHelper(
+      bundleResourceDir: "/Applications/Mactions.app/Contents/Resources",
+      cwd: "/",
+      binaryPath: "/Applications/Mactions.app/Contents/MacOS/Mactions",
+      sourceFilePath: "/nonexistent/WindowsVMProvider.swift",
+      isExecutable: { _ in false })
+    XCTAssertNil(resolved)
+  }
+
   // MARK: Teardown guard
 
   func testStopIsIdempotentAndClearsRunning() {

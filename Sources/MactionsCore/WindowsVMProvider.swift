@@ -444,38 +444,70 @@ public struct WindowsVMProviderFactory: RunnerProviderFactory {
   }
 
   /// Resolve the `scripts/mactions-fusion-vm` lifecycle helper at module-load
-  /// time: first next to the binary's working dir (dev builds run via
-  /// `swift run` from the repo), then by walking up from the executable to a
-  /// repo root (useful when the app is launched from a path that isn't the repo
-  /// cwd). nil if the helper isn't shipped alongside the binary (Fusion is then
-  /// not offered).
-  public static let fusionHelperPath: String? = {
-    let fm = FileManager.default
-    let rel = "scripts/mactions-fusion-vm"
+  /// time. Order, most-production-likely first: (0) bundled in the distributed
+  /// `.app`'s Resources, then the `swift run`/dev fallbacks — (1) the launch cwd,
+  /// (2) up from the binary, (3) up from this file's compile-time location. nil
+  /// if the helper isn't reachable anywhere (Fusion is then not offered).
+  public static let fusionHelperPath: String? = resolveFusionHelper(
+    bundleResourceDir: Bundle.main.resourceURL?.path,
+    cwd: FileManager.default.currentDirectoryPath,
+    binaryPath: CommandLine.arguments.first ?? "/",
+    sourceFilePath: #filePath,
+    isExecutable: { FileManager.default.isExecutableFile(atPath: $0) }
+  )
+
+  /// Pure helper resolution given the environment probes, ordered by
+  /// production-likelihood. Split out from the live `fusionHelperPath` so the
+  /// strategy precedence is unit-testable without a real bundle / cwd / binary
+  /// layout (mirrors `WindowsPreflight.makeReport`).
+  ///   - `bundleResourceDir`: `Bundle.main.resourceURL?.path` — the distributed
+  ///     `.app`'s `Contents/Resources` (nil under `swift run`/tests).
+  ///   - `cwd`: current working directory (the repo root under `swift run`).
+  ///   - `binaryPath`: the running executable (`CommandLine.arguments.first`).
+  ///   - `sourceFilePath`: this file's compile-time `#filePath` (dev fallback).
+  ///   - `isExecutable`: probes whether an absolute path is an executable file.
+  static func resolveFusionHelper(
+    rel: String = "scripts/mactions-fusion-vm",
+    bundleResourceDir: String?,
+    cwd: String,
+    binaryPath: String,
+    sourceFilePath: String,
+    isExecutable: (String) -> Bool
+  ) -> String? {
+    // 0. Bundled in the distributed .app's Resources — the PRODUCTION path.
+    //    project.yml's "Bundle scripts/ into Resources" postBuildScript copies
+    //    scripts/ to Contents/Resources/scripts/ (signed under the app
+    //    signature), so a downloaded .app resolves HERE. Mirrors
+    //    AppState.prepareWindowsImageScript(). The walk-ups below never descend
+    //    into Resources, so without this a distributed app reads Fusion as "not
+    //    installed" even with vmrun present.
+    if let bundleResourceDir {
+      let bundled = URL(fileURLWithPath: bundleResourceDir).appendingPathComponent(rel).path
+      if isExecutable(bundled) { return bundled }
+    }
     // 1. ./scripts/<name> relative to the launch cwd (`swift run` from the repo).
-    let cwd = fm.currentDirectoryPath + "/" + rel
-    if fm.isExecutableFile(atPath: cwd) { return cwd }
+    let cwdCandidate = cwd + "/" + rel
+    if isExecutable(cwdCandidate) { return cwdCandidate }
     // 2. Walk up from the binary (.build/<…>/Mactions → repo root with scripts/).
-    var dir = URL(fileURLWithPath: CommandLine.arguments.first ?? "/").deletingLastPathComponent()
+    var dir = URL(fileURLWithPath: binaryPath).deletingLastPathComponent()
     for _ in 0..<8 {
       let candidate = dir.appendingPathComponent(rel).path
-      if fm.isExecutableFile(atPath: candidate) { return candidate }
+      if isExecutable(candidate) { return candidate }
       if dir.path == "/" { break }
       dir = dir.deletingLastPathComponent()
     }
     // 3. Walk up from THIS source file's compile-time location (Sources/
-    //    MactionsCore/…) to the repo root — robust for dev runs from ANY cwd,
-    //    where (1) and (2) can both miss. (A distributed .app would instead ship
-    //    the scripts in its Resources; not built yet — see Roadmap.)
-    var src = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+    //    MactionsCore/…) to a repo root — robust for dev runs from ANY cwd,
+    //    where (0)–(2) can all miss (no bundle, cwd ≠ repo, binary elsewhere).
+    var src = URL(fileURLWithPath: sourceFilePath).deletingLastPathComponent()
     for _ in 0..<8 {
       let candidate = src.appendingPathComponent(rel).path
-      if fm.isExecutableFile(atPath: candidate) { return candidate }
+      if isExecutable(candidate) { return candidate }
       if src.path == "/" { break }
       src = src.deletingLastPathComponent()
     }
     return nil
-  }()
+  }
 
   /// Absolute path to VMware Fusion's `vmrun`. Fusion is NOT brew-installable
   /// (Broadcom-portal download), so detection is presence-only — we never try to
