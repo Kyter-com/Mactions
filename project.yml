@@ -91,7 +91,7 @@ targets:
         # The Icon Composer icon → real AppIcon (compiled by actool).
         ASSETCATALOG_COMPILER_APPICON_NAME: Mactions
         SWIFT_VERSION: "6.0"
-        MARKETING_VERSION: "0.1.1"
+        MARKETING_VERSION: "0.1.2"
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: xcode/Info.plist

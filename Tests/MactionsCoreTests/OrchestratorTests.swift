@@ -696,12 +696,18 @@ final class OrchestratorTests: XCTestCase {
       idleJITRefreshInterval: nil)
     await orch.start()
     XCTAssertEqual(cp.jitCount, 1)
+    let runner = try! XCTUnwrap(orch.runners.first)
 
-    await waitUntil { cp.jitCount >= 2 }
+    await waitUntil {
+      cp.jitCount >= 2 && factory.made[0].stopped && cp.deleted.contains(runner.remoteId!)
+        && orch.runners.count == 1 && orch.runners.first?.id != runner.id
+    }
 
     XCTAssertGreaterThanOrEqual(cp.jitCount, 2)
     XCTAssertTrue(factory.made[0].stopped)
+    XCTAssertTrue(cp.deleted.contains(runner.remoteId!))
     XCTAssertEqual(orch.runners.count, 1)
+    XCTAssertNotEqual(orch.runners.first?.id, runner.id)
     await orch.stop()
   }
 
@@ -725,7 +731,10 @@ final class OrchestratorTests: XCTestCase {
     cp.remote = [
       RemoteRunner(id: runner.remoteId!, name: runner.id, status: "online", busy: false)
     ]
-    await waitUntil { factory.made[0].stopped }
+    await waitUntil {
+      cp.jitCount >= 2 && factory.made[0].stopped && orch.runners.count == 1
+        && orch.runners.first?.id != runner.id
+    }
     XCTAssertTrue(factory.made[0].stopped)
     // The SIGTERM'd agent's terminationHandler fires onExit — like
     // LocalProcessProvider/LinuxContainerProvider after a real stop().
@@ -810,7 +819,10 @@ final class OrchestratorTests: XCTestCase {
     cp.remote = [
       RemoteRunner(id: runner.remoteId!, name: runner.id, status: "offline", busy: true)
     ]
-    await waitUntil { cp.jitCount >= 2 }
+    await waitUntil {
+      cp.jitCount >= 2 && factory.made[0].stopped && cp.deleted.contains(runner.remoteId!)
+        && orch.runners.count == 1 && orch.runners.first?.id != runner.id
+    }
 
     XCTAssertTrue(factory.made[0].stopped)
     XCTAssertTrue(cp.deleted.contains(runner.remoteId!))
@@ -828,7 +840,10 @@ final class OrchestratorTests: XCTestCase {
       RemoteRunner(id: runner.remoteId!, name: runner.id, status: "online", busy: false)
     ]
 
-    await waitUntil { cp.jitCount >= 2 }
+    await waitUntil {
+      cp.jitCount >= 2 && factory.made[0].stopped && cp.deleted.contains(runner.remoteId!)
+        && orch.runners.count == 1 && orch.runners.first?.id != runner.id
+    }
 
     XCTAssertGreaterThanOrEqual(cp.jitCount, 2)
     XCTAssertTrue(factory.made[0].stopped)
