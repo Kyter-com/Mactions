@@ -58,4 +58,30 @@ final class LinuxContainerBudgetTests: XCTestCase {
     XCTAssertEqual(LinuxContainerBudget.defaultCPUsPerContainer, 2)
     XCTAssertEqual(LinuxContainerBudget.defaultMemoryGBPerContainer, 6)
   }
+
+  func testEffectiveCapClampsLargeHostToBridgeCeiling() {
+    // 128 GB / 64 cores: the raw RAM/CPU divide authorizes min((128-4)/6, 64/2)
+    // = min(20, 32) = 20 — far past what the shared vmnet bridge tolerates.
+    XCTAssertEqual(
+      LinuxContainerBudget.maxConcurrentContainers(
+        physicalMemoryBytes: gb(128), activeProcessorCount: 64), 20)
+    // The EFFECTIVE cap (what the host budget enforces) clamps to the ceiling.
+    XCTAssertEqual(LinuxContainerBudget.maxConcurrentContainersCeiling, 4)
+    XCTAssertEqual(
+      LinuxContainerBudget.effectiveMaxConcurrentContainers(
+        physicalMemoryBytes: gb(128), activeProcessorCount: 64),
+      LinuxContainerBudget.maxConcurrentContainersCeiling)
+  }
+
+  func testEffectiveCapNeverRaisesASmallHost() {
+    // 12 GB / 4 cores: raw = min((12-4)/6, 4/2) = min(1, 2) = 1. The ceiling is
+    // an UPPER clamp only — it must not raise a host that's below it.
+    XCTAssertEqual(
+      LinuxContainerBudget.effectiveMaxConcurrentContainers(
+        physicalMemoryBytes: gb(12), activeProcessorCount: 4), 1)
+    // A host that can't fit even one container stays 0 through the clamp.
+    XCTAssertEqual(
+      LinuxContainerBudget.effectiveMaxConcurrentContainers(
+        physicalMemoryBytes: gb(4), activeProcessorCount: 8), 0)
+  }
 }

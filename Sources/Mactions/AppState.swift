@@ -777,7 +777,7 @@ final class AppState: ObservableObject {
         let maxLinux =
           linuxFactory == nil
           ? 0
-          : LinuxContainerBudget.maxConcurrentContainers(
+          : LinuxContainerBudget.effectiveMaxConcurrentContainers(
             physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
             activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount)
 
@@ -1887,7 +1887,7 @@ final class AppState: ObservableObject {
         ? WindowsVMBudget.maxConcurrentVMs(physicalMemoryBytes: ram, perVMGB: perVM)
         : 0,
       linuxMaxConcurrentContainers: linuxImageReady
-        ? LinuxContainerBudget.maxConcurrentContainers(
+        ? LinuxContainerBudget.effectiveMaxConcurrentContainers(
           physicalMemoryBytes: ram,
           activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount)
         : 0,

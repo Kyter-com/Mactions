@@ -175,7 +175,8 @@ final class OrchestratorTests: XCTestCase {
     idleJITRefreshInterval: TimeInterval? = 8 * 60,
     idleTrimGraceInterval: TimeInterval = 90,
     trimConfirmInterval: TimeInterval = 0.01,  // tests: one 50ms tick elapses it
-    launchFailureGraceInterval: TimeInterval = 0  // tests: disabled unless opted in
+    launchFailureGraceInterval: TimeInterval = 0,  // tests: disabled unless opted in
+    neverConfirmedReapInterval: TimeInterval = 3600  // tests: effectively off unless opted in
   ) -> (RunnerOrchestrator, FakeControlPlane, FakeFactory) {
     let cp = FakeControlPlane()
     cp.queuedJobs = queued ?? Array(repeating: labels, count: count)
@@ -191,7 +192,8 @@ final class OrchestratorTests: XCTestCase {
       idleJITRefreshInterval: idleJITRefreshInterval,
       idleTrimGraceInterval: idleTrimGraceInterval,
       trimConfirmInterval: trimConfirmInterval,
-      launchFailureGraceInterval: launchFailureGraceInterval)
+      launchFailureGraceInterval: launchFailureGraceInterval,
+      neverConfirmedReapInterval: neverConfirmedReapInterval)
     return (orch, cp, factory)
   }
 
@@ -827,6 +829,73 @@ final class OrchestratorTests: XCTestCase {
     XCTAssertTrue(factory.made[0].stopped)
     XCTAssertTrue(cp.deleted.contains(runner.remoteId!))
     XCTAssertGreaterThanOrEqual(cp.jitCount, 2)
+    await orch.stop()
+  }
+
+  /// A container that REGISTERS but never reaches GitHub (its egress failed) is a
+  /// zombie: it won't exit, so the launch-failure-on-exit path never fires, and
+  /// waiting out the 5-min sustained-offline grace lets replacements pile up
+  /// behind it (the observed 15-container incident). With a short
+  /// `neverConfirmedReapInterval` it's reaped FAST — `provider.stop()` runs (so
+  /// the real provider force-deletes the container), the never-online
+  /// registration is deregistered, and it's counted toward the launch-failure
+  /// backoff so a repeated failure surfaces instead of respawning forever.
+  func testReapsRegisteredButNeverConfirmedOnlineZombieFast() async {
+    let (orch, cp, factory) = makeOrchestrator(
+      count: 1, reconcileInterval: 50_000_000,
+      remoteRegistrationGraceInterval: 5 * 60,  // sustained-offline grace stays LONG…
+      idleJITRefreshInterval: nil,
+      neverConfirmedReapInterval: 0)  // …but the never-online reaper fires immediately
+    await orch.start()
+    let runner = try! XCTUnwrap(orch.runners.first)
+
+    // Registered (has a remoteId) but GitHub reports it offline and it was NEVER
+    // online — the egress-failed container. The 5-min grace hasn't elapsed, so
+    // ONLY the never-confirmed reaper can catch this.
+    cp.remote = [
+      RemoteRunner(id: runner.remoteId!, name: runner.id, status: "offline", busy: false)
+    ]
+    let reaped = await waitUntil {
+      factory.made[0].stopped && cp.deleted.contains(runner.remoteId!)
+        && orch.runners.first?.id != runner.id
+    }
+    XCTAssertTrue(
+      reaped,
+      "a never-online zombie must be stopped (→ container force-deleted), deregistered, and replaced — fast")
+    // Repeated never-online reaps must surface as `launchFailing` ("substrate
+    // broken") rather than silently respawning forever.
+    let surfaced = await waitUntil { orch.launchFailing }
+    XCTAssertTrue(surfaced, "two never-online reaps must flip launchFailing")
+    await orch.stop()
+  }
+
+  /// A SUSTAINED `listRunners` outage must HOLD the fleet, not keep scaling up.
+  /// With busy-ness unknown the converge step assumes queued jobs need NEW
+  /// runners — but when the outage is an egress failure those replacements can
+  /// never connect, which is the snowball. (A brief blip still scales up.)
+  func testSustainedListRunnersOutageHoldsTheFleet() async {
+    let (orch, cp, factory) = makeOrchestrator(
+      count: 3, queued: [["self-hosted"]],  // one job → one runner to start
+      reconcileInterval: 50_000_000,
+      neverConfirmedReapInterval: 0)  // the "sustained" window is immediate in the test
+    await orch.start()
+    let runner = try! XCTUnwrap(orch.runners.first)
+    // Confirm it online + busy so the reaper leaves it alone and a slot persists.
+    cp.remote = [
+      RemoteRunner(id: runner.remoteId!, name: runner.id, status: "online", busy: true)
+    ]
+    let started = await waitUntil { orch.runners.count == 1 }
+    XCTAssertTrue(started)
+
+    // The runner API goes dark and STAYS dark, while demand spikes to 3. The
+    // fleet must NOT grow toward demand against unknown busy-ness.
+    cp.failListRunners = true
+    cp.queuedJobs = Array(repeating: ["self-hosted"], count: 3)
+    try? await Task.sleep(nanoseconds: 400_000_000)  // ~8 ticks; a negative assertion
+    XCTAssertEqual(
+      orch.runners.count, 1,
+      "a sustained runner-API outage must hold the fleet, not scale up to demand")
+    _ = factory
     await orch.stop()
   }
 

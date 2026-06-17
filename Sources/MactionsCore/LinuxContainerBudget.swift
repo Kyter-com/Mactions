@@ -23,6 +23,15 @@ public enum LinuxContainerBudget {
   /// is OOM-killed (exit 137) rather than swamping the host.
   public static let defaultMemoryGBPerContainer = 6
 
+  /// Hard ceiling on concurrent containers, applied BELOW the RAM/CPU divide.
+  /// Apple `container` shares a single vmnet NAT bridge across every container;
+  /// past a handful of concurrent lightweight VMs the bridge/DHCP path — not
+  /// RAM/CPU — becomes the binding constraint, and a registered-but-offline
+  /// container can wedge it for the others. Clamp explicitly so a large Mac
+  /// can't authorize a fan-out that exhausts the bridge (the raw divide permitted
+  /// 8+ on a 64 GB host, which is how a stuck runner snowballed into a pileup).
+  public static let maxConcurrentContainersCeiling = 4
+
   /// Max concurrent containers given the host's physical memory + core count.
   ///
   /// Reserves `reservedGB` for macOS, the app, and idle agents, then divides the
@@ -44,5 +53,25 @@ public enum LinuxContainerBudget {
     let byRAM = usableGB >= memoryGBPerContainer ? usableGB / memoryGBPerContainer : 0
     let byCPU = max(0, activeProcessorCount) / cpusPerContainer
     return max(0, min(byRAM, byCPU))
+  }
+
+  /// The cap the host budget should actually ENFORCE: the RAM/CPU divide above,
+  /// then clamped to `maxConcurrentContainersCeiling`. The raw divide can
+  /// authorize many containers on a big Mac, but Apple `container`'s shared
+  /// vmnet NAT bridge — not RAM/CPU — binds first, so the effective cap is the
+  /// lower of the two. Callers computing the live Linux budget use THIS.
+  public static func effectiveMaxConcurrentContainers(
+    physicalMemoryBytes: UInt64,
+    activeProcessorCount: Int,
+    memoryGBPerContainer: Int = defaultMemoryGBPerContainer,
+    cpusPerContainer: Int = defaultCPUsPerContainer,
+    reservedGB: Int = 4
+  ) -> Int {
+    min(
+      maxConcurrentContainers(
+        physicalMemoryBytes: physicalMemoryBytes, activeProcessorCount: activeProcessorCount,
+        memoryGBPerContainer: memoryGBPerContainer, cpusPerContainer: cpusPerContainer,
+        reservedGB: reservedGB),
+      maxConcurrentContainersCeiling)
   }
 }
