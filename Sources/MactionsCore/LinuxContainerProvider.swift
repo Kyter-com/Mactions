@@ -209,11 +209,19 @@ public final class LinuxContainerProvider: RunnerProvider, @unchecked Sendable {
 
   public func stop() {
     lock.lock(); let process = self.process; self.process = nil; lock.unlock()
-    if let process, process.isRunning {
-      process.terminate()  // terminationHandler runs cleanup()
-    } else {
-      cleanup()
-    }
+    // Terminate the foreground `container run` client so its Process settles and
+    // the `onExit` callback fires — but that client is only an ATTACHMENT to a
+    // daemon-managed container. SIGTERM does NOT reliably make `container run`
+    // exit, so we must not depend on its terminationHandler to invoke cleanup().
+    // Force-delete by NAME ourselves, unconditionally: `container delete --force`
+    // removes a still-running container, and `cleanup()` is idempotent (the
+    // `cleaned` guard), so a later terminationHandler is a harmless no-op.
+    //
+    // Without this, a reaped runner's container kept running in the daemon while
+    // the orchestrator dropped it from `slots` and launched a replacement — so a
+    // never-connecting runner (failed egress) piled up one zombie per reap cycle.
+    process?.terminate()
+    cleanup()
   }
 
   /// Idempotent: `--rm` reaps the container on a normal exit, but a SIGKILL

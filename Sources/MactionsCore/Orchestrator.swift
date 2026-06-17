@@ -144,6 +144,15 @@ public final class RunnerOrchestrator {
   /// don't record a run, don't hot-loop a replacement — the periodic tick
   /// paces the retry.
   private let launchFailureGraceInterval: TimeInterval
+  /// A slot ALIVE this long without GitHub ever confirming it `online`
+  /// (`confirmedOnline` never set) is a never-connected zombie: it minted a
+  /// registration but its egress failed, so it never reached GitHub and never
+  /// claimed a job — and, unlike a launch-FAILURE *exit*, its container keeps
+  /// running, so it never trips `launchFailureGraceInterval`. Reap it well before
+  /// the 5-min sustained-offline grace (there's no job to orphan: an unconfirmed
+  /// runner is never assigned work), and count it toward the launch-failure
+  /// backoff so a repeated failure surfaces instead of spawning endlessly.
+  private let neverConfirmedReapInterval: TimeInterval
 
   /// What the last queue poll saw — the UI's window into scale-from-zero
   /// (zero runners is the normal armed state, so the demand signal itself is
@@ -169,6 +178,12 @@ public final class RunnerOrchestrator {
   /// broken (dead daemon, bad base image) and "starting…" would be a lie.
   private var consecutiveLaunchFailures = 0
   public var launchFailing: Bool { consecutiveLaunchFailures >= 2 }
+  /// When `listRunners` first started failing (cleared on the next success). A
+  /// SUSTAINED runner-API outage must NOT read as "spawn more": with busy-ness
+  /// unknown, the converge step would scale up to a fixed target every tick, and
+  /// when the outage is an egress failure those new runners can never connect —
+  /// the snowball. Used by the `health == nil` backstop in `reconcile`.
+  private var listRunnersFailingSince: Date?
   /// Fired (on the main actor) whenever `state`/`runners` change.
   public var onChange: (() -> Void)?
   /// Fired (on the main actor) once for each runner that finishes — a clean
@@ -264,7 +279,8 @@ public final class RunnerOrchestrator {
     idleJITRefreshInterval: TimeInterval? = 8 * 60,
     idleTrimGraceInterval: TimeInterval = 90,
     trimConfirmInterval: TimeInterval = 25,
-    launchFailureGraceInterval: TimeInterval = 30
+    launchFailureGraceInterval: TimeInterval = 30,
+    neverConfirmedReapInterval: TimeInterval = 120
   ) {
     self.controlPlane = controlPlane
     self.factory = factory
@@ -279,6 +295,7 @@ public final class RunnerOrchestrator {
     self.idleTrimGraceInterval = idleTrimGraceInterval
     self.trimConfirmInterval = trimConfirmInterval
     self.launchFailureGraceInterval = launchFailureGraceInterval
+    self.neverConfirmedReapInterval = neverConfirmedReapInterval
   }
 
   public var runners: [ManagedRunner] {
@@ -397,6 +414,19 @@ public final class RunnerOrchestrator {
 
     // 3. Converge.
     guard let health else {
+      // SUSTAINED runner-API outage → HOLD the fleet (don't spawn more). With
+      // busy-ness unknown, the scale-up below assumes queued jobs need NEW
+      // runners — but when the outage is an egress failure (often the same one
+      // stopping runners from connecting), those replacements can never come
+      // online, which is exactly the snowball that piled up containers. Mirrors
+      // the "failed queue poll HOLDS" rule above. A brief blip still scales up.
+      if let since = listRunnersFailingSince,
+        Date().timeIntervalSince(since) >= neverConfirmedReapInterval
+      {
+        lastError = "Can't reach GitHub's runner API — holding the fleet (not spawning more)."
+        notify()
+        return
+      }
       // The queue read is real but busy-ness is unknown (listRunners failed).
       // Assume every current slot is busy: demand that PERSISTS alongside
       // genuinely idle runners doesn't happen (GitHub assigns within seconds),
@@ -538,10 +568,12 @@ public final class RunnerOrchestrator {
     do {
       remote = try await controlPlane.listRunners()
     } catch {
+      if listRunnersFailingSince == nil { listRunnersFailingSince = Date() }
       lastError = String(describing: error)
       notify()
       return nil
     }
+    listRunnersFailingSince = nil  // a successful fetch clears the outage clock
     guard epoch == myEpoch, state == .online else { return nil }
 
     let byId = Dictionary(remote.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
@@ -556,6 +588,26 @@ public final class RunnerOrchestrator {
       let healthy = remoteRunner?.status.lowercased() == "online"
 
       if !healthy {
+        // NEVER-CONNECTED ZOMBIE: appended, alive past `neverConfirmedReapInterval`,
+        // and GitHub has NEVER once confirmed it online. This is the egress-failed
+        // container — it registered but never reached GitHub, so it has no job to
+        // orphan (an unconfirmed runner is never assigned work) and its container
+        // won't exit on its own (so the launch-failure-on-EXIT path never fires).
+        // Reap it FAST instead of waiting out the 5-min sustained-offline grace
+        // (which exists to protect a mid-job runner from a transient blip) — else
+        // replacements pile up behind it. Count it toward the launch-failure
+        // backoff so a repeated failure flips `launchFailing` ("substrate broken")
+        // rather than silently respawning forever.
+        if slot.appended, !slot.confirmedOnline, neverConfirmedReapInterval >= 0,
+          age >= neverConfirmedReapInterval
+        {
+          consecutiveLaunchFailures += 1
+          lastError =
+            "Runner \(slot.name) registered but never reached GitHub within "
+            + "\(Int(neverConfirmedReapInterval))s — reaping (check network/egress)."
+          stale.append((slot, remoteRunner))
+          continue
+        }
         // Missing from GitHub's list, or not online. Prune ONLY after SUSTAINED
         // unhealth (≥ grace), never on a single bad reading — a transient
         // eventual-consistency / connection blip must not tear down a runner
