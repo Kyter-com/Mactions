@@ -176,7 +176,8 @@ final class OrchestratorTests: XCTestCase {
     idleTrimGraceInterval: TimeInterval = 90,
     trimConfirmInterval: TimeInterval = 0.01,  // tests: one 50ms tick elapses it
     launchFailureGraceInterval: TimeInterval = 0,  // tests: disabled unless opted in
-    neverConfirmedReapInterval: TimeInterval = 3600  // tests: effectively off unless opted in
+    neverConfirmedReapInterval: TimeInterval = 3600,  // tests: effectively off unless opted in
+    listRunnersOutageHoldInterval: TimeInterval = 3600  // tests: effectively off unless opted in
   ) -> (RunnerOrchestrator, FakeControlPlane, FakeFactory) {
     let cp = FakeControlPlane()
     cp.queuedJobs = queued ?? Array(repeating: labels, count: count)
@@ -193,7 +194,8 @@ final class OrchestratorTests: XCTestCase {
       idleTrimGraceInterval: idleTrimGraceInterval,
       trimConfirmInterval: trimConfirmInterval,
       launchFailureGraceInterval: launchFailureGraceInterval,
-      neverConfirmedReapInterval: neverConfirmedReapInterval)
+      neverConfirmedReapInterval: neverConfirmedReapInterval,
+      listRunnersOutageHoldInterval: listRunnersOutageHoldInterval)
     return (orch, cp, factory)
   }
 
@@ -877,7 +879,7 @@ final class OrchestratorTests: XCTestCase {
     let (orch, cp, factory) = makeOrchestrator(
       count: 3, queued: [["self-hosted"]],  // one job → one runner to start
       reconcileInterval: 50_000_000,
-      neverConfirmedReapInterval: 0)  // the "sustained" window is immediate in the test
+      listRunnersOutageHoldInterval: 0)  // the outage-hold window is immediate in the test
     await orch.start()
     let runner = try! XCTUnwrap(orch.runners.first)
     // Confirm it online + busy so the reaper leaves it alone and a slot persists.

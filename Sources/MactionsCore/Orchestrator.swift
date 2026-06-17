@@ -152,7 +152,20 @@ public final class RunnerOrchestrator {
   /// the 5-min sustained-offline grace (there's no job to orphan: an unconfirmed
   /// runner is never assigned work), and count it toward the launch-failure
   /// backoff so a repeated failure surfaces instead of spawning endlessly.
+  ///
+  /// VALUES: a NEGATIVE value DISABLES the reaper (the `>= 0` guard at the use
+  /// site). A very small value (e.g. `0`) reaps a runner before it has any
+  /// chance to come online — only sensible in tests; the production default
+  /// leaves a real connect window. Independent of the `listRunners`-outage
+  /// backstop, which has its own `listRunnersOutageHoldInterval`.
   private let neverConfirmedReapInterval: TimeInterval
+  /// How long `listRunners` must be CONTINUOUSLY failing before the converge
+  /// step holds the fleet instead of scaling up against unknown busy-ness (the
+  /// outage backstop in `reconcile`). Deliberately SEPARATE from
+  /// `neverConfirmedReapInterval`: tuning or disabling the zombie reaper must
+  /// not silently widen or disable this safety window, which would re-enable the
+  /// runaway scale-up during a prolonged outage. A brief blip still scales up.
+  private let listRunnersOutageHoldInterval: TimeInterval
 
   /// What the last queue poll saw — the UI's window into scale-from-zero
   /// (zero runners is the normal armed state, so the demand signal itself is
@@ -280,7 +293,8 @@ public final class RunnerOrchestrator {
     idleTrimGraceInterval: TimeInterval = 90,
     trimConfirmInterval: TimeInterval = 25,
     launchFailureGraceInterval: TimeInterval = 30,
-    neverConfirmedReapInterval: TimeInterval = 120
+    neverConfirmedReapInterval: TimeInterval = 120,
+    listRunnersOutageHoldInterval: TimeInterval = 120
   ) {
     self.controlPlane = controlPlane
     self.factory = factory
@@ -296,6 +310,7 @@ public final class RunnerOrchestrator {
     self.trimConfirmInterval = trimConfirmInterval
     self.launchFailureGraceInterval = launchFailureGraceInterval
     self.neverConfirmedReapInterval = neverConfirmedReapInterval
+    self.listRunnersOutageHoldInterval = listRunnersOutageHoldInterval
   }
 
   public var runners: [ManagedRunner] {
@@ -421,7 +436,7 @@ public final class RunnerOrchestrator {
       // online, which is exactly the snowball that piled up containers. Mirrors
       // the "failed queue poll HOLDS" rule above. A brief blip still scales up.
       if let since = listRunnersFailingSince,
-        Date().timeIntervalSince(since) >= neverConfirmedReapInterval
+        Date().timeIntervalSince(since) >= listRunnersOutageHoldInterval
       {
         lastError = "Can't reach GitHub's runner API — holding the fleet (not spawning more)."
         notify()
