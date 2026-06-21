@@ -41,7 +41,9 @@ extension RepoRef: Hashable {
 public struct GitHubRepoLister {
   public let token: String
   public var apiBase = URL(string: "https://api.github.com")!
-  public var session: URLSession = .shared
+  // Bounded-timeout session (see GitHubClient.boundedSession): a hung repo-list
+  // request must not be able to freeze the discovery loop that awaits it.
+  public var session: URLSession = GitHubClient.boundedSession
 
   public init(token: String) { self.token = token }
 
