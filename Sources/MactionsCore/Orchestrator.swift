@@ -439,6 +439,10 @@ public final class RunnerOrchestrator {
         Date().timeIntervalSince(since) >= listRunnersOutageHoldInterval
       {
         lastError = "Can't reach GitHub's runner API — holding the fleet (not spawning more)."
+        ControlPlaneLog.log(
+          "reconcile.listRunners_outage_hold",
+          ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+           "failingSec": String(Int(Date().timeIntervalSince(since)))])
         notify()
         return
       }
@@ -715,6 +719,10 @@ public final class RunnerOrchestrator {
     // frees when any combo's runner exits and the next tick retries. Flag the
     // denial so the UI can say "waiting for capacity" instead of "starting…".
     if let budget, !budget.tryAcquire(os) {
+      ControlPlaneLog.log(
+        "provision.budget_denied",
+        ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+         "inUse": String(budget.inUse(os))])
       if !demand.waitingForCapacity {
         demand.waitingForCapacity = true
         notify()
@@ -783,10 +791,17 @@ public final class RunnerOrchestrator {
       slot.holdsBudget = holdingBudget
       holdingBudget = false
       slots.append(slot)
+      ControlPlaneLog.log(
+        "provision.launched",
+        ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue, "runner": jit.runnerName])
       notify()
       return true
     } catch {
       lastError = String(describing: error)
+      ControlPlaneLog.log(
+        "provision.error",
+        ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+         "error": String(String(describing: error).prefix(200))])
       notify()
       return false
     }

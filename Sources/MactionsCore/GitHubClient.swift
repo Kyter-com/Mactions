@@ -148,10 +148,25 @@ public struct GitHubClient: RunnerControlPlane {
   public let repo: String
   public let token: String
   public var apiBase = URL(string: "https://api.github.com")!
-  public var session: URLSession = .shared
+  public var session: URLSession = GitHubClient.boundedSession
   /// Shared across copies of this struct (it's a reference): the queued-jobs
   /// poll reuses one store per client so idle 304s stay free all session.
   let etags = ETagStore()
+
+  /// Default session for all GitHub API traffic. CRUCIAL: it caps
+  /// `timeoutIntervalForResource` — `URLSession.shared`'s default is 7 DAYS, so
+  /// a single wedged connection could hang a request, and thus the SINGLE SERIAL
+  /// discovery loop that awaits it, for hours (root of the 2026-06-21 all-OS
+  /// provisioning stall). A per-request `URLRequest.timeoutInterval` only bounds
+  /// IDLE time between packets, not total resource time, so it can't prevent
+  /// that on its own. Reused (sessions are meant to be long-lived); the
+  /// injectable `session` lets tests substitute a fake.
+  public static let boundedSession: URLSession = {
+    let cfg = URLSessionConfiguration.default
+    cfg.timeoutIntervalForRequest = 30
+    cfg.timeoutIntervalForResource = 60
+    return URLSession(configuration: cfg)
+  }()
 
   public init(owner: String, repo: String, token: String) {
     self.owner = owner

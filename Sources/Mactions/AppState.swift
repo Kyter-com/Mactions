@@ -1034,7 +1034,30 @@ final class AppState: ObservableObject {
     let planSnapshot = plan
     discoveryTask = Task { [weak self] in
       while !Task.isCancelled {
-        await self?.discoveryScan(token: token, plan: planSnapshot, epoch: myEpoch)
+        // Bound each scan with a watchdog. A scan makes serial network calls
+        // (admin-repo list + per-repo queue polls); if one ever hangs past its
+        // session timeout, awaiting it directly would freeze this SINGLE loop —
+        // and thus ALL-OS provisioning — indefinitely (the 2026-06-21 stall).
+        // Bounded GitHub timeouts (GitHubClient.boundedSession) make a real hang
+        // unlikely; this makes it impossible to wedge the loop. A task GROUP
+        // (not detached tasks) keeps the scan a CHILD of this loop, so go-offline
+        // cancellation still propagates into it promptly; the loser of the race
+        // (the hung scan, or the idle timer) is cancelled either way.
+        await withTaskGroup(of: Bool.self) { group in
+          group.addTask {
+            await self?.discoveryScan(token: token, plan: planSnapshot, epoch: myEpoch)
+            return true  // scan finished on its own
+          }
+          group.addTask {
+            try? await Task.sleep(nanoseconds: 180_000_000_000)  // 3 min: ample for ≤50 repos
+            return false  // watchdog fired first
+          }
+          let scanFinished = await group.next() ?? true
+          if !scanFinished {
+            ControlPlaneLog.log("discovery.scan.watchdog_timeout", ["budgetSec": "180"])
+          }
+          group.cancelAll()
+        }
         try? await Task.sleep(nanoseconds: 60_000_000_000)
       }
     }
@@ -1112,6 +1135,7 @@ final class AppState: ObservableObject {
         fleetOS[key] = os
         fleetRepo[key] = repo.fullName
         discoveredKeys.insert(key)
+        ControlPlaneLog.log("discovery.provision", ["key": key, "os": os.rawValue])
         await orch.start()
         // goOffline can land DURING start() — its teardown snapshot won't
         // include an orchestrator added after it ran, so roll this one back
@@ -1161,6 +1185,7 @@ final class AppState: ObservableObject {
       case .countQuiet(let quietScans):
         discoveryQuietScans[key] = quietScans
       case .reap:
+        ControlPlaneLog.log("discovery.reap", ["key": key])
         await orch.stop()
         orchestrators[key] = nil
         fleetOS[key] = nil
@@ -1170,6 +1195,14 @@ final class AppState: ObservableObject {
         sync()
       }
     }
+    ControlPlaneLog.log(
+      "discovery.scan.end",
+      [
+        "candidates": String(candidates.count),
+        "matched": String(matchedKeys.count),
+        "pollFailed": String(unknownRepos.count),
+        "orchestrators": String(orchestrators.count),
+      ])
   }
 
   // MARK: Windows runner (opt-in)
