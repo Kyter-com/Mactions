@@ -95,6 +95,26 @@ final class LinuxContainerProviderTests: XCTestCase {
     XCTAssertNil(cli)
   }
 
+  func testReadinessDistinguishesDaemonFromMissingImage() throws {
+    let ready = ContainerCLI(executable: try fakeContainer(daemonOK: true, imageOK: true))
+    XCTAssertEqual(
+      LinuxContainerProviderFactory.readiness(image: "img", cli: ready),
+      .ready)
+    XCTAssertTrue(LinuxContainerProviderFactory.ready(image: "img", cli: ready))
+
+    let daemonDown = ContainerCLI(executable: try fakeContainer(daemonOK: false, imageOK: true))
+    XCTAssertEqual(
+      LinuxContainerProviderFactory.readiness(image: "img", cli: daemonDown),
+      .daemonUnavailable)
+    XCTAssertFalse(LinuxContainerProviderFactory.ready(image: "img", cli: daemonDown))
+
+    let imageMissing = ContainerCLI(executable: try fakeContainer(daemonOK: true, imageOK: false))
+    XCTAssertEqual(
+      LinuxContainerProviderFactory.readiness(image: "img", cli: imageMissing),
+      .imageMissing)
+    XCTAssertFalse(LinuxContainerProviderFactory.ready(image: "img", cli: imageMissing))
+  }
+
   // MARK: Teardown guard
 
   func testStopIsIdempotentAndDoesNotCrashWithNoProcess() {
@@ -108,5 +128,25 @@ final class LinuxContainerProviderTests: XCTestCase {
     XCTAssertFalse(p.isRunning)
     p.stop()  // must not crash / re-run teardown effects
     XCTAssertFalse(p.isRunning)
+  }
+
+  private func fakeContainer(daemonOK: Bool, imageOK: Bool) throws -> String {
+    let dir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("mactions-linux-test-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let script = dir.appendingPathComponent("container", isDirectory: false)
+    let contents = """
+      #!/bin/sh
+      if [ "$1 $2" = "system status" ]; then
+        exit \(daemonOK ? 0 : 1)
+      fi
+      if [ "$1 $2 $3" = "image inspect img" ]; then
+        exit \(imageOK ? 0 : 1)
+      fi
+      exit 1
+      """
+    try contents.write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+    return script.path
   }
 }

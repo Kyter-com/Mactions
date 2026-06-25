@@ -68,6 +68,20 @@ public protocol LinuxContainerCLI: Sendable {
   func parseIsRunning(from output: String) -> Bool
 }
 
+/// Result of the Linux substrate readiness probe. `ready` used to return only a
+/// boolean, which made the app say "set up Linux" without explaining whether the
+/// daemon was down or the local image had been pruned.
+public enum LinuxContainerReadiness: Equatable, Sendable {
+  case ready
+  case daemonUnavailable
+  case imageMissing
+
+  public var isReady: Bool {
+    if case .ready = self { return true }
+    return false
+  }
+}
+
 extension LinuxContainerCLI {
   /// The env-var the actions/runner consumes as `--jitconfig`. Shared by every
   /// backend (it's a property of the agent, not the container engine).
@@ -280,12 +294,18 @@ public struct LinuxContainerProviderFactory: RunnerProviderFactory {
   /// the container daemon is up AND the runner image is present locally. A probe
   /// error returns `false`, never throws.
   public static func ready(image: String, cli: LinuxContainerCLI) -> Bool {
+    readiness(image: image, cli: cli).isReady
+  }
+
+  /// Same probe as `ready`, but keeps the user-facing reason so the UI can tell
+  /// "start Apple container" apart from "re-pull the runner image".
+  public static func readiness(image: String, cli: LinuxContainerCLI) -> LinuxContainerReadiness {
     guard let info = try? Shell.run(cli.executable, cli.daemonStatusArgs()), info.ok else {
-      return false
+      return .daemonUnavailable
     }
     guard let img = try? Shell.run(cli.executable, cli.imageInspectArgs(image: image)), img.ok else {
-      return false
+      return .imageMissing
     }
-    return true
+    return .ready
   }
 }

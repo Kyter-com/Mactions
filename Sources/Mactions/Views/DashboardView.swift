@@ -59,8 +59,12 @@ struct DashboardView: View {
         restartBar
         Divider()
       }
+      if let setup = app.setupNotice {
+        actionNoticeBar(setup)
+        Divider()
+      }
       if let rebuild = app.rebuildNotice {
-        rebuildBar(rebuild)
+        actionNoticeBar(rebuild)
         Divider()
       }
       NavigationSplitView {
@@ -86,6 +90,7 @@ struct DashboardView: View {
     .frame(minWidth: 900, minHeight: 560)
     .onAppear {
       app.refreshWindowsPerVMGB()
+      app.refreshLinuxAvailability()
       // Recompute the rebuild nudge so the dashboard banner reflects a stale base
       // immediately — previously this only ran on the Settings pane's onAppear, so
       // the banner didn't appear until the user opened Settings. Cheap: the recipe
@@ -240,18 +245,17 @@ struct DashboardView: View {
     }
   }
 
-  /// Shown when a runner base image is stale — the prominent dashboard analog of
-  /// the in-pane Settings rebuild banner, styled like `restartBar`. Non-blocking:
-  /// the fleet still runs on the existing base, so this just surfaces the update
-  /// + a one-click jump to the Settings pane that rebuilds it (the rebuild itself
-  /// needs the confirm dialog + offline gate that live there).
-  private func rebuildBar(_ rebuild: AppState.RebuildNotice) -> some View {
+  /// Shown when a runner substrate needs attention — e.g. a stale Windows base
+  /// image or Linux runtime/image repair. Non-blocking: the fleet can still run
+  /// the platforms that are currently armed, and the button deep-links to the
+  /// Settings pane that owns the fix.
+  private func actionNoticeBar(_ notice: AppState.ActionNotice) -> some View {
     HStack(spacing: MactionsTheme.Spacing.tight) {
-      Image(systemName: rebuild.icon).foregroundStyle(.orange)
-      Text(rebuild.text)
+      Image(systemName: notice.icon).foregroundStyle(.orange)
+      Text(notice.text)
         .font(.callout).foregroundStyle(.orange)
       Spacer(minLength: MactionsTheme.Spacing.control)
-      Button("Rebuild…") { app.presentSettings(rebuild.tab) }
+      Button(notice.actionTitle) { app.presentSettings(notice.tab) }
         .controlSize(.small)
     }
     .padding(.horizontal, MactionsTheme.Spacing.section)
@@ -719,7 +723,6 @@ private struct RunnersPane: View {
 private struct RunnerActivityDot: View {
   let phase: ManagedRunner.Phase
   let busy: Bool
-  @State private var spin = false
 
   private var color: Color {
     switch phase {
@@ -739,13 +742,22 @@ private struct RunnerActivityDot: View {
   var body: some View {
     ZStack {
       if busy {
-        Circle()
-          .trim(from: 0, to: 0.7)
-          .stroke(color, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+        // Indeterminate circular ProgressView — NOT a hand-rolled
+        // `.rotationEffect` + `.animation(.repeatForever)`. A repeatForever
+        // animation lives inside SwiftUI's view graph and re-evaluates the
+        // animated attribute every display frame, which forces the whole
+        // window's single NSHostingView to re-layout/re-render ~60×/s for as
+        // long as ANY runner is busy. With all-repos discovery (many rows) on a
+        // host already pinned by the VM/container fleet, that per-frame whole-
+        // tree relayout starves the main thread and the window paints a blank
+        // partial frame. NSProgressIndicator (what ProgressView wraps) spins on
+        // the render server via CoreAnimation, so the busy ring animates for
+        // free — no SwiftUI per-frame work, regardless of how many are running.
+        ProgressView()
+          .progressViewStyle(.circular)
+          .controlSize(.mini)
+          .tint(color)
           .frame(width: 13, height: 13)
-          .rotationEffect(.degrees(spin ? 360 : 0))
-          .animation(.linear(duration: 1).repeatForever(autoreverses: false), value: spin)
-          .onAppear { spin = true }
       }
       Circle().fill(color).frame(width: 7, height: 7)
     }

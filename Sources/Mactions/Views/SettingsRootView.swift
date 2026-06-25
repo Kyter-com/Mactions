@@ -387,6 +387,7 @@ private struct LinuxSettingsTab: View {
       }
     }
     .formStyle(.grouped)
+    .onAppear { app.refreshLinuxAvailability() }
   }
 
   private var notReadySection: some View {
@@ -394,13 +395,16 @@ private struct LinuxSettingsTab: View {
       if let failure = app.linuxSetupFailure {
         failureBanner(failure, external: app.linuxSetupFailureIsExternal)
       }
+      if let notice = app.linuxAvailabilityNotice {
+        Banner(notice, severity: .warning, icon: app.linuxAvailabilityIcon)
+      }
       if let backend = app.linuxBackendName {
         Text("Pull the runner image (~seconds). Each Linux job then runs in a throwaway arm64 container. Runtime: \(backend).")
           .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         Button {
           app.setUpLinuxRunner()
         } label: {
-          Label("Pull runner image", systemImage: "arrow.down.circle")
+          Label(app.linuxSetupButtonTitle, systemImage: "arrow.down.circle")
         }
         .disabled(app.state != .offline)
       } else {
@@ -417,6 +421,10 @@ private struct LinuxSettingsTab: View {
       if let failure = app.linuxSetupFailure {
         failureBanner(failure, external: app.linuxSetupFailureIsExternal)
       }
+      if let notice = app.linuxAvailabilityNotice {
+        Banner(notice, severity: .warning, icon: app.linuxAvailabilityIcon)
+      }
+      InfoRow("Status", value: app.linuxAvailabilityLabel, systemImage: "checkmark.seal")
       InfoRow("Image", value: app.linuxRunnerImage, systemImage: "shippingbox")
       InfoRow("Architecture", value: "arm64")
       if let backend = app.linuxBackendName {
@@ -426,15 +434,16 @@ private struct LinuxSettingsTab: View {
         logLink("Pull log", path: log)
       }
       Button {
-        app.setUpLinuxRunner(force: true)
+        app.setUpLinuxRunner(force: !app.linuxAvailability.needsAction)
       } label: {
-        Label("Re-pull / update image", systemImage: "arrow.clockwise")
+        Label(app.linuxSetupButtonTitle, systemImage: "arrow.clockwise")
       }
       .disabled(app.state != .offline || !app.linuxBackendAvailable)
       if !app.linuxBackendAvailable {
         Text("Install Apple `container` to re-pull.").font(.caption).foregroundStyle(.tertiary)
       } else if app.state != .offline {
-        Text("Go offline to re-pull.").font(.caption).foregroundStyle(.tertiary)
+        Text(app.linuxAvailability.needsAction ? "Go offline to repair." : "Go offline to re-pull.")
+          .font(.caption).foregroundStyle(.tertiary)
       }
     } header: {
       Text("Linux runner image")

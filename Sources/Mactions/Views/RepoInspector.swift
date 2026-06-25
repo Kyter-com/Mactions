@@ -199,7 +199,7 @@ struct RepoInspector: View {
       if !ready { return "Windows needs a one-time base image — opens Settings → Windows to build it." }
       return enabled ? "Windows enabled — tap to disable." : "Enable a throwaway Win11-ARM VM per job."
     case .linux:
-      if !ready { return "Linux needs the runner image — opens Settings → Linux to pull it." }
+      if !ready { return app.linuxAvailabilityNotice ?? "Linux needs setup — opens Settings → Linux." }
       return enabled ? "Linux enabled — tap to disable." : "Enable a throwaway arm64 container per job."
     }
   }
@@ -218,9 +218,14 @@ struct RepoInspector: View {
       }
 
       if !ready {
+        let setupMessage =
+          os == .linux
+          ? (app.linuxAvailabilityNotice
+            ?? "Linux isn't ready on this Mac — open Settings → Linux to repair setup.")
+          : "\(os.displayName) isn't set up on this Mac — open Settings → \(os.displayName) to "
+            + "\(os == .windows ? "build the base image" : "pull the runner image")."
         Banner(
-          "\(os.displayName) isn't set up on this Mac — open Settings → \(os.displayName) to "
-            + "\(os == .windows ? "build the base image" : "pull the runner image").",
+          setupMessage,
           severity: .warning, icon: "wrench.and.screwdriver")
       }
 
@@ -251,7 +256,7 @@ struct RepoInspector: View {
     switch os {
     case .macOS: return true
     case .windows: return app.windowsImageReady
-    case .linux: return app.linuxImageReady
+    case .linux: return app.linuxRunnerUsable
     }
   }
 
@@ -399,7 +404,8 @@ struct AllRepositoriesInspector: View {
       }
     case .linux:
       Banner(
-        "Linux defaults are enabled, but the Linux runner image is not ready.",
+        app.linuxAvailabilityNotice
+          ?? "Linux defaults are enabled, but Linux setup is not ready.",
         severity: .warning, icon: "wrench.and.screwdriver"
       ) {
         Button("Open Linux Settings") { app.presentSettings(.linux) }
@@ -412,7 +418,7 @@ struct AllRepositoriesInspector: View {
     switch os {
     case .macOS: return true
     case .windows: return app.windowsImageReady
-    case .linux: return app.linuxImageReady && app.linuxBackendAvailable
+    case .linux: return app.linuxRunnerUsable
     }
   }
 

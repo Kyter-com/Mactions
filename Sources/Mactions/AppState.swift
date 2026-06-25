@@ -4,7 +4,10 @@ import MactionsCore
 import SwiftUI
 
 /// One row in the live runner list: which OS + repo a runner belongs to + state.
-struct FleetRunnerRow: Identifiable {
+/// `Equatable` so `sync()` can skip republishing an unchanged fleet — every
+/// assignment to a `@Published` fires `objectWillChange`, which invalidates the
+/// whole dashboard (one NSHostingView), so a no-op write costs a full relayout.
+struct FleetRunnerRow: Identifiable, Equatable {
   let os: RunnerOS
   let repoFullName: String
   let runner: ManagedRunner
@@ -126,6 +129,27 @@ final class AppState: ObservableObject {
   @Published var linuxSetupFailureIsExternal = false
   /// Durable transcript of the last image pull (drives a "View pull log" button).
   @Published var linuxBuildLogPath: String?
+  /// Live diagnosis of the Linux substrate. This is deliberately separate from
+  /// the persisted `linuxImageReady` flag because that flag can go stale when the
+  /// Apple container daemon is stopped or the local image is pruned outside the
+  /// app.
+  @Published var linuxAvailability: LinuxAvailability = .unknown
+
+  enum LinuxAvailability: Equatable {
+    case unknown
+    case ready
+    case notSetUp
+    case runtimeMissing
+    case daemonUnavailable
+    case imageMissing
+
+    var needsAction: Bool {
+      switch self {
+      case .notSetUp, .runtimeMissing, .daemonUnavailable, .imageMissing: return true
+      case .unknown, .ready: return false
+      }
+    }
+  }
 
   // Repo discovery (for the searchable picker).
   @Published var availableRepos: [RepoRef] = []
@@ -293,6 +317,7 @@ final class AppState: ObservableObject {
     windowsKeepFailedDisk = defaults.bool(forKey: "windowsKeepFailedDisk")
     linuxImageReady = defaults.bool(forKey: "linuxImageReady")
     linuxRunnerImage = defaults.string(forKey: "linuxRunnerImage") ?? linuxRunnerImage
+    linuxAvailability = linuxImageReady ? .unknown : .notSetUp
     linuxBuildLogPath = Self.latestLinuxPullLogPath()
     // Re-point "View build log" at the newest transcript on disk (cheap dir
     // listing) and recompose the base summary — both survive restarts.
@@ -375,13 +400,15 @@ final class AppState: ObservableObject {
   /// noticeable on the dashboard instead of buried in the Settings pane. The
   /// fleet keeps running on the existing base (non-blocking), so this is a nudge,
   /// not a gate; the action deep-links to the pane that rebuilds it.
-  struct RebuildNotice: Equatable {
+  struct ActionNotice: Equatable {
     let text: String
     /// SF Symbol (data, not a view) matching the reason — keeps the dashboard
     /// bar and the Settings banner visually consistent.
     let icon: String
     /// Where "Rebuild…" jumps so the user lands on the actual rebuild controls.
     let tab: SettingsTab
+    /// Button text for the dashboard bar.
+    let actionTitle: String
   }
 
   /// The active rebuild nudge, or `nil` when every runner base is current.
@@ -393,7 +420,7 @@ final class AppState: ObservableObject {
   /// the official runner image (no recipe to drift) — neither surfaces a rebuild
   /// nudge. New rebuildable bases plug their own branch in here and the dashboard
   /// banner renders them with no further wiring.
-  var rebuildNotice: RebuildNotice? {
+  var rebuildNotice: ActionNotice? {
     if windowsMaintenance.needsRebuild, let notice = windowsUpdateNotice {
       let icon: String
       switch windowsMaintenance {
@@ -402,9 +429,22 @@ final class AppState: ObservableObject {
       case .both: icon = "exclamationmark.triangle"
       case .upToDate, .notBuilt: icon = "arrow.clockwise.circle"
       }
-      return RebuildNotice(text: notice, icon: icon, tab: .windows)
+      return ActionNotice(text: notice, icon: icon, tab: .windows, actionTitle: "Rebuild…")
     }
     return nil
+  }
+
+  /// A Linux setup/repair nudge for the dashboard. Unlike Windows rebuilds, this
+  /// is not a version-update lifecycle; it is a live availability problem (no
+  /// runtime, daemon down, image missing). Only show it when Linux is actually in
+  /// the requested plan/defaults.
+  var setupNotice: ActionNotice? {
+    guard linuxRequestedByPlan, linuxAvailability.needsAction,
+      let notice = linuxAvailabilityNotice
+    else { return nil }
+    return ActionNotice(
+      text: notice, icon: linuxAvailabilityIcon, tab: .linux,
+      actionTitle: "Open Linux Settings")
   }
 
   func isSelected(_ repo: RepoRef) -> Bool { plan.repos.contains { $0.repo == repo } }
@@ -762,11 +802,22 @@ final class AppState: ObservableObject {
         let linuxCLI =
           (wantsLinux && linuxImageReady)
           ? LinuxContainerProviderFactory.detectInstalledCLI() : nil
+        var linuxReadiness: LinuxContainerReadiness?
         var linuxReady = false
         if let lxCLI = linuxCLI {
-          linuxReady = await Task.detached { [lxCLI, linuxImg] in
-            LinuxContainerProviderFactory.ready(image: linuxImg, cli: lxCLI)
+          linuxReadiness = await Task.detached { [lxCLI, linuxImg] in
+            LinuxContainerProviderFactory.readiness(image: linuxImg, cli: lxCLI)
           }.value
+          linuxReady = linuxReadiness?.isReady ?? false
+        }
+        if wantsLinux {
+          if let linuxReadiness {
+            applyLinuxAvailability(linuxAvailability(from: linuxReadiness))
+          } else if !linuxImageReady {
+            applyLinuxAvailability(.notSetUp)
+          } else if linuxCLI == nil {
+            applyLinuxAvailability(.runtimeMissing)
+          }
         }
         guard fleetEpoch == myEpoch else { return }  // went offline during the probe
         let linuxFactory: LinuxContainerProviderFactory? =
@@ -920,7 +971,7 @@ final class AppState: ObservableObject {
             case .linux:
               why =
                 linuxFactory == nil
-                ? "set up Apple container (Settings → Linux)"
+                ? linuxSkipStatusReason
                 : "this Mac can't safely run a Linux container"
             }
             statusMessage =
@@ -943,15 +994,7 @@ final class AppState: ObservableObject {
         }
         // A Linux combo was enabled but the runtime/image isn't ready → say which.
         if !linuxCombos.isEmpty, linuxFactory == nil {
-          let detail: String
-          if !linuxImageReady {
-            detail = "pull the runner image (Settings → Linux)"
-          } else if linuxCLI == nil {
-            detail = "install Apple container (Settings → Linux)"
-          } else {
-            detail = "start Apple container or re-pull (Settings → Linux)"
-          }
-          statusMessage = (statusMessage ?? "") + " Linux skipped — \(detail)."
+          statusMessage = (statusMessage ?? "") + " Linux skipped — \(linuxSkipStatusReason)."
         }
         startDiscoveryIfNeeded(token: token, epoch: myEpoch)
       } catch {
@@ -1672,6 +1715,124 @@ final class AppState: ObservableObject {
   /// `nil` if none is installed.
   var linuxBackendName: String? { LinuxContainerProviderFactory.detectInstalledCLI()?.displayName }
 
+  /// Linux can be selected/armed when the persisted image gate is true and the
+  /// latest live probe has not found a concrete blocker. `.unknown` is allowed
+  /// so a fresh launch does not falsely dim a valid setup before the first probe
+  /// finishes; go-online and Settings both refresh it.
+  var linuxRunnerUsable: Bool {
+    linuxImageReady && linuxBackendAvailable
+      && (linuxAvailability == .unknown || linuxAvailability == .ready)
+  }
+
+  private var linuxRequestedByPlan: Bool {
+    plan.enabledCombos().contains { $0.os == .linux }
+      || (plan.isAllRepos && plan.defaultPlatforms.contains(RunnerOS.linux.rawValue))
+  }
+
+  var linuxAvailabilityIcon: String {
+    switch linuxAvailability {
+    case .runtimeMissing: return "shippingbox"
+    case .daemonUnavailable: return "powerplug"
+    case .imageMissing, .notSetUp: return "arrow.down.circle"
+    case .unknown, .ready: return "checkmark.circle"
+    }
+  }
+
+  var linuxAvailabilityLabel: String {
+    switch linuxAvailability {
+    case .unknown: return linuxImageReady ? "Not checked yet" : "Not set up"
+    case .ready: return "Ready"
+    case .notSetUp: return "Image not pulled"
+    case .runtimeMissing: return "Apple container missing"
+    case .daemonUnavailable: return "Daemon not running"
+    case .imageMissing: return "Image missing locally"
+    }
+  }
+
+  var linuxSetupButtonTitle: String {
+    switch linuxAvailability {
+    case .daemonUnavailable: return "Start / repair Linux setup"
+    case .imageMissing, .notSetUp, .runtimeMissing, .unknown, .ready:
+      return linuxImageReady ? "Re-pull / update image" : "Pull runner image"
+    }
+  }
+
+  var linuxAvailabilityNotice: String? {
+    switch linuxAvailability {
+    case .unknown, .ready:
+      return nil
+    case .notSetUp:
+      return "Linux is enabled but the runner image has not been pulled on this Mac. Pull \(linuxRunnerImage) to run Linux jobs."
+    case .runtimeMissing:
+      return "Linux is enabled but Apple container is not installed or is unsupported on this macOS. Install Apple container (macOS 26+), then pull the runner image."
+    case .daemonUnavailable:
+      return "Linux is enabled but Apple container is installed and its daemon is not running. Open Linux setup to start it; if the image is still present, Mactions will skip the re-pull."
+    case .imageMissing:
+      return "Linux was set up before, but \(linuxRunnerImage) is no longer present locally. Re-pull the runner image to restore Linux jobs."
+    }
+  }
+
+  var linuxSkipStatusReason: String {
+    switch linuxAvailability {
+    case .notSetUp:
+      return "pull the runner image (Settings -> Linux)"
+    case .runtimeMissing:
+      return "install Apple container (Settings -> Linux)"
+    case .daemonUnavailable:
+      return "start Apple container (Settings -> Linux)"
+    case .imageMissing:
+      return "re-pull the runner image (Settings -> Linux)"
+    case .unknown:
+      return linuxImageReady
+        ? "start Apple container or re-pull (Settings -> Linux)"
+        : "pull the runner image (Settings -> Linux)"
+    case .ready:
+      return "check Linux setup (Settings -> Linux)"
+    }
+  }
+
+  private func linuxAvailability(from readiness: LinuxContainerReadiness) -> LinuxAvailability {
+    switch readiness {
+    case .ready: return .ready
+    case .daemonUnavailable: return .daemonUnavailable
+    case .imageMissing: return .imageMissing
+    }
+  }
+
+  private func applyLinuxAvailability(_ availability: LinuxAvailability) {
+    linuxAvailability = availability
+    if availability == .ready, !linuxImageReady {
+      linuxImageReady = true
+      saveConfig()
+    } else if availability == .imageMissing, linuxImageReady {
+      linuxImageReady = false
+      saveConfig()
+    }
+  }
+
+  /// Re-check Linux readiness for Settings/dashboard display. This is a live
+  /// shell probe, so it runs off the main actor and writes only the summarized
+  /// reason back to SwiftUI.
+  func refreshLinuxAvailability() {
+    guard linuxImageReady else {
+      if linuxAvailability != .imageMissing {
+        linuxAvailability = .notSetUp
+      }
+      return
+    }
+    guard let cli = LinuxContainerProviderFactory.detectInstalledCLI() else {
+      linuxAvailability = .runtimeMissing
+      return
+    }
+    let image = linuxRunnerImage
+    Task {
+      let readiness = await Task.detached { [cli, image] in
+        LinuxContainerProviderFactory.readiness(image: image, cli: cli)
+      }.value
+      applyLinuxAvailability(linuxAvailability(from: readiness))
+    }
+  }
+
   /// Set up the Linux runner: confirm Apple container is up (starting it
   /// idempotently if needed), then pull the official runner image. FAST — the
   /// pull is seconds, not the Windows base build's 30–40 min, so the stepper is
@@ -1682,6 +1843,7 @@ final class AppState: ObservableObject {
     guard state == .offline else { statusMessage = "Go offline first."; return }
     guard !linuxSetupBusy else { return }
     guard let cli = LinuxContainerProviderFactory.detectInstalledCLI() else {
+      applyLinuxAvailability(.runtimeMissing)
       statusMessage =
         "Apple container not found. Install it from github.com/apple/container/releases (macOS 26+), then tap Linux again."
       return
@@ -1691,7 +1853,7 @@ final class AppState: ObservableObject {
     // directly, so a stray re-tap doesn't re-pull. A forced "update image"
     // deliberately re-pulls.
     if !force, LinuxContainerProviderFactory.ready(image: image, cli: cli) {
-      linuxImageReady = true
+      applyLinuxAvailability(.ready)
       saveConfig()
       linuxSetupFailure = nil
       statusMessage = "Linux runner image '\(image)' is ready (\(cli.displayName))."
@@ -1720,6 +1882,7 @@ final class AppState: ObservableObject {
       }
       guard daemonUp else {
         linuxSetupFailureIsExternal = false
+        applyLinuxAvailability(.daemonUnavailable)
         linuxSetupFailure =
           "\(cli.displayName) isn't running and couldn't be started. Start it manually, then retry."
         statusMessage = "Linux setup failed: Apple container not running."
@@ -1734,6 +1897,25 @@ final class AppState: ObservableObject {
       if cli.daemonPrepareNeeded() {
         linuxSetupDetail = "Installing the Apple container kernel (one-time)…"
         _ = await Task.detached { try? Shell.run(cli.executable, cli.daemonPrepareArgs()) }.value
+      }
+
+      // If this repair was only needed because the daemon was down, don't make
+      // the user pay a registry pull: once the daemon is up, a present image is
+      // enough to restore Linux readiness.
+      if !force {
+        let imagePresent = await Task.detached { [cli, image] in
+          (try? Shell.run(cli.executable, cli.imageInspectArgs(image: image)))?.ok ?? false
+        }.value
+        if imagePresent {
+          LinuxRunnerImage.recordImageRef(image)
+          applyLinuxAvailability(.ready)
+          linuxImageReady = true
+          saveConfig()
+          linuxSetupFailure = nil
+          statusMessage = "Linux runner image '\(image)' is ready (\(cli.displayName))."
+          endLinuxSetup()
+          return
+        }
       }
 
       // 2) Pull the runner image, streaming progress into the live stepper.
@@ -1760,6 +1942,7 @@ final class AppState: ObservableObject {
       }.value
       if let result, result.ok, isReady {
         LinuxRunnerImage.recordImageRef(image)
+        applyLinuxAvailability(.ready)
         linuxImageReady = true
         saveConfig()
         linuxSetupFailure = nil
@@ -1767,6 +1950,7 @@ final class AppState: ObservableObject {
       } else {
         linuxImageReady = false  // never persist a stale-true
         saveConfig()
+        applyLinuxAvailability(.notSetUp)
         // Classify: a registry/network blip isn't the user's setup and is safe to
         // retry; a local cause (daemon/runtime) is theirs to fix.
         let transient = LinuxSetupProgress.isLikelyTransientFailure(result?.stderr ?? "")
@@ -1919,7 +2103,7 @@ final class AppState: ObservableObject {
       windowsMaxConcurrentVMs: windowsImageReady
         ? WindowsVMBudget.maxConcurrentVMs(physicalMemoryBytes: ram, perVMGB: perVM)
         : 0,
-      linuxMaxConcurrentContainers: linuxImageReady
+      linuxMaxConcurrentContainers: linuxRunnerUsable
         ? LinuxContainerBudget.effectiveMaxConcurrentContainers(
           physicalMemoryBytes: ram,
           activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount)
@@ -2127,7 +2311,10 @@ final class AppState: ObservableObject {
         for runner in remote where runner.busy { busy.insert(runner.name) }
       }
     }
-    busyRunnerNames = busy
+    // Skip the publish when the busy set is unchanged (the common case on a
+    // steady fleet) — an unconditional write here fired objectWillChange every
+    // 6s and relayout the whole window even when nothing moved.
+    if busy != busyRunnerNames { busyRunnerNames = busy }
   }
 
   /// `busy` is GitHub's runner-API verdict for this runner (from `busyRunnerNames`):
@@ -2180,7 +2367,12 @@ final class AppState: ObservableObject {
         launchFailures[repoName] = error
       }
     }
-    runners = rows.sorted { $0.id < $1.id }
+    // Diff before publishing: orchestrators call `notify()` on nearly every
+    // state transition, but the row set is usually unchanged between them — an
+    // unconditional assignment would fire objectWillChange and relayout the
+    // whole window each time (the other published values below are diffed too).
+    let sorted = rows.sorted { $0.id < $1.id }
+    if sorted != runners { runners = sorted }
     if demand != repoQueuedJobs { repoQueuedJobs = demand }
     let watched = Set(fleetRepo.values)
     if watched != watchedRepos { watchedRepos = watched }
