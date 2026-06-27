@@ -2,7 +2,8 @@ name: Windows smoke (Mactions runner)
 
 # Manual-only: a tiny job that runs on a Windows-ARM runner provided by Mactions
 # itself (runs-on matches the app's Windows fleet labels). Proves the ephemeral
-# Windows loop end to end. Dispatch with:
+# Windows loop end to end and intentionally pauses for a minute so the running
+# job is easy to screenshot in the dashboard. Dispatch with:
 #   gh workflow run "Windows smoke (Mactions runner)"
 on:
   # workflow_dispatch ONLY — never add pull_request / pull_request_target / push.
@@ -16,7 +17,7 @@ on:
 permissions: {}
 
 jobs:
-  win-smoke:
+  windows-smoke:
     runs-on: [self-hosted, Windows, mactions]
     timeout-minutes: 20
     steps:
@@ -26,5 +27,13 @@ jobs:
           [System.Environment]::OSVersion.VersionString
       - name: Runner context
         run: echo "RUNNER_OS=$env:RUNNER_OS RUNNER_ARCH=$env:RUNNER_ARCH RUNNER_NAME=$env:RUNNER_NAME"
-      - name: Git available (actions/checkout dependency)
-        run: git --version
+      - name: Toolchain snapshot
+        run: |
+          if (Get-Command git -ErrorAction SilentlyContinue) { git --version } else { Write-Host "git not found" }
+          if (Get-Command pwsh -ErrorAction SilentlyContinue) { pwsh --version } else { Write-Host "pwsh not found" }
+      - name: Hold for dashboard screenshot
+        run: |
+          Write-Host "Holding this Windows runner for 60 seconds so the dashboard can show it running."
+          Start-Sleep -Seconds 60
+      - name: Finish
+        run: Write-Host "Windows smoke complete"

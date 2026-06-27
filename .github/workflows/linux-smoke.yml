@@ -1,0 +1,40 @@
+name: Linux smoke (Mactions runner)
+
+# Manual-only: a tiny job that runs on a Linux ARM64 container runner provided
+# by Mactions itself (runs-on matches the app's Linux fleet labels). Proves the
+# ephemeral Linux loop end to end and intentionally pauses for a minute so the
+# running job is easy to screenshot in the dashboard. Dispatch with:
+#   gh workflow run "Linux smoke (Mactions runner)"
+on:
+  # workflow_dispatch ONLY — never add pull_request / pull_request_target / push.
+  # This job runs on a SELF-HOSTED Linux container; a fork-PR trigger would let
+  # untrusted code execute on maintainer-controlled hardware. Dispatch requires
+  # repo write access.
+  workflow_dispatch:
+
+# Least privilege: this job only inspects the runner, so the GITHUB_TOKEN needs
+# no scopes.
+permissions: {}
+
+jobs:
+  linux-smoke:
+    runs-on: [self-hosted, Linux, ARM64, mactions]
+    timeout-minutes: 10
+    steps:
+      - name: Identity + OS
+        run: |
+          echo "host=$(hostname) user=$(whoami) arch=$(uname -m)"
+          . /etc/os-release
+          echo "$PRETTY_NAME"
+      - name: Runner context
+        run: echo "RUNNER_OS=$RUNNER_OS RUNNER_ARCH=$RUNNER_ARCH RUNNER_NAME=$RUNNER_NAME"
+      - name: Toolchain snapshot
+        run: |
+          if command -v git >/dev/null 2>&1; then git --version; else echo "git not found"; fi
+          bash --version | head -n 1
+      - name: Hold for dashboard screenshot
+        run: |
+          echo "Holding this Linux runner for 60 seconds so the dashboard can show it running."
+          sleep 60
+      - name: Finish
+        run: echo "Linux smoke complete"

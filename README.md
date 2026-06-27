@@ -14,8 +14,9 @@
 
 <p align="center">
   <a href="https://github.com/Kyter-com/Mactions/actions/workflows/release.yml"><img alt="Self-hosted macOS release" src="https://github.com/Kyter-com/Mactions/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/Kyter-com/Mactions/actions/workflows/selfhosted-smoke.yml"><img alt="Self-hosted smoke" src="https://github.com/Kyter-com/Mactions/actions/workflows/selfhosted-smoke.yml/badge.svg"></a>
-  <a href="https://github.com/Kyter-com/Mactions/actions/workflows/win-smoke.yml"><img alt="Windows smoke" src="https://github.com/Kyter-com/Mactions/actions/workflows/win-smoke.yml/badge.svg"></a>
+  <a href="https://github.com/Kyter-com/Mactions/actions/workflows/macos-smoke.yml"><img alt="macOS smoke" src="https://github.com/Kyter-com/Mactions/actions/workflows/macos-smoke.yml/badge.svg"></a>
+  <a href="https://github.com/Kyter-com/Mactions/actions/workflows/linux-smoke.yml"><img alt="Linux smoke" src="https://github.com/Kyter-com/Mactions/actions/workflows/linux-smoke.yml/badge.svg"></a>
+  <a href="https://github.com/Kyter-com/Mactions/actions/workflows/windows-smoke.yml"><img alt="Windows smoke" src="https://github.com/Kyter-com/Mactions/actions/workflows/windows-smoke.yml/badge.svg"></a>
 </p>
 
 <p align="center">

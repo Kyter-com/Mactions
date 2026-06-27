@@ -54,14 +54,14 @@ single-job, self-deregistering — rather than long-lived registration tokens.
 
 ### Self-hosted CI workflows
 
-The `release`, `selfhosted-smoke`, and `win-smoke` workflows run on self-hosted
-runners. The smoke workflows are intentionally **`workflow_dispatch`-only**
-(manual; requires repo write access). The release workflow is restricted to
-version tags plus manual dispatch. Do **not** add `pull_request` or
-`pull_request_target` triggers to any self-hosted workflow, and do not add broad
-branch `push` triggers. That would let untrusted or routine code execute on the
-maintainer's hardware. Release tags should be protected, and the `release`
-environment should require maintainer approval.
+The `release`, `macos-smoke`, `linux-smoke`, and `windows-smoke` workflows run
+on self-hosted runners. The smoke workflows are intentionally
+**`workflow_dispatch`-only** (manual; requires repo write access). The release
+workflow is restricted to version tags plus manual dispatch. Do **not** add
+`pull_request` or `pull_request_target` triggers to any self-hosted workflow, and
+do not add broad branch `push` triggers. That would let untrusted or routine code
+execute on the maintainer's hardware. Release tags should be protected, and the
+`release` environment should require maintainer approval.
 
 ### Software updates
 

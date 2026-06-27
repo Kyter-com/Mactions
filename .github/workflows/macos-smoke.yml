@@ -1,0 +1,40 @@
+name: macOS smoke (Mactions runner)
+
+# Manual-only: a tiny job that runs on a macOS runner provided by Mactions
+# itself (runs-on matches the app's default macOS labels). Proves the ephemeral
+# macOS loop end to end without doing a full build. It intentionally pauses for
+# a minute so the running job is easy to screenshot in the dashboard. Dispatch with:
+#   gh workflow run "macOS smoke (Mactions runner)"
+on:
+  # workflow_dispatch ONLY — never add pull_request / pull_request_target / push.
+  # This job runs on a SELF-HOSTED runner (the maintainer's Mac, no VM isolation);
+  # a fork-PR trigger would let untrusted code execute on that host. Dispatch
+  # requires repo write access, which keeps the self-hosted runner closed to
+  # outside contributors.
+  workflow_dispatch:
+
+# Least privilege: this job only inspects the runner, so the GITHUB_TOKEN needs
+# no scopes.
+permissions: {}
+
+jobs:
+  macos-smoke:
+    runs-on: [self-hosted, macOS, mactions]
+    timeout-minutes: 10
+    steps:
+      - name: Identity + OS
+        run: |
+          echo "host=$(hostname) user=$(whoami) arch=$(uname -m)"
+          sw_vers
+      - name: Runner context
+        run: echo "RUNNER_OS=$RUNNER_OS RUNNER_ARCH=$RUNNER_ARCH RUNNER_NAME=$RUNNER_NAME"
+      - name: Toolchain snapshot
+        run: |
+          if command -v xcodebuild >/dev/null 2>&1; then xcodebuild -version; else echo "xcodebuild not found"; fi
+          if command -v swift >/dev/null 2>&1; then swift --version; else echo "swift not found"; fi
+      - name: Hold for dashboard screenshot
+        run: |
+          echo "Holding this macOS runner for 60 seconds so the dashboard can show it running."
+          sleep 60
+      - name: Finish
+        run: echo "macOS smoke complete"
