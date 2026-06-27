@@ -28,6 +28,14 @@
   <img alt="Last commit" src="https://img.shields.io/github/last-commit/Kyter-com/Mactions?style=flat-square">
 </p>
 
+<p align="center">
+  <img src="docs/assets/dashboard-smoke.png" width="960" alt="Mactions dashboard showing macOS, Windows, and Linux self-hosted runners with a Linux smoke job running">
+</p>
+
+<p align="center">
+  <em>macOS, Windows, and Linux runners launched on demand from one Mac.</em>
+</p>
+
 ## Why it exists
 
 GitHub-hosted macOS and Windows ARM capacity can be unpredictable, and permanent
