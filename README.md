@@ -36,6 +36,14 @@
   <em>macOS, Windows, and Linux runners launched on demand from one Mac.</em>
 </p>
 
+<p align="center">
+  <img src="docs/assets/dashboard-settings.png" width="960" alt="Mactions dashboard showing all-repositories defaults with macOS, Windows, and Linux platforms enabled">
+</p>
+
+<p align="center">
+  <em>Choose default platforms once; Mactions starts matching runners only when jobs queue.</em>
+</p>
+
 ## Why it exists
 
 GitHub-hosted macOS and Windows ARM capacity can be unpredictable, and permanent
