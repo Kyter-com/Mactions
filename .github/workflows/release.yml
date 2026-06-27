@@ -114,7 +114,7 @@ jobs:
               continue
             fi
 
-            version_output="$($developer/usr/bin/xcodebuild -version)"
+            version_output="$("$developer/usr/bin/xcodebuild" -version)"
             version_line="${version_output%%$'\n'*}"
             if [[ "$version_line" =~ ^Xcode[[:space:]]26([.]|$) ]]; then
               developer_dir="$developer"
