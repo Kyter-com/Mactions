@@ -1,4 +1,4 @@
-name: Hosted macOS release
+name: Self-hosted macOS release
 
 on:
   push:
@@ -12,7 +12,7 @@ on:
         type: string
 
 concurrency:
-  group: hosted-release-${{ github.ref }}
+  group: self-hosted-release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -22,15 +22,14 @@ env:
   APP_NAME: Mactions
   SCHEME: MactionsApp
   # Opt into Homebrew's upcoming tap-trust default early. We only install the
-  # core formula `xcodegen`, so enforcing trust changes nothing for us — it just
-  # silences the deprecation nag about the runner's preinstalled aws/tap &
-  # azure/bicep taps.
+  # core formula `xcodegen`, so enforcing trust changes nothing for us.
   HOMEBREW_REQUIRE_TAP_TRUST: "1"
 
 jobs:
   release:
     name: Build, notarize, and publish
-    runs-on: macos-26
+    runs-on: [self-hosted, macOS, mactions]
+    environment: release
     timeout-minutes: 60
     env:
       CSC_LINK: ${{ secrets.CSC_LINK }}
@@ -45,6 +44,14 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Add Homebrew to PATH
+        run: |
+          {
+            echo "/opt/homebrew/bin"
+            echo "/opt/homebrew/sbin"
+            echo "/usr/local/bin"
+          } >> "$GITHUB_PATH"
 
       - name: Derive release version
         run: |
@@ -89,12 +96,39 @@ jobs:
       - name: Select Xcode 26
         run: |
           set -euo pipefail
-          XCODE_APP="$(find /Applications -maxdepth 1 -name 'Xcode_26*.app' -print | sort | tail -n 1)"
-          if [ -z "$XCODE_APP" ]; then
+
+          shopt -s nullglob
+          xcode_26_apps=(/Applications/Xcode_26*.app)
+          shopt -u nullglob
+
+          candidates=()
+          for ((idx=${#xcode_26_apps[@]} - 1; idx >= 0; idx--)); do
+            candidates+=("${xcode_26_apps[$idx]}")
+          done
+          candidates+=("/Applications/Xcode.app")
+
+          developer_dir=""
+          for app in "${candidates[@]}"; do
+            developer="$app/Contents/Developer"
+            if [ ! -d "$developer" ]; then
+              continue
+            fi
+
+            version_output="$($developer/usr/bin/xcodebuild -version)"
+            version_line="${version_output%%$'\n'*}"
+            if [[ "$version_line" =~ ^Xcode[[:space:]]26([.]|$) ]]; then
+              developer_dir="$developer"
+              break
+            fi
+          done
+
+          if [ -z "$developer_dir" ]; then
             echo "::error::No Xcode 26 installation found on this runner"
             exit 1
           fi
-          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+
+          export DEVELOPER_DIR="$developer_dir"
+          echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
           xcodebuild -version
           swift --version
 
@@ -102,6 +136,10 @@ jobs:
         run: |
           set -euo pipefail
           if ! command -v xcodegen >/dev/null 2>&1; then
+            if ! command -v brew >/dev/null 2>&1; then
+              echo "::error::Homebrew is required to install xcodegen on this self-hosted runner"
+              exit 1
+            fi
             brew install xcodegen
           fi
           xcodegen --version

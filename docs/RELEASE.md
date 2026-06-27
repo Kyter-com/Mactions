@@ -1,9 +1,19 @@
 # Release Setup
 
-The hosted release workflow is `.github/workflows/release.yml`. It runs on
-GitHub-hosted macOS, builds the Xcode app target, signs with Developer ID,
-notarizes and staples the app and DMG, generates a Sparkle appcast, and uploads
-the release assets to GitHub Releases.
+The release workflow is `.github/workflows/release.yml`. It runs on a Mactions
+self-hosted macOS runner (`[self-hosted, macOS, mactions]`), builds the Xcode app
+target, signs with Developer ID, notarizes and staples the app and DMG,
+generates a Sparkle appcast, and uploads the release assets to GitHub Releases.
+
+The release Mac must be online in Mactions with this repo selected before a tag
+push or manual dispatch can run. It also needs Xcode 26, Homebrew, and a Developer
+ID certificate that `security find-identity -v -p codesigning` reports as valid
+on that Mac.
+
+For this public repo, release execution is maintainer-only. Protect `v*` tags so
+only the maintainer can create release tags, and configure the GitHub `release`
+environment to require maintainer approval before the job can start on the
+self-hosted Mac.
 
 ## Required GitHub Actions Secrets
 

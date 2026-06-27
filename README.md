@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Kyter-com/Mactions/actions/workflows/release.yml"><img alt="Hosted macOS release" src="https://github.com/Kyter-com/Mactions/actions/workflows/release.yml/badge.svg"></a>
+  <a href="https://github.com/Kyter-com/Mactions/actions/workflows/release.yml"><img alt="Self-hosted macOS release" src="https://github.com/Kyter-com/Mactions/actions/workflows/release.yml/badge.svg"></a>
   <a href="https://github.com/Kyter-com/Mactions/actions/workflows/selfhosted-smoke.yml"><img alt="Self-hosted smoke" src="https://github.com/Kyter-com/Mactions/actions/workflows/selfhosted-smoke.yml/badge.svg"></a>
   <a href="https://github.com/Kyter-com/Mactions/actions/workflows/win-smoke.yml"><img alt="Windows smoke" src="https://github.com/Kyter-com/Mactions/actions/workflows/win-smoke.yml/badge.svg"></a>
 </p>
