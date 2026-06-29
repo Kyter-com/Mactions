@@ -3,6 +3,44 @@
 All notable changes to Mactions are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.5] - 2026-06-29
+
+### Fixed
+
+- **Runner activity spinner froze into a static "spoke wheel" while a job was
+  running.** The dashboard's per-runner busy indicator used a native circular
+  `ProgressView`, whose underlying `NSProgressIndicator` stops animating once its
+  row is recycled in the virtualized fleet list — so a running job showed a
+  frozen macOS spoke wheel instead of the GitHub-style spinning ring. Replaced it
+  with a Core-Animation-driven arc: the rotation runs on the render server
+  (independent of the main thread, so it adds no per-frame work however large the
+  fleet), survives list-row recycling without freezing, tracks light/dark
+  appearance, and honors Reduce Motion.
+
+## [0.1.4] - 2026-06-27
+
+### Added
+
+- **Control-plane logging.** Structured logging — an OSLog subsystem
+  (`com.kyter.mactions`) plus an append-only, size-rotated
+  `~/.mactions/logs/control-plane.jsonl` — now traces the all-repositories
+  discovery scan (begin/provision/reap/end and watchdog timeouts) and the
+  orchestrator's provisioning path (budget-denied, launch outcome, `listRunners`
+  outage hold). A provisioning stall is now explainable from the log alone, and a
+  missing scan-end line pinpoints a freeze. Motivated by a ~9.5 h all-OS
+  provisioning stall that previously left no runtime trace.
+- **Discovery-loop watchdog.** Each discovery scan now runs in a structured task
+  group raced against a 180 s timer; a hung scan is cancelled so the loop always
+  ticks again, while go-offline cancellation still propagates promptly.
+
+### Fixed
+
+- **Unbounded control-plane API timeouts.** Both GitHub API clients defaulted to
+  `URLSession.shared`, whose `timeoutIntervalForResource` is 7 days — so a single
+  wedged connection could hang a request (and the discovery loop awaiting it)
+  almost indefinitely. The control-plane session now caps the request timeout at
+  30 s and the resource timeout at 60 s.
+
 ## [0.1.3] - 2026-06-16
 
 ### Fixed

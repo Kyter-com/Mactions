@@ -742,21 +742,19 @@ private struct RunnerActivityDot: View {
   var body: some View {
     ZStack {
       if busy {
-        // Indeterminate circular ProgressView — NOT a hand-rolled
-        // `.rotationEffect` + `.animation(.repeatForever)`. A repeatForever
-        // animation lives inside SwiftUI's view graph and re-evaluates the
-        // animated attribute every display frame, which forces the whole
-        // window's single NSHostingView to re-layout/re-render ~60×/s for as
-        // long as ANY runner is busy. With all-repos discovery (many rows) on a
-        // host already pinned by the VM/container fleet, that per-frame whole-
-        // tree relayout starves the main thread and the window paints a blank
-        // partial frame. NSProgressIndicator (what ProgressView wraps) spins on
-        // the render server via CoreAnimation, so the busy ring animates for
-        // free — no SwiftUI per-frame work, regardless of how many are running.
-        ProgressView()
-          .progressViewStyle(.circular)
-          .controlSize(.mini)
-          .tint(color)
+        // GitHub-style spinning arc, driven by Core Animation (see SpinningRing).
+        // The rotation runs on the render server, independent of the main thread,
+        // so the spin costs zero SwiftUI/main-thread work per frame however many
+        // runners are busy. We deliberately avoid two tempting-but-broken paths:
+        //   • `.rotationEffect` + `.animation(.repeatForever)` re-evaluates the
+        //     animated attribute every display frame, forcing the window's single
+        //     NSHostingView to relayout ~60×/s while ANY runner is busy — under an
+        //     all-repos fleet that starves the main thread and paints blank frames.
+        //   • a native circular `ProgressView` silently FREEZES (renders a static
+        //     spoke wheel) once its NSProgressIndicator is recycled inside this
+        //     virtualized List. SpinningRing re-arms its animation on every
+        //     re-entry to a window, so it can't freeze.
+        SpinningRing(color: color)
           .frame(width: 13, height: 13)
       }
       Circle().fill(color).frame(width: 7, height: 7)
@@ -764,6 +762,145 @@ private struct RunnerActivityDot: View {
     .frame(width: 16, height: 16)
     .accessibilityElement()
     .accessibilityLabel(label)
+  }
+}
+
+/// A GitHub-style indeterminate spinner: a 70% circular arc that rotates forever.
+/// The rotation is a `CABasicAnimation` on `transform.rotation`, which Core
+/// Animation runs on the render server independent of the main thread — so it
+/// costs no SwiftUI/main-thread work per frame regardless of how many runners
+/// are busy (the reason we don't drive it with SwiftUI's `.repeatForever`). The
+/// CA animation keeps its phase across List-row recycling and self-heals if the
+/// NSView is ever rebuilt, so it can't fall into the static-spoke-wheel freeze
+/// that a recycled `ProgressView(.circular)` hits here. Honors Reduce Motion
+/// (a full, still ring, no spin).
+private struct SpinningRing: NSViewRepresentable {
+  var color: Color
+  var lineWidth: CGFloat = 1.5
+
+  func makeNSView(context: Context) -> SpinningRingView {
+    SpinningRingView(color: NSColor(color), lineWidth: lineWidth)
+  }
+
+  func updateNSView(_ view: SpinningRingView, context: Context) {
+    view.update(color: NSColor(color), lineWidth: lineWidth)
+  }
+}
+
+private final class SpinningRingView: NSView {
+  private static let spinKey = "mactions.spin"
+  private let ring = CAShapeLayer()
+  private var ringColor: NSColor
+  private var ringLineWidth: CGFloat
+
+  init(color: NSColor, lineWidth: CGFloat) {
+    self.ringColor = color
+    self.ringLineWidth = lineWidth
+    super.init(frame: .zero)
+    wantsLayer = true
+    ring.fillColor = NSColor.clear.cgColor
+    ring.lineCap = .round
+    layer?.addSublayer(ring)
+    // The SwiftUI ZStack owns this dot's VoiceOver label; don't double-announce.
+    setAccessibilityElement(false)
+    NSWorkspace.shared.notificationCenter.addObserver(
+      self, selector: #selector(accessibilityOptionsChanged),
+      name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
+  }
+
+  required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+  deinit { NSWorkspace.shared.notificationCenter.removeObserver(self) }
+
+  override var intrinsicContentSize: NSSize { NSSize(width: 13, height: 13) }
+
+  func update(color: NSColor, lineWidth: CGFloat) {
+    ringColor = color
+    ringLineWidth = lineWidth
+    needsLayout = true
+    applyStyle()
+  }
+
+  override func layout() {
+    super.layout()
+    // No implicit animations on geometry/style — only the explicit spin animates.
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    let side = min(bounds.width, bounds.height)
+    let square = CGRect(x: 0, y: 0, width: side, height: side)
+    ring.bounds = square
+    ring.anchorPoint = CGPoint(x: 0.5, y: 0.5)   // rotate about the ring's center
+    ring.position = CGPoint(x: bounds.midX, y: bounds.midY)
+    let inset = ringLineWidth / 2 + 0.5
+    ring.path = CGPath(ellipseIn: square.insetBy(dx: inset, dy: inset), transform: nil)
+    ring.contentsScale = window?.backingScaleFactor ?? 2
+    CATransaction.commit()
+    applyStyle()
+    armAnimationIfNeeded()
+  }
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    guard window != nil else { return }
+    // A CA animation runs on an absolute-time clock, so it keeps its phase across a
+    // detach/re-attach (List row scrolled offscreen and back) and simply resumes —
+    // no freeze. We re-arm only if it's actually missing (e.g. SwiftUI rebuilt the
+    // NSView); force-removing a live animation would snap the ring back to 0° (a
+    // visible jump on every recycle), so we don't.
+    ring.contentsScale = window?.backingScaleFactor ?? 2
+    armAnimationIfNeeded()
+  }
+
+  override func viewDidChangeEffectiveAppearance() {
+    super.viewDidChangeEffectiveAppearance()
+    applyStyle()   // re-resolve the stroke color for the new light/dark appearance
+  }
+
+  override func viewDidChangeBackingProperties() {
+    super.viewDidChangeBackingProperties()
+    ring.contentsScale = window?.backingScaleFactor ?? 2
+  }
+
+  @objc private func accessibilityOptionsChanged() {
+    DispatchQueue.main.async { [weak self] in
+      self?.applyStyle()
+      self?.armAnimationIfNeeded()
+    }
+  }
+
+  private var reduceMotion: Bool {
+    NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+  }
+
+  private func applyStyle() {
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    ring.lineWidth = ringLineWidth
+    // Resolve the (possibly dynamic) color against THIS view's appearance so the
+    // arc tracks light/dark exactly like the SwiftUI dot beside it.
+    var stroke = ringColor.cgColor
+    effectiveAppearance.performAsCurrentDrawingAppearance { stroke = ringColor.cgColor }
+    ring.strokeColor = stroke
+    ring.strokeStart = 0
+    // Reduce Motion: a full, still ring still reads as "active" without spinning.
+    ring.strokeEnd = reduceMotion ? 1.0 : 0.7
+    CATransaction.commit()
+  }
+
+  private func armAnimationIfNeeded() {
+    if reduceMotion {
+      ring.removeAnimation(forKey: Self.spinKey)
+      return
+    }
+    guard window != nil, ring.animation(forKey: Self.spinKey) == nil else { return }
+    let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+    spin.fromValue = 0
+    spin.toValue = -Double.pi * 2      // clockwise (y-up layer), matching the old SwiftUI ring
+    spin.duration = 1
+    spin.repeatCount = .infinity
+    spin.isRemovedOnCompletion = false
+    spin.timingFunction = CAMediaTimingFunction(name: .linear)   // constant angular speed
+    ring.add(spin, forKey: Self.spinKey)
   }
 }
 
