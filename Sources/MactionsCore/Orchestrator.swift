@@ -279,6 +279,28 @@ public final class RunnerOrchestrator {
   /// Monotonic reconcile-pass counter, for the trim two-snapshot rule.
   private var reconcileTick = 0
 
+  /// The never-confirmed-zombie reap window for a runner OS — how long a
+  /// provisioned-but-never-once-online runner may live before it's reaped as a
+  /// launch failure. It MUST exceed a *healthy* launch's boot→register time, or
+  /// healthy-but-slow runners get reaped mid-boot and re-provisioned forever (a
+  /// relaunch loop). Linux containers / local macOS register within seconds, so
+  /// 120s clears an egress-failed zombie fast (the 4d428fb intent). A Windows VM
+  /// legitimately needs minutes — clone boot, autologon, the in-guest JIT-disc
+  /// wait, then `run.cmd` registration; `WindowsVMProvider` alone allows 300s
+  /// just to reach powered-on — so it gets that full boot budget plus a
+  /// registration margin. Pass the initializer arg explicitly to opt out.
+  static func defaultNeverConfirmedReapInterval(for os: RunnerOS) -> TimeInterval {
+    os == .windows ? 360 : 120
+  }
+
+  /// The sustained-offline grace before a runner GitHub no longer lists online is
+  /// reaped as dead. Kept in lock-step with the never-confirmed window above for
+  /// Windows, so a slow-booting VM isn't torn down by *this* second reap path
+  /// before it can register either (both 360s on Windows; 120s / 300s elsewhere).
+  static func defaultRemoteRegistrationGraceInterval(for os: RunnerOS) -> TimeInterval {
+    os == .windows ? 360 : 5 * 60
+  }
+
   public init(
     controlPlane: RunnerControlPlane,
     factory: RunnerProviderFactory,
@@ -288,12 +310,12 @@ public final class RunnerOrchestrator {
     machinePrefix: String = machineRunnerPrefix(),
     reconcileInterval: UInt64 = 30_000_000_000,
     idleReconcileInterval: UInt64 = 60_000_000_000,
-    remoteRegistrationGraceInterval: TimeInterval = 5 * 60,
+    remoteRegistrationGraceInterval: TimeInterval? = nil,
     idleJITRefreshInterval: TimeInterval? = 8 * 60,
     idleTrimGraceInterval: TimeInterval = 90,
     trimConfirmInterval: TimeInterval = 25,
     launchFailureGraceInterval: TimeInterval = 30,
-    neverConfirmedReapInterval: TimeInterval = 120,
+    neverConfirmedReapInterval: TimeInterval? = nil,
     listRunnersOutageHoldInterval: TimeInterval = 120
   ) {
     self.controlPlane = controlPlane
@@ -304,12 +326,14 @@ public final class RunnerOrchestrator {
     self.machinePrefix = machinePrefix
     self.reconcileInterval = reconcileInterval
     self.idleReconcileInterval = idleReconcileInterval
-    self.remoteRegistrationGraceInterval = remoteRegistrationGraceInterval
+    self.remoteRegistrationGraceInterval =
+      remoteRegistrationGraceInterval ?? Self.defaultRemoteRegistrationGraceInterval(for: os)
     self.idleJITRefreshInterval = idleJITRefreshInterval
     self.idleTrimGraceInterval = idleTrimGraceInterval
     self.trimConfirmInterval = trimConfirmInterval
     self.launchFailureGraceInterval = launchFailureGraceInterval
-    self.neverConfirmedReapInterval = neverConfirmedReapInterval
+    self.neverConfirmedReapInterval =
+      neverConfirmedReapInterval ?? Self.defaultNeverConfirmedReapInterval(for: os)
     self.listRunnersOutageHoldInterval = listRunnersOutageHoldInterval
   }
 

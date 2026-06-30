@@ -14,6 +14,16 @@ struct FleetRunnerRow: Identifiable, Equatable {
   var id: String { "\(repoFullName)#\(runner.id)" }
 }
 
+extension Notification.Name {
+  /// Posted by `AppState.sync()` whenever the *structural* fleet set — the
+  /// runner rows or watched repos that back the dashboard's two virtualized
+  /// `List`s — actually changes. `DashboardWindowController` observes this to
+  /// force a one-shot relayout, so a `List`/`NSTableView` that dropped into a
+  /// blank-frame state under churn repaints without the user nudging the window.
+  static let mactionsFleetStructureChanged = Notification.Name(
+    "com.kyter.mactions.fleetStructureChanged")
+}
+
 /// The app's single source of truth. Owns auth + config, drives one
 /// `RunnerOrchestrator` per selected repo, and republishes to SwiftUI. A
 /// singleton so the `AppDelegate` can reach it during termination.
@@ -864,7 +874,7 @@ final class AppState: ObservableObject {
             owner: repo.owner, repo: repo.name, labels: labels, maxRunners: count)
           let orch = RunnerOrchestrator(
             controlPlane: plane, factory: factory, config: fleet, os: os, budget: budget)
-          orch.onChange = { [weak self] in self?.sync() }
+          orch.onChange = { [weak self] in self?.scheduleSync() }
           orch.onRunFinished = { [weak self] record in self?.recordRun(record) }
           let key = "\(repo.fullName)#\(os.rawValue)"
           orchestrators[key] = orch
@@ -1172,7 +1182,7 @@ final class AppState: ObservableObject {
           maxRunners: seedConfig.count)
         let orch = RunnerOrchestrator(
           controlPlane: plane, factory: factory, config: fleet, os: os, budget: budget)
-        orch.onChange = { [weak self] in self?.sync() }
+        orch.onChange = { [weak self] in self?.scheduleSync() }
         orch.onRunFinished = { [weak self] record in self?.recordRun(record) }
         orchestrators[key] = orch
         fleetOS[key] = os
@@ -2343,6 +2353,25 @@ final class AppState: ObservableObject {
     }
   }
 
+  /// Coalesce a burst of orchestrator `notify()` callbacks into ONE `sync()` per
+  /// main-actor turn. A single runner exit or reconcile pass fires `notify()`
+  /// from ~15 sites, and an all-repos fleet (or a runner stuck relaunching every
+  /// ~90s) turns that into a storm of `@Published` writes — each one invalidates
+  /// the whole dashboard (one NSHostingView), and the relayout churn eventually
+  /// wedges the virtualized runner/sidebar `List`s into a blank-frame state.
+  /// Collapsing to one publish per turn keeps `sync()`'s diff-before-publish
+  /// logic intact but removes the churn that blanks the UI.
+  private var syncScheduled = false
+  private func scheduleSync() {
+    guard !syncScheduled else { return }
+    syncScheduled = true
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      self.syncScheduled = false
+      self.sync()
+    }
+  }
+
   private func sync() {
     // Only mirror the live runner list here. We deliberately do NOT re-stamp
     // orch.lastError onto statusMessage on every change — that clobbered the
@@ -2371,13 +2400,21 @@ final class AppState: ObservableObject {
     // state transition, but the row set is usually unchanged between them — an
     // unconditional assignment would fire objectWillChange and relayout the
     // whole window each time (the other published values below are diffed too).
+    var structureChanged = false
     let sorted = rows.sorted { $0.id < $1.id }
-    if sorted != runners { runners = sorted }
+    if sorted != runners { runners = sorted; structureChanged = true }
     if demand != repoQueuedJobs { repoQueuedJobs = demand }
     let watched = Set(fleetRepo.values)
-    if watched != watchedRepos { watchedRepos = watched }
+    if watched != watchedRepos { watchedRepos = watched; structureChanged = true }
     if pollFailing != repoPollFailing { repoPollFailing = pollFailing }
     if waitingCapacity != repoWaitingForCapacity { repoWaitingForCapacity = waitingCapacity }
     if launchFailures != repoLaunchFailure { repoLaunchFailure = launchFailures }
+    // When the rows/repos backing the two virtualized Lists actually change,
+    // nudge the dashboard to relayout (the render-recovery guard against a
+    // blank-frame List — see DashboardWindowController). Posted only on a real
+    // structural change, so a steady fleet costs nothing.
+    if structureChanged {
+      NotificationCenter.default.post(name: .mactionsFleetStructureChanged, object: nil)
+    }
   }
 }

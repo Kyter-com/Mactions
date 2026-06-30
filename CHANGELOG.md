@@ -3,6 +3,33 @@
 All notable changes to Mactions are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.6] - 2026-06-30
+
+### Fixed
+
+- **Windows runners relaunched in an endless loop, never picking up jobs.** The
+  never-confirmed-zombie reaper (added in 0.1.3 to clear runners that register
+  but never reach GitHub) used a single 120 s grace for every platform. A Windows
+  VM legitimately needs minutes — clone boot, autologon, the in-guest JIT-disc
+  wait, then `run.cmd` registration; the VM provider alone allows 300 s just to
+  reach powered-on — so a healthy-but-slow Windows runner was reaped *before* it
+  could register, then re-provisioned, on a ~134 s cadence forever (queued jobs
+  never ran, and a VMware VM stayed pinned at ~90 % CPU). The reap windows
+  (`neverConfirmedReapInterval` and the sustained-offline `remoteRegistrationGrace`)
+  are now per-OS: 360 s on Windows (the provider's full boot budget plus a
+  registration margin), unchanged on Linux/macOS, which register in seconds.
+
+- **The dashboard could go blank ("UI disappeared") while a fleet ran.** Every
+  orchestrator state transition published to SwiftUI individually, and a single
+  reconcile pass fires ~15 of them; under an all-repositories fleet — or a runner
+  stuck relaunching — that storm of `@Published` writes relayouts the whole
+  window repeatedly until the virtualized runner/sidebar `List`s wedge into a
+  blank-frame state while the main thread sits idle (recoverable only by resizing
+  the window). Orchestrator notifications are now coalesced into one publish per
+  run-loop turn, and a render-recovery guard forces the hosting view to relayout
+  when the fleet's structure changes or the window returns on screen — the
+  programmatic equivalent of the manual resize that un-blanks it.
+
 ## [0.1.5] - 2026-06-29
 
 ### Fixed

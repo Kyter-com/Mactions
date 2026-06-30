@@ -20,6 +20,11 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
   static let shared = DashboardWindowController()
 
   private var window: NSWindow?
+  /// Coalesces relayout nudges to one per run-loop turn (the structure-changed
+  /// notification can still arrive in a burst even after sync() coalescing).
+  private var relayoutScheduled = false
+
+  deinit { NotificationCenter.default.removeObserver(self) }
 
   /// Show (creating on first use) and focus the dashboard window.
   func show() {
@@ -42,6 +47,20 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
       win.identifier = NSUserInterfaceItemIdentifier("mactions-dashboard")
       win.delegate = self
       window = win
+
+      // Render-recovery guard: a virtualized List/NSTableView can drop into a
+      // blank-frame state under @Published churn and stay blank while the main
+      // thread sits idle (the "UI disappeared" bug) — until something forces a
+      // relayout. Re-run layout on the SwiftUI hosting view whenever the fleet's
+      // structure changes or the window comes back on screen; that's the
+      // programmatic equivalent of the manual window-resize that fixes it.
+      let center = NotificationCenter.default
+      center.addObserver(
+        self, selector: #selector(scheduleContentRelayout),
+        name: .mactionsFleetStructureChanged, object: nil)
+      center.addObserver(
+        self, selector: #selector(scheduleContentRelayout),
+        name: NSWindow.didChangeOcclusionStateNotification, object: win)
     }
     NSApp.activate(ignoringOtherApps: true)
     guard let window else { return }
@@ -66,5 +85,34 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
     // (isReleasedWhenClosed = false) and reused on the next show(). This is purely
     // a UI-presence change; it never touches the fleet (closing ≠ quitting).
     AppState.shared.stopMemorySampling()
+  }
+
+  // MARK: Render-recovery guard
+
+  /// Schedule a one-shot relayout of the dashboard's hosting view on the next
+  /// run-loop turn, coalescing a burst of triggers into a single nudge. Deferred
+  /// (not synchronous) so SwiftUI has already processed the published change; we
+  /// only force a layout pass if it still didn't repaint. Always invoked on the
+  /// main thread (the observed notifications are posted there).
+  @objc private func scheduleContentRelayout() {
+    guard !relayoutScheduled else { return }
+    relayoutScheduled = true
+    DispatchQueue.main.async { [weak self] in
+      self?.relayoutScheduled = false
+      self?.forceContentRelayout()
+    }
+  }
+
+  /// Force a layout pass on the hosting view — the same recovery a user gets by
+  /// nudging the window's edge. A no-op while the window is hidden/occluded, or
+  /// when the content is already correctly laid out.
+  private func forceContentRelayout() {
+    guard let window, window.isVisible,
+      window.occlusionState.contains(.visible),
+      let content = window.contentView
+    else { return }
+    content.needsLayout = true
+    content.layoutSubtreeIfNeeded()
+    content.needsDisplay = true
   }
 }

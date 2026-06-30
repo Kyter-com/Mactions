@@ -435,22 +435,11 @@ private struct RunnersPane: View {
       // the list must render whenever any group does, or watched fleets hide.
       if !app.plan.isAllRepos && app.plan.repos.isEmpty && groups.isEmpty {
         VStack(spacing: MactionsTheme.Spacing.section) {
-          if app.isSignedIn, app.plan.isAllRepos {
-            DashboardEmptyState(
-              systemImage: "antenna.radiowaves.left.and.right",
-              title: "Watching all repositories",
-              message: app.state == .online
-                ? "No queued jobs discovered yet — a repo appears here the moment one of its jobs queues. Add a repository explicitly to pin its own settings."
-                : "All-repositories mode is on. Go online to start watching every repo you admin for queued jobs — or add a repository explicitly to pin its own settings.")
-            Button {
-              showAddRepo = true
-            } label: {
-              Label("Add repository…", systemImage: "plus")
-            }
-            .glassProminentButton()
-            .keyboardShortcut("n", modifiers: .command)
-            .disabled(app.state != .offline)
-          } else if app.isSignedIn {
+          // All-repos mode always renders the List below — it carries the
+          // selectable "All repositories" header even with zero discovered
+          // groups — so this empty-state block is only ever reached when NOT in
+          // all-repos mode (see the outer `!app.plan.isAllRepos` guard).
+          if app.isSignedIn {
             DashboardEmptyState(
               systemImage: "tray", title: "No repositories",
               message: "Add a repository to manage its self-hosted runners. Then pick a platform for it on the right.")
