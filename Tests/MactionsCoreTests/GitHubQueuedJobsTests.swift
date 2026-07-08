@@ -213,4 +213,38 @@ final class GitHubQueuedJobsTests: XCTestCase {
       XCTFail("expected a throw")
     } catch {}
   }
+
+  func testListRunnersPaginatesAllPages() async throws {
+    StubURLProtocol.handler = { request in
+      let url = request.url!
+      guard url.path == "/repos/o/r/actions/runners" else {
+        return (404, [:], self.json(#"{"message": "unexpected"}"#))
+      }
+      let page = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+        .queryItems?.first(where: { $0.name == "page" })?.value
+      if page == "2" {
+        return (
+          200, [:],
+          self.json(
+            #"{"total_count":3,"runners":[{"id":3,"name":"r3","status":"offline","busy":false}]}"#)
+        )
+      }
+      return (
+        200, [:],
+        self.json(
+          #"{"total_count":3,"runners":[{"id":1,"name":"r1","status":"online","busy":true},"#
+            + #"{"id":2,"name":"r2","status":"offline","busy":false}]}"#)
+      )
+    }
+
+    let runners = try await client.listRunners()
+
+    XCTAssertEqual(runners.map(\.id), [1, 2, 3])
+    XCTAssertEqual(
+      StubURLProtocol.seen.map { $0.url!.absoluteString },
+      [
+        "https://api.github.com/repos/o/r/actions/runners?per_page=100",
+        "https://api.github.com/repos/o/r/actions/runners?per_page=100&page=2",
+      ])
+  }
 }

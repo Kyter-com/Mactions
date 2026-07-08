@@ -3,6 +3,22 @@
 All notable changes to Mactions are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.7] - 2026-07-07
+
+### Fixed
+
+- **Runner listings are now paginated before making reap decisions.** Repos with
+  more than 100 registered self-hosted runners could hide a live Mactions runner
+  on a later GitHub API page. The control plane could then treat that runner as
+  never-confirmed/offline and tear down its container while GitHub still had an
+  in-flight job assigned. `listRunners()` now reads every page before the
+  orchestrator trims, refreshes, or reaps runners.
+
+- **Failed JIT/start attempts clean up their runner registrations.** If GitHub
+  creates a registration but the JIT call or local provider start fails, Mactions
+  now deregisters the exact offline runner or minted runner id so stale
+  registrations do not accumulate.
+
 ## [0.1.6] - 2026-06-30
 
 ### Fixed

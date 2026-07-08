@@ -215,12 +215,14 @@ public struct GitHubClient: RunnerControlPlane {
     return req
   }
 
-  public func listRunnersRequest() -> URLRequest {
+  public func listRunnersRequest(perPage: Int = 100, page: Int? = nil) -> URLRequest {
     var components = URLComponents(
       url: apiBase.appendingPathComponent("repos/\(owner)/\(repo)/actions/runners"),
       resolvingAgainstBaseURL: false
     )!
-    components.queryItems = [URLQueryItem(name: "per_page", value: "100")]
+    var items = [URLQueryItem(name: "per_page", value: String(perPage))]
+    if let page { items.append(URLQueryItem(name: "page", value: String(page))) }
+    components.queryItems = items
     var req = request(url: components.url!, method: "GET")
     // Busy-ness drives trim/refresh decisions — a URLCache-stale `busy=false`
     // could reap a runner that just took a job. Always hit the network.
@@ -250,9 +252,21 @@ public struct GitHubClient: RunnerControlPlane {
   }
 
   public func listRunners() async throws -> [RemoteRunner] {
-    struct Response: Decodable { let runners: [RemoteRunner] }
-    let data = try await send(listRunnersRequest())
-    return try JSONDecoder().decode(Response.self, from: data).runners
+    struct Response: Decodable {
+      let total_count: Int
+      let runners: [RemoteRunner]
+    }
+    let perPage = 100
+    var page = 1
+    var all: [RemoteRunner] = []
+    while true {
+      let data = try await send(listRunnersRequest(perPage: perPage, page: page == 1 ? nil : page))
+      let decoded = try JSONDecoder().decode(Response.self, from: data)
+      all.append(contentsOf: decoded.runners)
+      guard all.count < decoded.total_count, !decoded.runners.isEmpty else { break }
+      page += 1
+    }
+    return all
   }
 
   public func deleteRunner(id: Int) async throws {

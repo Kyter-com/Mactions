@@ -19,9 +19,21 @@ final class FakeControlPlane: RunnerControlPlane, @unchecked Sendable {
   /// Runner ids whose delete throws — GitHub's 422 for a runner that is
   /// currently running a job (the server-side trim-race guard).
   var failDeletes: Set<Int> = []
+  /// Simulate GitHub returning an error from generate-jitconfig.
+  var failJIT = false
+  /// GitHub can create the runner registration and still return a 500; this
+  /// seeds that offline ghost so the orchestrator can clean it by exact name.
+  var createOfflineRunnerOnFailedJIT = false
 
   func generateJITConfig(name: String, labels: [String]) async throws -> JITConfig {
     jitCount += 1
+    if failJIT {
+      if createOfflineRunnerOnFailedJIT {
+        remote.append(
+          RemoteRunner(id: 1000 + jitCount, name: name, status: "offline", busy: false))
+      }
+      throw Failure()
+    }
     return JITConfig(encodedConfig: "jit-\(name)", runnerId: jitCount, runnerName: name)
   }
   func listRunners() async throws -> [RemoteRunner] {
@@ -87,6 +99,21 @@ final class InstantExitProvider: RunnerProvider, @unchecked Sendable {
 final class InstantExitFactory: RunnerProviderFactory {
   let kind = "instant-exit"
   func makeProvider(name: String) -> RunnerProvider { InstantExitProvider(id: name) }
+}
+
+final class ThrowingStartProvider: RunnerProvider, @unchecked Sendable {
+  let id: String
+  init(id: String) { self.id = id }
+  var isRunning: Bool { false }
+  func start(jitConfig: String, onExit: @escaping @Sendable (Int32) -> Void) throws {
+    throw FakeControlPlane.Failure()
+  }
+  func stop() {}
+}
+
+final class ThrowingStartFactory: RunnerProviderFactory {
+  let kind = "throwing-start"
+  func makeProvider(name: String) -> RunnerProvider { ThrowingStartProvider(id: name) }
 }
 
 /// An agent that dies shortly AFTER launch — the COMMON dead-container-daemon
@@ -975,6 +1002,61 @@ final class OrchestratorTests: XCTestCase {
     await deregisterOrphanRunners(
       cp, prefix: "mactions-testmac", includeOfflineMactionsRunners: true)
     XCTAssertEqual(Set(cp.deleted), [1, 2])
+  }
+
+  func testDeregisterOfflineRunnerNamedOnlyDeletesExactOfflineIdleRunner() async {
+    let cp = FakeControlPlane()
+    cp.remote = [
+      RemoteRunner(id: 1, name: "mactions-testmac-target", status: "offline", busy: false),
+      RemoteRunner(id: 2, name: "mactions-testmac-other", status: "offline", busy: false),
+      RemoteRunner(id: 3, name: "mactions-testmac-busy", status: "offline", busy: true),
+      RemoteRunner(id: 4, name: "mactions-testmac-online", status: "online", busy: false),
+    ]
+
+    let deleted = await deregisterOfflineRunnerNamed(cp, name: "mactions-testmac-target")
+
+    XCTAssertTrue(deleted)
+    XCTAssertEqual(cp.deleted, [1])
+  }
+
+  func testFailedJITCleansExactOfflineGhostRegistration() async {
+    let cp = FakeControlPlane()
+    cp.queuedJobs = [["self-hosted"]]
+    cp.failJIT = true
+    cp.createOfflineRunnerOnFailedJIT = true
+    let factory = FakeFactory()
+    let orch = RunnerOrchestrator(
+      controlPlane: cp, factory: factory,
+      config: FleetConfig(owner: "o", repo: "r", labels: ["self-hosted"], maxRunners: 1),
+      machinePrefix: "mactions-testmac",
+      reconcileInterval: 30_000_000_000,
+      idleReconcileInterval: 30_000_000_000)
+
+    await orch.start()
+
+    XCTAssertEqual(cp.jitCount, 1)
+    XCTAssertEqual(cp.deleted, [1001], "the partial GitHub registration is removed by name")
+    XCTAssertTrue(orch.runners.isEmpty)
+    XCTAssertTrue(factory.made.isEmpty)
+    await orch.stop()
+  }
+
+  func testProviderStartFailureDeregistersMintedRunner() async {
+    let cp = FakeControlPlane()
+    cp.queuedJobs = [["self-hosted"]]
+    let orch = RunnerOrchestrator(
+      controlPlane: cp, factory: ThrowingStartFactory(),
+      config: FleetConfig(owner: "o", repo: "r", labels: ["self-hosted"], maxRunners: 1),
+      machinePrefix: "mactions-testmac",
+      reconcileInterval: 30_000_000_000,
+      idleReconcileInterval: 30_000_000_000)
+
+    await orch.start()
+
+    XCTAssertEqual(cp.jitCount, 1)
+    XCTAssertEqual(cp.deleted, [1], "a local start failure must not leave its JIT registered")
+    XCTAssertTrue(orch.runners.isEmpty)
+    await orch.stop()
   }
 
   // MARK: Run history

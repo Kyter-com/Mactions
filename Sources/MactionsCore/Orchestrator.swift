@@ -83,6 +83,29 @@ func shouldDeregisterOrphanRunner(
     && !runner.busy
 }
 
+/// Best-effort cleanup for a JIT provisioning attempt that failed after GitHub
+/// may already have created the runner registration. This is intentionally
+/// exact-name and offline/non-busy only: unlike a go-online prefix sweep, this
+/// can run while sibling combos are live, so it must not delete a slow-starting
+/// or busy runner that belongs to another slot.
+@discardableResult
+public func deregisterOfflineRunnerNamed(
+  _ controlPlane: RunnerControlPlane,
+  name: String
+) async -> Bool {
+  guard let remote = try? await controlPlane.listRunners(),
+    let runner = remote.first(where: {
+      $0.name == name && $0.status.lowercased() == "offline" && !$0.busy
+    })
+  else { return false }
+  do {
+    try await controlPlane.deleteRunner(id: runner.id)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /// Owns the lifecycle of the ephemeral runners for one `(repo, OS)` combo —
 /// **scale-from-zero**: runners exist only while queued jobs need them.
 ///
@@ -761,8 +784,10 @@ public final class RunnerOrchestrator {
     defer { if holdingBudget { budget?.release(os) } }
 
     let name = "\(machinePrefix)-\(String(UUID().uuidString.prefix(6)).lowercased())"
+    var mintedJIT: JITConfig?
     do {
       let jit = try await controlPlane.generateJITConfig(name: name, labels: config.labels)
+      mintedJIT = jit
       // We may have gone offline during the JIT call — don't launch a runner
       // for a dead generation; deregister the one we just created.
       guard epoch == myEpoch, state == .starting || state == .online else {
@@ -821,6 +846,17 @@ public final class RunnerOrchestrator {
       notify()
       return true
     } catch {
+      if let jit = mintedJIT {
+        try? await controlPlane.deleteRunner(id: jit.runnerId)
+        ControlPlaneLog.log(
+          "provision.cleanup_registered",
+          ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+           "runner": jit.runnerName])
+      } else if await deregisterOfflineRunnerNamed(controlPlane, name: name) {
+        ControlPlaneLog.log(
+          "provision.cleanup_named",
+          ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue, "runner": name])
+      }
       lastError = String(describing: error)
       ControlPlaneLog.log(
         "provision.error",
