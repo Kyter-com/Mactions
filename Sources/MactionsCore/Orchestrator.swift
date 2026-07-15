@@ -280,6 +280,17 @@ public final class RunnerOrchestrator {
     /// `pruneUnusableSlots`). An exit BEFORE any confirmation is a launch
     /// failure, not a run — see `handleExit`.
     var confirmedOnline = false
+    /// When GitHub FIRST reported this runner `online`. The idle-JIT-refresh
+    /// clock (see `pruneUnusableSlots`) runs from HERE, not from `startedAt`:
+    /// the refresh recycles a runner whose JIT registration is sitting idle,
+    /// and that registration only begins once the runner comes online. Clocking
+    /// it from launch charged a slow-booting provider the whole boot against its
+    /// idle window — a Windows-ARM VM cold-boots in ~6-7 min, so with an 8-min
+    /// refresh it had only ~1-2 min ONLINE to claim a queued job before being
+    /// reaped, and its runners churned forever while the job stayed queued.
+    /// Set once and never reset on a transient offline blip — the same JIT
+    /// registration spans the blip, so the idle clock must not restart.
+    var onlineSince: Date?
     init(
       name: String, remoteId: Int?, phase: ManagedRunner.Phase, provider: RunnerProvider,
       startedAt: Date
@@ -698,9 +709,17 @@ public final class RunnerOrchestrator {
       // from under, which would orphan the job).
       slot.unhealthySince = nil
       slot.confirmedOnline = true  // a later quick exit is a run, not a launch failure
+      if slot.onlineSince == nil { slot.onlineSince = now }  // idle-refresh clock: from registration, not launch
       consecutiveLaunchFailures = 0  // a runner reached GitHub: launches work again
+      // Idle age is measured from `onlineSince` (registration), NOT `startedAt`
+      // (launch): boot time is not idle time. A runner that just came online has
+      // had zero idle time regardless of how long it booted, so a slow-booting
+      // provider gets its FULL window to claim a queued job before being reaped.
+      // (Reaping a never-online or sustained-offline runner is the separate
+      // launch-age/grace logic above; this branch only runs while online.)
       if let idleJITRefreshInterval, idleJITRefreshInterval >= 0,
-        let remoteRunner, !remoteRunner.busy, age >= idleJITRefreshInterval
+        let remoteRunner, !remoteRunner.busy,
+        now.timeIntervalSince(slot.onlineSince ?? now) >= idleJITRefreshInterval
       {
         refresh.append((slot, remoteRunner))
       }

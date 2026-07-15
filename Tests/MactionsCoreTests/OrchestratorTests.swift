@@ -951,6 +951,48 @@ final class OrchestratorTests: XCTestCase {
     await orch.stop()
   }
 
+  /// The idle-JIT-refresh clock runs from when a runner comes ONLINE, not from
+  /// launch. A slow-booting provider (a Windows-ARM VM cold-boots in ~6-7 min,
+  /// well past the 8-min refresh) must still get its FULL window to claim a
+  /// queued job once it registers. Regression for the churn where such runners
+  /// were reaped ~1-2 min after registering and relaunched forever while the
+  /// job stayed queued (`startedAt`-clocked refresh charged boot time as idle).
+  func testIdleRefreshClockRunsFromOnlineNotLaunch() async {
+    let refreshInterval: TimeInterval = 0.4
+    let (orch, cp, factory) = makeOrchestrator(
+      count: 1, reconcileInterval: 50_000_000, idleJITRefreshInterval: refreshInterval)
+    await orch.start()
+    let runner = try! XCTUnwrap(orch.runners.first)
+
+    // Simulate a boot LONGER than the refresh interval, still offline/unconfirmed.
+    // The grace + never-confirmed intervals are minutes (test defaults), so a
+    // sub-second "boot" is nowhere near being reaped as offline/zombie.
+    cp.remote = []
+    try? await Task.sleep(nanoseconds: 500_000_000)  // 0.5s > 0.4s: time-since-LAUNCH now exceeds the interval
+
+    // NOW it registers. Under the old launch-clocked code it would be refreshed
+    // on the very next tick (launch age already exceeds the interval); the fix
+    // starts its idle clock here, so it is left alone to claim its job.
+    cp.remote = [
+      RemoteRunner(id: runner.remoteId!, name: runner.id, status: "online", busy: false)
+    ]
+    try? await Task.sleep(nanoseconds: 200_000_000)  // 0.2s ONLINE, still < 0.4s interval
+
+    XCTAssertEqual(
+      cp.jitCount, 1,
+      "a just-registered idle runner must NOT be refreshed yet, even though it booted longer than the interval")
+    XCTAssertFalse(factory.made[0].stopped)
+    XCTAssertEqual(orch.runners.first?.id, runner.id)
+
+    // Once it HAS been online a full interval and is still idle, the normal
+    // refresh fires — the mechanism still works, it is just correctly clocked.
+    await waitUntil {
+      cp.jitCount >= 2 && factory.made[0].stopped && orch.runners.first?.id != runner.id
+    }
+    XCTAssertGreaterThanOrEqual(cp.jitCount, 2)
+    await orch.stop()
+  }
+
   // MARK: Teardown
 
   /// stop() deregisters exactly the runners THIS orchestrator owns — never a
