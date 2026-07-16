@@ -319,20 +319,23 @@ public final class RunnerOrchestrator {
   /// healthy-but-slow runners get reaped mid-boot and re-provisioned forever (a
   /// relaunch loop). Linux containers / local macOS register within seconds, so
   /// 120s clears an egress-failed zombie fast (the 4d428fb intent). A Windows VM
-  /// legitimately needs minutes — clone boot, autologon, the in-guest JIT-disc
-  /// wait, then `run.cmd` registration; `WindowsVMProvider` alone allows 300s
-  /// just to reach powered-on — so it gets that full boot budget plus a
-  /// registration margin. Pass the initializer arg explicitly to opt out.
+  /// legitimately needs 6–7 minutes in cold-boot observations — clone boot,
+  /// autologon, the in-guest JIT-disc wait, then `run.cmd` registration — so a
+  /// 360s reaper can kill a healthy-but-slow guest immediately before it comes
+  /// online. Give Windows 10 minutes: above the observed boot tail and the
+  /// guest's explicit 120s no-JIT diagnosis, still far below the provider's
+  /// multi-hour hung-job watchdog. Pass the initializer arg explicitly to opt
+  /// out.
   static func defaultNeverConfirmedReapInterval(for os: RunnerOS) -> TimeInterval {
-    os == .windows ? 360 : 120
+    os == .windows ? 10 * 60 : 120
   }
 
   /// The sustained-offline grace before a runner GitHub no longer lists online is
   /// reaped as dead. Kept in lock-step with the never-confirmed window above for
   /// Windows, so a slow-booting VM isn't torn down by *this* second reap path
-  /// before it can register either (both 360s on Windows; 120s / 300s elsewhere).
+  /// before it can register either (both 600s on Windows; 120s / 300s elsewhere).
   static func defaultRemoteRegistrationGraceInterval(for os: RunnerOS) -> TimeInterval {
-    os == .windows ? 360 : 5 * 60
+    os == .windows ? 10 * 60 : 5 * 60
   }
 
   public init(
@@ -656,7 +659,7 @@ public final class RunnerOrchestrator {
     let byId = Dictionary(remote.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
     let byName = Dictionary(remote.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
     let now = Date()
-    var stale: [(slot: Slot, remote: RemoteRunner?)] = []
+    var stale: [(slot: Slot, remote: RemoteRunner?, reason: String)] = []
     var refresh: [(slot: Slot, remote: RemoteRunner)] = []
 
     for slot in slots {
@@ -682,7 +685,7 @@ public final class RunnerOrchestrator {
           lastError =
             "Runner \(slot.name) registered but never reached GitHub within "
             + "\(Int(neverConfirmedReapInterval))s — reaping (check network/egress)."
-          stale.append((slot, remoteRunner))
+          stale.append((slot, remoteRunner, "never_confirmed_online"))
           continue
         }
         // Missing from GitHub's list, or not online. Prune ONLY after SUSTAINED
@@ -698,7 +701,7 @@ public final class RunnerOrchestrator {
         if age >= remoteRegistrationGraceInterval,
           now.timeIntervalSince(slot.unhealthySince ?? now) >= remoteRegistrationGraceInterval
         {
-          stale.append((slot, remoteRunner))
+          stale.append((slot, remoteRunner, "sustained_unhealthy"))
         }
         continue
       }
@@ -709,7 +712,14 @@ public final class RunnerOrchestrator {
       // from under, which would orphan the job).
       slot.unhealthySince = nil
       slot.confirmedOnline = true  // a later quick exit is a run, not a launch failure
-      if slot.onlineSince == nil { slot.onlineSince = now }  // idle-refresh clock: from registration, not launch
+      if slot.onlineSince == nil {
+        slot.onlineSince = now  // idle-refresh clock: from registration, not launch
+        ControlPlaneLog.log(
+          "runner.online",
+          ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+           "runner": slot.name,
+           "bootSeconds": String(Int(max(0, now.timeIntervalSince(slot.startedAt))))])
+      }
       consecutiveLaunchFailures = 0  // a runner reached GitHub: launches work again
       // Idle age is measured from `onlineSince` (registration), NOT `startedAt`
       // (launch): boot time is not idle time. A runner that just came online has
@@ -744,6 +754,11 @@ public final class RunnerOrchestrator {
       let staleIds = Set(stale.map { ObjectIdentifier($0.slot) })
       for item in stale {
         item.slot.reaped = true  // before stop(): its onExit can fire immediately
+        ControlPlaneLog.log(
+          "runner.reap",
+          ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+           "runner": item.slot.name, "reason": item.reason,
+           "lifetimeSeconds": String(Int(max(0, now.timeIntervalSince(item.slot.startedAt))))])
         stopProviderOffMain(item.slot)
       }
       slots.removeAll { staleIds.contains(ObjectIdentifier($0)) }
@@ -769,6 +784,12 @@ public final class RunnerOrchestrator {
         continue
       }
       guard epoch == myEpoch, state == .online else { return health }
+      ControlPlaneLog.log(
+        "runner.reap",
+        ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+         "runner": item.slot.name, "reason": "idle_jit_refresh",
+         "onlineSeconds": String(Int(max(0, now.timeIntervalSince(item.slot.onlineSince ?? now)))),
+         "lifetimeSeconds": String(Int(max(0, now.timeIntervalSince(item.slot.startedAt))))])
       stopProviderOffMain(item.slot)
       slots.removeAll { $0 === item.slot }
       notify()
@@ -901,6 +922,10 @@ public final class RunnerOrchestrator {
     // happens at append time).
     guard slot.appended else {
       slot.earlyExitStatus = status
+      ControlPlaneLog.log(
+        "runner.exit",
+        ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+         "runner": slot.name, "status": String(status), "classification": "during_launch"])
       return
     }
 
@@ -915,9 +940,18 @@ public final class RunnerOrchestrator {
     // retry. (Trade-off: a REAL job that fails in under the grace on a runner
     // we never saw online skips local history — GitHub's run history still has
     // it.)
-    if status != 0, !slot.confirmedOnline, !slot.reaped,
-      Date().timeIntervalSince(slot.startedAt) < launchFailureGraceInterval
-    {
+    let lifetime = Date().timeIntervalSince(slot.startedAt)
+    let launchFailure = status != 0 && !slot.confirmedOnline && !slot.reaped
+      && lifetime < launchFailureGraceInterval
+    ControlPlaneLog.log(
+      "runner.exit",
+      ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+       "runner": slot.name, "status": String(status),
+       "classification": launchFailure
+         ? "launch_failure" : (slot.reaped ? "maintenance" : "natural"),
+       "confirmedOnline": String(slot.confirmedOnline),
+       "lifetimeSeconds": String(Int(max(0, lifetime)))])
+    if launchFailure {
       consecutiveLaunchFailures += 1
       lastError = "Runner \(slot.name) exited during launch (status \(status))."
       releaseBudget(slot)

@@ -144,6 +144,12 @@ RECORDED_BUILD=""
 # ~/.mactions/windows-base.recipe on a successful build, and MUST stay equal to
 # WindowsImage.currentProvisioningRecipeVersion (a unit test enforces that), which
 # the app reads to decide whether a built base needs a rebuild.
+# v14: run-job.ps1 writes an explicit infrastructure outcome (success, no-jit,
+# or runner-exit:N) and leaves VMware Tools up for a short capture window. The
+# host also redundantly copies the JIT through Tools to close a virtual-CD
+# visibility failure. It no longer mistakes every guest power-off - including
+# the broken/missing config-disc branch - for a completed run, and preserves the
+# guest transcript for failures before destroying the clone.
 # v13: three hosted-parity OS-semantic fixes, all sentinel-verified: Git moves
 # to C:\Program Files\Git with the full hosted machine-PATH composition - \cmd,
 # the mingw \bin (clangarm64 on ARM64), \usr\bin (PathOption=CmdTools adds all
@@ -180,7 +186,7 @@ RECORDED_BUILD=""
 # v4: bootstrap.ps1 verifies git/bash/pwsh before the sentinel (+ retries their
 # downloads). v3 bases can be silently missing those tools (a swallowed transient
 # download failure still snapshotted), so they warrant a rebuild to a verified v4.
-PROVISIONING_RECIPE_VERSION=13
+PROVISIONING_RECIPE_VERSION=14
 
 # Fetch a UUP dump URL with backoff, writing the body to OUTFILE. Retries on
 # network errors, HTTP 429 (UUP dump's ~20-25s per-IP throttle), and 5xx; fails

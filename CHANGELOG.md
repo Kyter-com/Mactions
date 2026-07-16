@@ -3,6 +3,22 @@
 All notable changes to Mactions are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Windows runners no longer lose most of their assignment window to VM boot.**
+  The idle-JIT refresh now starts when GitHub first reports a runner online, not
+  when its VM launched, and the Windows never-confirmed/offline grace rises from
+  6 to 10 minutes to cover the observed 6–7 minute cold-boot tail.
+- **A missing JIT disc can no longer masquerade as a completed Windows run.**
+  Recipe v14 redundantly delivers the byte-exact JIT through VMware Tools, then
+  requires the guest to publish `success`, `no-jit`, or `runner-exit:N` before
+  shutdown. Failure transcripts persist under `~/.mactions/logs/`; runner
+  online/reap/exit timing is also recorded in the control-plane JSONL log.
+  Existing recipe-v13 bases remain compatible until the rebuild nudge is acted
+  on, at which point strict outcome verification activates.
+
 ## [0.1.7] - 2026-07-07
 
 ### Fixed

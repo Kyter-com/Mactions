@@ -953,10 +953,11 @@ final class OrchestratorTests: XCTestCase {
 
   /// The idle-JIT-refresh clock runs from when a runner comes ONLINE, not from
   /// launch. A slow-booting provider (a Windows-ARM VM cold-boots in ~6-7 min,
-  /// well past the 8-min refresh) must still get its FULL window to claim a
-  /// queued job once it registers. Regression for the churn where such runners
-  /// were reaped ~1-2 min after registering and relaunched forever while the
-  /// job stayed queued (`startedAt`-clocked refresh charged boot time as idle).
+  /// consuming most of the old launch-clocked 8-min refresh) must still get its
+  /// FULL window to claim a queued job once it registers. Regression for the
+  /// churn where such runners were reaped ~1-2 min after registering and
+  /// relaunched forever while the job stayed queued (`startedAt`-clocked
+  /// refresh charged boot time as idle).
   func testIdleRefreshClockRunsFromOnlineNotLaunch() async {
     let refreshInterval: TimeInterval = 0.4
     let (orch, cp, factory) = makeOrchestrator(
@@ -991,6 +992,15 @@ final class OrchestratorTests: XCTestCase {
     }
     XCTAssertGreaterThanOrEqual(cp.jitCount, 2)
     await orch.stop()
+  }
+
+  func testWindowsRegistrationGracesCoverObservedColdBootTail() {
+    XCTAssertEqual(
+      RunnerOrchestrator.defaultNeverConfirmedReapInterval(for: .windows), 10 * 60)
+    XCTAssertEqual(
+      RunnerOrchestrator.defaultRemoteRegistrationGraceInterval(for: .windows), 10 * 60)
+    XCTAssertEqual(RunnerOrchestrator.defaultNeverConfirmedReapInterval(for: .linux), 120)
+    XCTAssertEqual(RunnerOrchestrator.defaultRemoteRegistrationGraceInterval(for: .macOS), 5 * 60)
   }
 
   // MARK: Teardown

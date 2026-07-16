@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # mactions-fusion-vm — per-clone VMware Fusion lifecycle, called by `VMwareCLI`
-# (Swift) with verb args (clone/start/status/stop/delete/list/base-status) so it
+# (Swift) with verb args (clone/start/status/deliver-jit/outcome/capture-log/stop/delete/
+# list/base-status) so it
 # slots into the existing WindowsVMCLI abstraction without exposing vmrun's
 # quirks (no getstate; running-state is read from `vmrun list`; the per-clone
 # config-ISO is wired onto a SATA cdrom by editing the clone .vmx) to Swift.
@@ -27,6 +28,10 @@
 #                                       #   then point sata0:0 at <clone>/config.iso
 #   start   <clone-name>               # vmrun start <vmx> nogui (headless)
 #   status  <clone-name>               # echo "running" or "stopped"
+#   deliver-jit <clone-name> <source>   # Tools copy to C:\setup\jitconfig
+#   outcome <clone-name>                # "pending" | "success" | "no-jit" |
+#                                       #   "runner-exit:<status>"
+#   capture-log <clone-name> <dest>     # copy C:\setup\logs\run-job.log
 #   stop    <clone-name>               # vmrun stop <vmx> hard; idempotent
 #   delete  <clone-name>               # stop + vmrun deleteVM + rm -rf; idempotent
 #   list                               # one clone-name per line (for sweep)
@@ -54,6 +59,11 @@ FUSION_DIR="${MACTIONS_ROOT}/fusion"
 # name once at build time; every per-job clone links from it (instant + minimal
 # disk). Overridable for future multi-base/test scenarios.
 SNAPSHOT="${MACTIONS_FUSION_SNAPSHOT:-base-provisioned}"
+GUEST_USER="${MACTIONS_GUEST_USER:-runner}"
+GUEST_PW="${MACTIONS_GUEST_PW:-P@ssw0rd-throwaway}"
+GUEST_OUTCOME='C:\setup\logs\run-outcome.txt'
+GUEST_RUN_LOG='C:\setup\logs\run-job.log'
+GUEST_JIT='C:\setup\jitconfig'
 
 die()  { echo "error: $*" >&2; exit 1; }
 note() { echo "[mactions-fusion-vm] $*" >&2; }
@@ -206,6 +216,69 @@ cmd_status() {
   if vmrun_list_contains "$vmx"; then echo "running"; else echo "stopped"; fi
 }
 
+# Redundant delivery for recipe-v14+ guests. The config ISO remains primary and
+# is available from the beginning of boot; once VMware Tools answers, this copy
+# gives run-job.ps1 the same byte-exact JIT at a fixed local path if Fusion did
+# not expose the virtual CD reliably. Only the host source PATH is in argv - the
+# encoded registration credential remains in the file and the throwaway guest.
+cmd_deliver_jit() {
+  local clone="$1" source="$2"
+  [[ -n "$clone" && -n "$source" ]] || die "usage: deliver-jit <clone-name> <source>"
+  [[ -s "$source" ]] || die "JIT source is missing or empty: $source"
+  local vmx; vmx="$(clone_vmx "$clone")"
+  [[ -f "$vmx" ]] || die "clone vmx not found: $vmx"
+  vmrun_list_contains "$vmx" || die "clone is not running: $clone"
+  "$VMRUN" -T fusion -gu "$GUEST_USER" -gp "$GUEST_PW" \
+    copyFileFromHostToGuest "$vmx" "$source" "$GUEST_JIT" >/dev/null
+}
+
+# Read the recipe-v14+ guest outcome while the VM and VMware Tools are still
+# running. `pending` is deliberately a successful helper result: Tools may not
+# be up yet, the runtime may still be waiting/working, or an older base may not
+# implement the marker. Swift decides whether a missing marker is required for
+# the recorded base recipe.
+cmd_outcome() {
+  local clone="$1"
+  [[ -n "$clone" ]] || die "usage: outcome <clone-name>"
+  local vmx; vmx="$(clone_vmx "$clone")"
+  [[ -f "$vmx" ]] || { echo "pending"; return 0; }
+  vmrun_list_contains "$vmx" || { echo "pending"; return 0; }
+
+  local exists
+  exists="$("$VMRUN" -T fusion -gu "$GUEST_USER" -gp "$GUEST_PW" \
+    fileExistsInGuest "$vmx" "$GUEST_OUTCOME" 2>/dev/null || true)"
+  case "$exists" in
+    *"file exists"*) ;;
+    *) echo "pending"; return 0 ;;
+  esac
+
+  local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/mactions-outcome.XXXXXX")"
+  if "$VMRUN" -T fusion -gu "$GUEST_USER" -gp "$GUEST_PW" \
+    copyFileFromGuestToHost "$vmx" "$GUEST_OUTCOME" "$tmp" >/dev/null 2>&1; then
+    tr -d '\r\n' < "$tmp"
+    printf '\n'
+  else
+    echo "pending"
+  fi
+  rm -f "$tmp"
+}
+
+# Preserve the completed guest transcript before deleteVM destroys the clone.
+# Used only for infrastructure failures, so successful runs continue to rely on
+# GitHub's authoritative Actions log and do not grow a second local log archive.
+cmd_capture_log() {
+  local clone="$1" destination="$2"
+  [[ -n "$clone" && -n "$destination" ]] \
+    || die "usage: capture-log <clone-name> <destination>"
+  local vmx; vmx="$(clone_vmx "$clone")"
+  [[ -f "$vmx" ]] || die "clone vmx not found: $vmx"
+  vmrun_list_contains "$vmx" || die "clone is not running: $clone"
+  mkdir -p "$(dirname "$destination")"
+  "$VMRUN" -T fusion -gu "$GUEST_USER" -gp "$GUEST_PW" \
+    copyFileFromGuestToHost "$vmx" "$GUEST_RUN_LOG" "$destination" >/dev/null
+  [[ -s "$destination" ]] || die "guest run log copy was empty: $destination"
+}
+
 cmd_stop() {
   local clone="$1"
   [[ -n "$clone" ]] || die "usage: stop <clone-name>"
@@ -253,6 +326,9 @@ case "$verb" in
   clone)        cmd_clone       "${1:-}" "${2:-}" ;;
   start)        cmd_start       "${1:-}" ;;
   status)       cmd_status      "${1:-}" ;;
+  deliver-jit)  cmd_deliver_jit "${1:-}" "${2:-}" ;;
+  outcome)      cmd_outcome     "${1:-}" ;;
+  capture-log)  cmd_capture_log "${1:-}" "${2:-}" ;;
   stop)         cmd_stop        "${1:-}" ;;
   delete)       cmd_delete      "${1:-}" ;;
   list)         cmd_list ;;
@@ -263,6 +339,9 @@ Usage:
   mactions-fusion-vm clone        <base-name> <clone-name>
   mactions-fusion-vm start        <clone-name>
   mactions-fusion-vm status       <clone-name>   # echoes "running" or "stopped"
+  mactions-fusion-vm deliver-jit  <clone-name> <source>
+  mactions-fusion-vm outcome      <clone-name>   # "pending" | "success" | "no-jit" | "runner-exit:N"
+  mactions-fusion-vm capture-log  <clone-name> <destination>
   mactions-fusion-vm stop         <clone-name>
   mactions-fusion-vm delete       <clone-name>
   mactions-fusion-vm list

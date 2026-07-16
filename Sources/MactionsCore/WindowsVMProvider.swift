@@ -13,7 +13,9 @@ import Foundation
 /// carrying the JIT registration into the guest; the in-guest runtime reads it,
 /// runs `run.cmd --jitconfig` (registering OUTBOUND to GitHub) for ONE job, then
 /// powers the VM off. The host learns completion purely by polling VM **power
-/// state**.
+/// state**, plus a small guest-written outcome marker copied through VMware
+/// Tools before shutdown. Power-off alone is not success: the guest also powers
+/// off after a missing JIT disc or runner bootstrap failure.
 public protocol WindowsVMCLI: Sendable {
   /// Absolute path to the CLI binary (the `mactions-fusion-vm` helper).
   var executable: String { get }
@@ -30,6 +32,16 @@ public protocol WindowsVMCLI: Sendable {
   func deleteArgs(clone: String) -> [String]
   /// Query the clone's power state. The provider parses it via `parseIsStopped`.
   func statusArgs(clone: String) -> [String]
+  /// Read the per-run outcome marker while VMware Tools is still available.
+  /// Prints `pending`, `success`, `no-jit`, or `runner-exit:<status>`.
+  func guestOutcomeArgs(clone: String) -> [String]
+  /// Redundant JIT delivery through VMware Tools. The config ISO remains the
+  /// boot-time primary channel; this guest copy closes an intermittent virtual
+  /// CD visibility/attach failure without putting the encoded JIT in argv.
+  func deliverJITArgs(clone: String, source: String) -> [String]
+  /// Copy the guest's per-run transcript to a durable host path before the
+  /// throwaway clone is destroyed.
+  func captureGuestLogArgs(clone: String, destination: String) -> [String]
   /// Query the BASE image's readiness — the helper's `base-status` verb checks
   /// the base `.vmx` exists, carries the linked-clone snapshot, and isn't
   /// powered on (prints "stopped" when ready to clone from).
@@ -59,6 +71,48 @@ public enum WindowsInjectionPlan: Equatable, Sendable {
 /// `.running` once before treating `.stopped` as "the job finished and the guest
 /// powered itself off" — a freshly cloned (not-yet-started) VM also reads stopped.
 public enum VMPhase: Equatable, Sendable { case starting, running, stopped }
+
+/// Infrastructure outcome emitted by recipe-v14+ `run-job.ps1`. This is NOT
+/// the workflow conclusion (GitHub owns that); it says whether the ephemeral
+/// runner process completed its one-run lifecycle or the guest shut down
+/// without ever starting it successfully.
+enum WindowsGuestOutcome: Equatable, Sendable, CustomStringConvertible {
+  case success
+  case noJIT
+  case runnerExit(Int32)
+
+  /// `nil` means the marker is not ready (or malformed/partial): keep polling
+  /// while the VM is running. Once the VM stops, a required-but-missing marker
+  /// is classified as infrastructure failure by the provider.
+  static func parse(_ output: String) -> Self? {
+    let value = output.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if value == "success" { return .success }
+    if value == "no-jit" { return .noJIT }
+    let prefix = "runner-exit:"
+    if value.hasPrefix(prefix),
+      let status = Int32(value.dropFirst(prefix.count))
+    {
+      return .runnerExit(status)
+    }
+    return nil
+  }
+
+  var exitStatus: Int32 {
+    switch self {
+    case .success: return 0
+    case .noJIT: return 1
+    case let .runnerExit(status): return status == 0 ? 1 : status
+    }
+  }
+
+  var description: String {
+    switch self {
+    case .success: return "success"
+    case .noJIT: return "no-jit"
+    case let .runnerExit(status): return "runner-exit:\(status)"
+    }
+  }
+}
 
 extension WindowsVMCLI {
   /// Default power-state read: mentions "stopped" and isn't mid-transition.
@@ -92,7 +146,8 @@ extension WindowsVMCLI {
 /// Injection model: provider `inject()` copies the per-job config ISO into
 /// `<clone-dir>/config.iso`; the helper's `clone` step has already wired
 /// `sata0:0` to that path with `startConnected=TRUE`, so Fusion connects it as a
-/// CD at power-on — no new Swift injection plumbing, reusing `.copyConfigFile`.
+/// CD at power-on. Recipe-v14+ then redundantly copies the same staging JIT to
+/// `C:\setup\jitconfig` once VMware Tools answers.
 public struct VMwareCLI: WindowsVMCLI {
   public let executable: String
   /// Where the base + per-clone subdirs live. The helper builds `<dir>/<clone>/`.
@@ -115,6 +170,13 @@ public struct VMwareCLI: WindowsVMCLI {
   public func forceStopArgs(clone: String) -> [String] { ["stop", clone] }
   public func deleteArgs(clone: String) -> [String] { ["delete", clone] }
   public func statusArgs(clone: String) -> [String] { ["status", clone] }
+  public func guestOutcomeArgs(clone: String) -> [String] { ["outcome", clone] }
+  public func deliverJITArgs(clone: String, source: String) -> [String] {
+    ["deliver-jit", clone, source]
+  }
+  public func captureGuestLogArgs(clone: String, destination: String) -> [String] {
+    ["capture-log", clone, destination]
+  }
   /// The helper has a dedicated `base-status` verb (base .vmx exists + carries
   /// the linked-clone snapshot + isn't powered on → "stopped"; else "in-use" /
   /// "no-snapshot" / "missing"). Mapped to the same parseIsStopped path so
@@ -153,11 +215,13 @@ public struct VMwareCLI: WindowsVMCLI {
 ///   2. **Build** a tiny per-clone **config ISO** carrying the JIT config.
 ///   3. **Inject** it: copy the config ISO to that `<clone-dir>/config.iso` path
 ///      (the wired CD), while the clone is still powered off.
-///   4. **Start** headless. The base image's in-guest runtime (a logon Scheduled
-///      Task from `bootstrap.ps1`) reads the JIT off the disc, runs
+///   4. **Start** headless and redundantly copy the JIT through VMware Tools.
+///      The base image's in-guest runtime (a logon Scheduled Task from
+///      `bootstrap.ps1`) reads the disc or local copy, runs
 ///      `run.cmd --jitconfig` for ONE job (registering OUTBOUND to GitHub), then
-///      `shutdown /s`.
-///   5. **Detect completion by power state**: poll `status` until the guest has
+///      writes an infrastructure outcome marker and `shutdown /s`.
+///   5. **Detect completion**: read the marker through VMware Tools, preserving
+///      the guest transcript on failure, then poll `status` until the guest has
 ///      powered itself off (after first confirming it reached `.running`).
 ///   6. **Destroy** the clone on every path, then fire `onExit`.
 ///
@@ -203,6 +267,9 @@ public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
   /// the clone, and the poll/escalation interval. Injectable so tests run fast.
   private let stopSettleTimeout: TimeInterval
   private let stopPollInterval: TimeInterval
+  /// Recipe-v14+ guests emit a verified completion marker. Older bases remain
+  /// usable during the rebuild nudge and retain the legacy power-off behavior.
+  private let requiresGuestOutcome: Bool
 
   /// Clone name carries the same `mactions-` prefix `HostCleanup` and the
   /// orchestrator use to identify (and reap) our own VMs.
@@ -213,9 +280,12 @@ public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
   /// thread and `stop()` from racing to delete the VM / fire `onExit` twice.
   private var tornDown = false
   /// Per-clone scratch dir (config ISO + staging); removed on teardown. The
-  /// guest reads the JIT off the copy on the clone's wired CD, so this staging
-  /// dir is only needed until `inject()` copies it into the clone dir.
+  /// staging JIT stays until then because recipe-v14+ also copies it through
+  /// VMware Tools as a redundant delivery channel after the guest starts.
   private var configWorkdir: String?
+  /// Exact plaintext JIT staging file. Recipe-v14+ providers also copy it into
+  /// the running guest through VMware Tools as a redundant delivery channel.
+  private var jitConfigFile: String?
   private let lock = NSLock()
 
   public init(
@@ -227,7 +297,8 @@ public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
     jobTimeout: TimeInterval = WindowsVMProvider.defaultJobTimeout,
     pollInterval: TimeInterval = 5,
     stopSettleTimeout: TimeInterval = 12,
-    stopPollInterval: TimeInterval = 1.5
+    stopPollInterval: TimeInterval = 1.5,
+    requiresGuestOutcome: Bool = false
   ) {
     self.id = id
     self.baseImage = baseImage
@@ -238,6 +309,7 @@ public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
     self.pollInterval = pollInterval
     self.stopSettleTimeout = stopSettleTimeout
     self.stopPollInterval = stopPollInterval
+    self.requiresGuestOutcome = requiresGuestOutcome
   }
 
   public var isRunning: Bool {
@@ -296,13 +368,37 @@ public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
         Thread.sleep(forTimeInterval: pollInterval)
       }
       if sawRunning {
-        // PHASE 2 — the guest runs its single job, then `shutdown /s`. Wait for
-        // the self power-off (the only completion signal — no SSH/exit code; the
-        // authoritative job result is on GitHub).
+        // PHASE 2 — the guest runs its single job, writes a small outcome marker,
+        // leaves VMware Tools up briefly so we can read it/capture a failure log,
+        // then `shutdown /s`. The authoritative workflow result remains GitHub's;
+        // this marker distinguishes a clean runner lifetime from infrastructure
+        // failures that also intentionally power the guest off.
         let jobDeadline = Date().addingTimeInterval(jobTimeout)
         var done = false
+        var guestOutcome: WindowsGuestOutcome?
+        var guestLogPath: String?
+        var deliveredJITFallback = false
         while Date() < jobDeadline {
           if isTornDown { return }  // torn down meanwhile — stop polling a gone VM
+          if requiresGuestOutcome {
+            if !deliveredJITFallback, deliverJITFallback() {
+              deliveredJITFallback = true
+              ControlPlaneLog.log(
+                "windows.jit_guest_copy_delivered",
+                ["runner": id, "clone": cloneName])
+            }
+            if guestOutcome == nil,
+              let r = try? Shell.run(cli.executable, cli.guestOutcomeArgs(clone: cloneName)), r.ok
+            {
+              guestOutcome = WindowsGuestOutcome.parse(r.stdout)
+            }
+            // The transcript is only worth retaining for infrastructure
+            // failures. Retry the best-effort copy during the guest's shutdown
+            // grace window until it lands or the VM powers off.
+            if let guestOutcome, guestOutcome.exitStatus != 0, guestLogPath == nil {
+              guestLogPath = captureGuestLog()
+            }
+          }
           if let r = try? Shell.run(cli.executable, cli.statusArgs(clone: cloneName)), r.ok,
             phase(from: r.stdout) == .stopped
           {
@@ -311,9 +407,40 @@ public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
           }
           Thread.sleep(forTimeInterval: pollInterval)
         }
-        status = done ? 0 : 1  // timeout (hung guest) -> failure; teardown force-kills
+        if !done {
+          status = 1  // timeout (hung guest) -> failure; teardown force-kills
+          ControlPlaneLog.log(
+            "windows.guest_timeout",
+            ["runner": id, "clone": cloneName, "seconds": String(Int(jobTimeout))])
+        } else if requiresGuestOutcome {
+          if let guestOutcome {
+            status = guestOutcome.exitStatus
+            var fields = [
+              "runner": id, "clone": cloneName, "outcome": guestOutcome.description,
+              "status": String(status),
+            ]
+            if let guestLogPath { fields["guestLog"] = guestLogPath }
+            ControlPlaneLog.log("windows.guest_outcome", fields)
+          } else {
+            // Recipe-v14+ promises a marker on every intentional shutdown. A
+            // bare power-off is therefore unverified infrastructure failure,
+            // never a completed run.
+            status = 1
+            ControlPlaneLog.log(
+              "windows.guest_outcome_missing",
+              ["runner": id, "clone": cloneName])
+          }
+        } else {
+          // A v13-or-older base has no marker. Keep it operational while the
+          // existing recipe-staleness UI asks the user to rebuild.
+          status = 0
+          ControlPlaneLog.log(
+            "windows.guest_outcome_legacy",
+            ["runner": id, "clone": cloneName])
+        }
       } else {
         status = 1  // never booted
+        ControlPlaneLog.log("windows.guest_never_booted", ["runner": id, "clone": cloneName])
       }
       if teardown() { onExit(status) }
     }
@@ -343,6 +470,39 @@ public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
     return .starting
   }
 
+  /// Pull the guest transcript while Tools is still running. The helper owns
+  /// authentication and the `copyFileFromGuestToHost` shape; Swift only chooses
+  /// the durable destination. Runner names are generated from a fixed safe
+  /// alphabet, so they are valid leaf filenames.
+  private func captureGuestLog() -> String? {
+    let destination = HostCleanup.logsRoot()
+      .appendingPathComponent("windows-run-\(id).log", isDirectory: false).path
+    try? FileManager.default.createDirectory(
+      at: HostCleanup.logsRoot(), withIntermediateDirectories: true)
+    guard let result = try? Shell.run(
+      cli.executable,
+      cli.captureGuestLogArgs(clone: cloneName, destination: destination)),
+      result.ok, FileManager.default.fileExists(atPath: destination)
+    else { return nil }
+    return destination
+  }
+
+  /// Best-effort redundant delivery to `C:\setup\jitconfig`. The source path,
+  /// not the credential itself, is passed in argv; the helper uses VMware Tools'
+  /// local guest operation and returns non-zero until Tools is ready, so the
+  /// phase-2 loop simply retries. Old bases are gated out because they do not
+  /// scan this path.
+  private func deliverJITFallback() -> Bool {
+    lock.lock()
+    let source = jitConfigFile
+    lock.unlock()
+    guard let source, FileManager.default.fileExists(atPath: source),
+      let result = try? Shell.run(
+        cli.executable, cli.deliverJITArgs(clone: cloneName, source: source))
+    else { return false }
+    return result.ok
+  }
+
   // MARK: Per-clone config ISO + injection
 
   /// Build the per-clone config ISO carrying the JIT at `mactions/jitconfig`
@@ -352,12 +512,16 @@ public final class WindowsVMProvider: RunnerProvider, @unchecked Sendable {
     let work = NSTemporaryDirectory() + "mactions-cfg-\(cloneName)"
     let staging = work + "/payload"
     let macDir = staging + "/mactions"
+    let jitFile = macDir + "/jitconfig"
     let iso = work + "/config.iso"
-    lock.lock(); configWorkdir = work; lock.unlock()
+    lock.lock()
+    configWorkdir = work
+    jitConfigFile = jitFile
+    lock.unlock()
     let fm = FileManager.default
     try? fm.removeItem(atPath: work)
     try fm.createDirectory(atPath: macDir, withIntermediateDirectories: true)
-    try Data(jitConfig.utf8).write(to: URL(fileURLWithPath: macDir + "/jitconfig"))
+    try Data(jitConfig.utf8).write(to: URL(fileURLWithPath: jitFile))
     try Shell.runChecked(
       WindowsImage.hdiutilPath(),
       WindowsImage.configISOArgs(sourceDir: staging, output: iso, volumeName: configVolumeName))
@@ -433,14 +597,22 @@ public struct WindowsVMProviderFactory: RunnerProviderFactory {
   public var kind: String { "Windows VM — \(cli.displayName) (throwaway clone, destroyed each run)" }
   private let baseImage: String
   private let cli: WindowsVMCLI
+  private let requiresGuestOutcome: Bool
 
-  public init(baseImage: String, cli: WindowsVMCLI) {
+  public init(
+    baseImage: String, cli: WindowsVMCLI,
+    requiresGuestOutcome: Bool = (WindowsImage.recordedRecipeVersion() ?? 0)
+      >= WindowsImage.guestOutcomeRecipeVersion
+  ) {
     self.baseImage = baseImage
     self.cli = cli
+    self.requiresGuestOutcome = requiresGuestOutcome
   }
 
   public func makeProvider(name: String) -> RunnerProvider {
-    WindowsVMProvider(id: name, baseImage: baseImage, cli: cli)
+    WindowsVMProvider(
+      id: name, baseImage: baseImage, cli: cli,
+      requiresGuestOutcome: requiresGuestOutcome)
   }
 
   /// Resolve the `scripts/mactions-fusion-vm` lifecycle helper at module-load

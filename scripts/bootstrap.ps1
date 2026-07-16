@@ -21,12 +21,14 @@
 
   Per job, the host clones this base, injects a tiny config ISO carrying the JIT
   registration (VMware Fusion: the clone's sata0:0 CD is wired to it at clone
-  time), and boots the clone headless. run-job.ps1 then:
-    - finds the JIT on the config disc (by volume label / drive scan),
+  time), boots the clone headless, then redundantly copies the same JIT through
+  VMware Tools to close a virtual-CD visibility failure. run-job.ps1 then:
+    - finds the JIT on the config disc or fixed local fallback,
     - runs `run.cmd --jitconfig <JIT>` for exactly ONE job (registers OUTBOUND to
       GitHub, auto-deregisters when done),
-    - powers the VM off. The host detects completion purely by polling VM power
-      state, then deletes the clone. Nothing inbound, nothing left behind.
+    - writes an infrastructure outcome and powers the VM off. The host verifies
+      that outcome, polls VM power state, then deletes the clone. Nothing
+      inbound, nothing left behind.
 
   After this script finishes, SHUT THE VM DOWN - the powered-off VM is the
   pristine base image. Runs under in-box Windows PowerShell 5.1, so everything
@@ -405,22 +407,41 @@ if (-not (Test-Path (Join-Path $RunnerRoot 'run.cmd'))) {
 $JobScript = 'C:\setup\run-job.ps1'
 New-Item -ItemType Directory -Force -Path 'C:\setup' | Out-Null
 
-# run-job.ps1 finds the per-clone JIT on the injected config disc, runs ONE job,
-# then powers the VM off (the host's only completion signal). It ALSO powers off
-# if no JIT is found after the full wait: the config disc is always pre-attached
-# before the VM starts (no attach race on any backend), and leaving the VM up
-# never self-heals (no re-scan, -AtLogOn task won't re-fire this session), so a
-# fast power-off lets the host reclaim the slot and reconcile a fresh clone
-# instead of stalling the full jobTimeout on a wedged guest.
+# run-job.ps1 finds the per-clone JIT on the injected config disc or redundant
+# VMware-Tools copy, runs ONE job, writes a host-readable infrastructure outcome,
+# then powers the VM off. It ALSO powers off if neither delivery arrives after
+# the full wait. Leaving the VM up cannot self-heal after this script stops
+# scanning (-AtLogOn will not re-fire this session), so a fast power-off lets the
+# host reclaim the slot and reconcile a fresh clone instead of stalling the full
+# jobTimeout on a wedged guest.
 @'
 $ErrorActionPreference = "Continue"
 $RunnerRoot = "C:\actions-runner"
 $LogDir = "C:\setup\logs"; New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+$OutcomePath = Join-Path $LogDir "run-outcome.txt"
+Remove-Item -Force -ErrorAction SilentlyContinue $OutcomePath
 Start-Transcript -Path (Join-Path $LogDir "run-job.log") -Append -Force | Out-Null
 
+function Read-JitFile($Path) {
+  if (-not (Test-Path -LiteralPath $Path)) { return $null }
+  # An empty/zero-byte jitconfig makes Get-Content -Raw return $null in PS 5.1,
+  # and .Trim() on $null is terminating. Treat empty/whitespace/read errors as
+  # absent so the caller keeps trying the other delivery channel.
+  try {
+    $content = Get-Content -Raw -LiteralPath $Path -ErrorAction Stop
+    if ($content) { $trimmed = $content.Trim(); if ($trimmed) { return $trimmed } }
+  } catch { }
+  return $null
+}
+
 function Find-Jit {
-  # Scan removable + CD-ROM volumes (DriveType 2,5) for the known per-clone file,
-  # then fall back to every filesystem root and the MACTIONS-labeled volume.
+  # Primary path: scan removable + CD-ROM volumes for the injected config ISO.
+  # Redundant path: the host copies the same staging file to C:\setup\jitconfig
+  # through VMware Tools after boot. That closes an intermittent virtual-CD
+  # visibility/attach failure while keeping the JIT off argv and the network.
+  $local = Read-JitFile "C:\setup\jitconfig"
+  if ($local) { return $local }
+
   # Robust against drive-letter shuffle - mirrors autounattend.xml's bootstrap scan.
   $known = "mactions\jitconfig"
   $roots = @()
@@ -432,18 +453,8 @@ function Find-Jit {
   $roots += (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue).Root
   foreach ($r in ($roots | Select-Object -Unique)) {
     $p = Join-Path ($r.TrimEnd("\") + "\") $known
-    if (Test-Path $p) {
-      # Guard the read: an empty/zero-byte jitconfig makes Get-Content -Raw return
-      # $null in PS 5.1, and .Trim() on $null is a TERMINATING error that would
-      # abort run-job.ps1 before EITHER shutdown branch runs - wedging the guest
-      # powered-on for the full jobTimeout. Treat empty/whitespace (or a read
-      # error) as "no JIT here" and keep scanning, so a broken config disc
-      # degrades to the fast power-off path instead.
-      try {
-        $c = Get-Content -Raw -LiteralPath $p -ErrorAction Stop
-        if ($c) { $t = $c.Trim(); if ($t) { return $t } }
-      } catch { }
-    }
+    $jit = Read-JitFile $p
+    if ($jit) { return $jit }
   }
   return $null
 }
@@ -457,20 +468,28 @@ if ($jit) {
   # run.cmd BLOCKS until the single JIT job completes, then exits (0 on a clean
   # ephemeral run). --jitconfig makes it single-use; no --once needed.
   & "$RunnerRoot\run.cmd" --jitconfig "$jit"
+  $runnerExit = $LASTEXITCODE
+  if ($runnerExit -eq 0) { $outcome = "success" } else { $outcome = "runner-exit:$runnerExit" }
+  Write-Output "Mactions guest outcome: $outcome"
+  Set-Content -LiteralPath $OutcomePath -Value $outcome -Encoding ASCII -Force
   Stop-Transcript | Out-Null
-  # Self power-off - the host detects completion purely via VM power state.
+  # Leave VMware Tools available for three host polling intervals so the host
+  # can copy the outcome and, on failure, this transcript before clone deletion.
+  Start-Sleep 15
   shutdown /s /t 0
 } else {
-  # No JIT after the full 120s wait. The config disc is wired to the clone's
-  # sata0:0 CD BEFORE the VM starts (mactions-fusion-vm's clone verb), so a null
-  # result here means a genuinely broken clone, NOT a transient attach race -
-  # and leaving the VM up does NOT self-heal (this script never re-scans, and the
-  # task is -AtLogOn only, so it won't re-fire within the same logged-on session).
+  # No JIT after the full 120s wait. Both the pre-wired config disc and the
+  # VMware-Tools copy failed to become readable, so this is a genuinely broken
+  # clone; leaving it up does NOT self-heal (this script stops scanning here and
+  # the -AtLogOn task will not re-fire within the same logged-on session).
   # Power off so the host's power-state poll reclaims the slot fast and the
   # orchestrator reconciles a fresh clone (with a fresh JIT) instead of burning
   # the full multi-hour jobTimeout on an idle guest while the JIT token expires.
-  Write-Output "no jitconfig found on any removable/CD volume after wait; powering off so the host reclaims the slot"
+  Write-Output "no jitconfig found through config disc or VMware Tools copy after wait; powering off so the host reclaims the slot"
+  Set-Content -LiteralPath $OutcomePath -Value "no-jit" -Encoding ASCII -Force
   Stop-Transcript | Out-Null
+  # Same capture grace as the runner-exit path above.
+  Start-Sleep 15
   shutdown /s /t 0
 }
 '@ | Set-Content -Path $JobScript -Encoding UTF8
