@@ -36,6 +36,13 @@ final class WindowsVMProviderTests: XCTestCase {
     XCTAssertEqual(cli.forceStopArgs(clone: "mactions-abc"), ["stop", "mactions-abc"])
     XCTAssertEqual(cli.deleteArgs(clone: "mactions-abc"), ["delete", "mactions-abc"])
     XCTAssertEqual(cli.statusArgs(clone: "mactions-abc"), ["status", "mactions-abc"])
+    XCTAssertEqual(cli.guestOutcomeArgs(clone: "mactions-abc"), ["outcome", "mactions-abc"])
+    XCTAssertEqual(
+      cli.deliverJITArgs(clone: "mactions-abc", source: "/tmp/jitconfig"),
+      ["deliver-jit", "mactions-abc", "/tmp/jitconfig"])
+    XCTAssertEqual(
+      cli.captureGuestLogArgs(clone: "mactions-abc", destination: "/logs/run.log"),
+      ["capture-log", "mactions-abc", "/logs/run.log"])
     XCTAssertEqual(cli.baseStatusArgs(base: "win11-runner-base"), ["base-status", "win11-runner-base"])
     XCTAssertTrue(cli.displayName.contains("VMware Fusion"))
   }
@@ -65,6 +72,38 @@ final class WindowsVMProviderTests: XCTestCase {
     XCTAssertFalse(cli.parseIsStopped(from: "no-snapshot"))
     XCTAssertFalse(cli.parseIsStopped(from: "missing"))
     XCTAssertFalse(cli.parseIsStopped(from: ""))
+  }
+
+  func testGuestOutcomeParserRejectsPowerOffWithoutVerifiedMarker() {
+    XCTAssertEqual(WindowsGuestOutcome.parse("success\r\n"), .success)
+    XCTAssertEqual(WindowsGuestOutcome.parse("NO-JIT\n"), .noJIT)
+    XCTAssertEqual(WindowsGuestOutcome.parse("runner-exit:17\n"), .runnerExit(17))
+    XCTAssertEqual(WindowsGuestOutcome.parse("runner-exit:-1"), .runnerExit(-1))
+    XCTAssertNil(WindowsGuestOutcome.parse("pending\n"))
+    XCTAssertNil(WindowsGuestOutcome.parse("runner-exit:"))
+    XCTAssertNil(WindowsGuestOutcome.parse("garbage"))
+
+    XCTAssertEqual(WindowsGuestOutcome.success.exitStatus, 0)
+    XCTAssertEqual(WindowsGuestOutcome.noJIT.exitStatus, 1)
+    XCTAssertEqual(WindowsGuestOutcome.runnerExit(17).exitStatus, 17)
+    // A malformed guest claim of runner-exit:0 must not become a second success
+    // spelling; recipe-v14's clean spelling is exactly `success`.
+    XCTAssertEqual(WindowsGuestOutcome.runnerExit(0).exitStatus, 1)
+  }
+
+  func testFusionHelperCarriesGuestOutcomeAndFailureLogVerbs() throws {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let helper = try String(
+      contentsOf: repoRoot.appendingPathComponent("scripts/mactions-fusion-vm"), encoding: .utf8)
+    for required in [
+      "cmd_outcome()", "fileExistsInGuest", "copyFileFromGuestToHost",
+      "cmd_deliver_jit()", "copyFileFromHostToGuest", "GUEST_JIT='C:\\setup\\jitconfig'",
+      "cmd_capture_log()", "GUEST_OUTCOME='C:\\setup\\logs\\run-outcome.txt'",
+      "GUEST_RUN_LOG='C:\\setup\\logs\\run-job.log'",
+    ] {
+      XCTAssertTrue(helper.contains(required), "missing guest-diagnostic helper fragment: \(required)")
+    }
   }
 
   func testFusionHelperFallsBackToVMSDForSnapshotDetection() {

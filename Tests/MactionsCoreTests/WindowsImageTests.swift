@@ -357,6 +357,53 @@ final class WindowsImageTests: XCTestCase {
       "currentProvisioningRecipeVersion drifted from PROVISIONING_RECIPE_VERSION — bump BOTH together")
   }
 
+  /// Recipe v14 closes the power-off-is-success ambiguity: every intentional
+  /// per-clone shutdown must publish an ASCII marker while VMware Tools is still
+  /// alive, including the 120s no-config-disc failure branch.
+  func testBootstrapPublishesGuestOutcomeBeforeShutdown() throws {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let bootstrapURL = repoRoot.appendingPathComponent("scripts/bootstrap.ps1")
+    let script = try String(contentsOf: bootstrapURL, encoding: .utf8)
+
+    XCTAssertEqual(WindowsImage.guestOutcomeRecipeVersion, 14)
+    XCTAssertGreaterThanOrEqual(
+      WindowsImage.currentProvisioningRecipeVersion, WindowsImage.guestOutcomeRecipeVersion)
+    for required in [
+      "$OutcomePath = Join-Path $LogDir \"run-outcome.txt\"",
+      "$local = Read-JitFile \"C:\\setup\\jitconfig\"",
+      "Set-Content -LiteralPath $OutcomePath -Value $outcome -Encoding ASCII -Force",
+      "Set-Content -LiteralPath $OutcomePath -Value \"no-jit\" -Encoding ASCII -Force",
+      "Start-Sleep 15",
+    ] {
+      XCTAssertTrue(script.contains(required), "missing recipe-v14 outcome fragment: \(required)")
+    }
+
+    let runnerMarker = try XCTUnwrap(script.range(
+      of: "Set-Content -LiteralPath $OutcomePath -Value $outcome -Encoding ASCII -Force"))
+    let noJITMarker = try XCTUnwrap(script.range(
+      of: "Set-Content -LiteralPath $OutcomePath -Value \"no-jit\" -Encoding ASCII -Force"))
+    let runnerShutdown = try XCTUnwrap(
+      script.range(of: "shutdown /s /t 0", range: runnerMarker.upperBound..<script.endIndex))
+    let noJITShutdown = try XCTUnwrap(
+      script.range(of: "shutdown /s /t 0", range: noJITMarker.upperBound..<script.endIndex))
+    XCTAssertLessThan(runnerMarker.lowerBound, runnerShutdown.lowerBound)
+    XCTAssertLessThan(noJITMarker.lowerBound, noJITShutdown.lowerBound)
+  }
+
+  /// Windows PowerShell 5.1 parses a BOM-less script as ANSI. A prior smart
+  /// punctuation byte sequence made the entire guest bootstrap unparseable, so
+  /// preserve the repo's hard BOM + ASCII-body invariant mechanically.
+  func testBootstrapKeepsUTF8BOMAndASCIIOnlyBody() throws {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let data = try Data(contentsOf: repoRoot.appendingPathComponent("scripts/bootstrap.ps1"))
+    XCTAssertTrue(data.starts(with: [0xEF, 0xBB, 0xBF]), "bootstrap.ps1 must keep its UTF-8 BOM")
+    XCTAssertTrue(
+      data.dropFirst(3).allSatisfy { $0 < 0x80 },
+      "bootstrap.ps1 must remain pure ASCII after its BOM for Windows PowerShell 5.1")
+  }
+
   /// BASE.md decision test: 7-Zip is a convenience tool, not a runner/OS
   /// semantic — and its old install (recipe ≤v11) was pinned to a 404-able URL,
   /// non-fatal, and never on PATH, so bases silently varied in whether they had

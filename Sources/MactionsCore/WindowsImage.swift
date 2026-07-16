@@ -234,6 +234,13 @@ public enum WindowsImage {
   /// the authority that gets stamped into `windows-base.recipe` at build time —
   /// and a unit test asserts they match.
   ///
+  /// v14: the per-clone runtime writes a guest infrastructure outcome marker
+  /// (`success`, `no-jit`, or `runner-exit:N`) and holds VMware Tools up for a
+  /// short capture window. The host also redundantly copies the JIT through
+  /// VMware Tools to close a virtual-CD visibility failure. It can now
+  /// distinguish clean runner completion from failure paths that also
+  /// intentionally power off the VM, and preserves the guest transcript for
+  /// failures before deleting the clone.
   /// v13: three hosted-parity OS-semantic fixes, all sentinel-verified:
   /// - Git relocates to C:\Program Files\Git — the exact hosted layout, so
   ///   workflows hardcoding hosted paths (bash.EXE, usr\bin tools) resolve.
@@ -290,7 +297,12 @@ public enum WindowsImage {
   /// still snapshotted, shipping a base where `actions/checkout` falls back to a REST
   /// tarball and every `shell: bash`/`shell: pwsh` step dies. So v3 bases are
   /// untrustworthy and warrant a rebuild to a verified v4.
-  public static let currentProvisioningRecipeVersion = 13
+  public static let currentProvisioningRecipeVersion = 14
+
+  /// First base recipe whose per-clone runtime guarantees `run-outcome.txt`.
+  /// Providers gate strict outcome verification on the RECORDED base recipe so
+  /// an existing v13 base keeps working while the rebuild nudge is outstanding.
+  public static let guestOutcomeRecipeVersion = 14
 
   /// Where `prepare-windows-image` records the provisioning-recipe version the
   /// base was built with. A sibling of `windows-base.build`; must survive run
