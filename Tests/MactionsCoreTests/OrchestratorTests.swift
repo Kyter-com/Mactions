@@ -7,57 +7,114 @@ import XCTest
 final class FakeControlPlane: RunnerControlPlane, @unchecked Sendable {
   struct Failure: Error {}
 
-  private(set) var jitCount = 0
-  private(set) var deleted: [Int] = []
-  var remote: [RemoteRunner] = []
+  private let lock = NSLock()
+  private var _jitCount = 0
+  private var _deleted: [Int] = []
+  private var _remote: [RemoteRunner] = []
+  private var _queuedJobs: [[String]] = []
+  private var _failQueuedPoll = false
+  private var _failListRunners = false
+  private var _failDeletes: Set<Int> = []
+  private var _failJIT = false
+  private var _createOfflineRunnerOnFailedJIT = false
+  private var _deleteAttempts: [Int] = []
+  private var _deleteDelayNanos: UInt64 = 0
+  private var _queuePollCount = 0
+  private var _queueDelayNanos: UInt64 = 0
+
+  private func synchronized<T>(_ body: () throws -> T) rethrows -> T {
+    lock.lock()
+    defer { lock.unlock() }
+    return try body()
+  }
+
+  var jitCount: Int { synchronized { _jitCount } }
+  var deleted: [Int] { synchronized { _deleted } }
+  var remote: [RemoteRunner] {
+    get { synchronized { _remote } }
+    set { synchronized { _remote = newValue } }
+  }
   /// Label sets of the jobs currently queued — the scale-from-zero demand signal.
-  var queuedJobs: [[String]] = []
+  var queuedJobs: [[String]] {
+    get { synchronized { _queuedJobs } }
+    set { synchronized { _queuedJobs = newValue } }
+  }
   /// When true, `listQueuedJobLabels` throws (a failed poll must HOLD the fleet).
-  var failQueuedPoll = false
+  var failQueuedPoll: Bool {
+    get { synchronized { _failQueuedPoll } }
+    set { synchronized { _failQueuedPoll = newValue } }
+  }
   /// When true, `listRunners` throws (busy-ness unknown: scale up only, never trim).
-  var failListRunners = false
+  var failListRunners: Bool {
+    get { synchronized { _failListRunners } }
+    set { synchronized { _failListRunners = newValue } }
+  }
   /// Runner ids whose delete throws — GitHub's 422 for a runner that is
   /// currently running a job (the server-side trim-race guard).
-  var failDeletes: Set<Int> = []
+  var failDeletes: Set<Int> {
+    get { synchronized { _failDeletes } }
+    set { synchronized { _failDeletes = newValue } }
+  }
   /// Simulate GitHub returning an error from generate-jitconfig.
-  var failJIT = false
+  var failJIT: Bool {
+    get { synchronized { _failJIT } }
+    set { synchronized { _failJIT = newValue } }
+  }
   /// GitHub can create the runner registration and still return a 500; this
   /// seeds that offline ghost so the orchestrator can clean it by exact name.
-  var createOfflineRunnerOnFailedJIT = false
+  var createOfflineRunnerOnFailedJIT: Bool {
+    get { synchronized { _createOfflineRunnerOnFailedJIT } }
+    set { synchronized { _createOfflineRunnerOnFailedJIT = newValue } }
+  }
 
   func generateJITConfig(name: String, labels: [String]) async throws -> JITConfig {
-    jitCount += 1
-    if failJIT {
-      if createOfflineRunnerOnFailedJIT {
-        remote.append(
-          RemoteRunner(id: 1000 + jitCount, name: name, status: "offline", busy: false))
+    let (count, shouldFail) = synchronized { () -> (Int, Bool) in
+      _jitCount += 1
+      if _failJIT, _createOfflineRunnerOnFailedJIT {
+        _remote.append(
+          RemoteRunner(id: 1000 + _jitCount, name: name, status: "offline", busy: false))
       }
-      throw Failure()
+      return (_jitCount, _failJIT)
     }
-    return JITConfig(encodedConfig: "jit-\(name)", runnerId: jitCount, runnerName: name)
+    if shouldFail { throw Failure() }
+    return JITConfig(encodedConfig: "jit-\(name)", runnerId: count, runnerName: name)
   }
   func listRunners() async throws -> [RemoteRunner] {
-    if failListRunners { throw Failure() }
-    return remote
+    let (shouldFail, runners) = synchronized { (_failListRunners, _remote) }
+    if shouldFail { throw Failure() }
+    return runners
   }
   /// Ids whose delete was ATTEMPTED (recorded at entry, before delay/throw) —
   /// lets tests interleave an exit with an in-flight delete await.
-  private(set) var deleteAttempts: [Int] = []
-  var deleteDelayNanos: UInt64 = 0
-  private(set) var queuePollCount = 0
-  var queueDelayNanos: UInt64 = 0
+  var deleteAttempts: [Int] { synchronized { _deleteAttempts } }
+  var deleteDelayNanos: UInt64 {
+    get { synchronized { _deleteDelayNanos } }
+    set { synchronized { _deleteDelayNanos = newValue } }
+  }
+  var queuePollCount: Int { synchronized { _queuePollCount } }
+  var queueDelayNanos: UInt64 {
+    get { synchronized { _queueDelayNanos } }
+    set { synchronized { _queueDelayNanos = newValue } }
+  }
 
   func deleteRunner(id: Int) async throws {
-    deleteAttempts.append(id)
-    if deleteDelayNanos > 0 { try? await Task.sleep(nanoseconds: deleteDelayNanos) }
-    if failDeletes.contains(id) { throw Failure() }
-    deleted.append(id)
+    let delay = synchronized { () -> UInt64 in
+      _deleteAttempts.append(id)
+      return _deleteDelayNanos
+    }
+    if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+    if synchronized({ _failDeletes.contains(id) }) { throw Failure() }
+    synchronized { _deleted.append(id) }
   }
   func listQueuedJobLabels() async throws -> [[String]] {
-    queuePollCount += 1
-    if queueDelayNanos > 0 { try? await Task.sleep(nanoseconds: queueDelayNanos) }
-    if failQueuedPoll { throw Failure() }
-    return queuedJobs
+    let delay = synchronized { () -> UInt64 in
+      _queuePollCount += 1
+      return _queueDelayNanos
+    }
+    if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+    let (shouldFail, jobs) = synchronized { (_failQueuedPoll, _queuedJobs) }
+    if shouldFail { throw Failure() }
+    return jobs
   }
 }
 

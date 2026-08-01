@@ -27,9 +27,13 @@ public enum FleetState: String, Sendable {
 /// A single runner the orchestrator is managing, as a value snapshot for the UI.
 public struct ManagedRunner: Identifiable, Equatable, Sendable {
   public enum Phase: String, Sendable { case provisioning, online, recycling, stopped, failed }
-  public let id: String // runner name
+  public let id: String  // runner name
   public var remoteId: Int?
   public var phase: Phase
+  /// Provider launch time. The dashboard uses the real lifetime for job
+  /// correlation, so a legal multi-hour job never falls outside an arbitrary
+  /// "recent runner" window when its detail is opened late.
+  public let startedAt: Date
 }
 
 /// Stable per-machine runner-name prefix: `mactions-<host>`. This is how we
@@ -37,7 +41,8 @@ public struct ManagedRunner: Identifiable, Equatable, Sendable {
 /// host prefixes, so each only ever deregisters *its own* runners, and the
 /// other's registrations are left untouched even when it's offline.
 public func machineRunnerPrefix(host: String = ProcessInfo.processInfo.hostName) -> String {
-  let safe = host
+  let safe =
+    host
     .replacingOccurrences(of: ".local", with: "")
     .lowercased()
     .filter { $0.isLetter || $0.isNumber || $0 == "-" }
@@ -64,7 +69,8 @@ public func deregisterOrphanRunners(
   includeOfflineMactionsRunners: Bool = false
 ) async {
   guard let remote = try? await controlPlane.listRunners() else { return }
-  for runner in remote where shouldDeregisterOrphanRunner(
+  for runner in remote
+  where shouldDeregisterOrphanRunner(
     runner, prefix: prefix, includeOfflineMactionsRunners: includeOfflineMactionsRunners)
   {
     try? await controlPlane.deleteRunner(id: runner.id)
@@ -295,7 +301,10 @@ public final class RunnerOrchestrator {
       name: String, remoteId: Int?, phase: ManagedRunner.Phase, provider: RunnerProvider,
       startedAt: Date
     ) {
-      self.name = name; self.remoteId = remoteId; self.phase = phase; self.provider = provider
+      self.name = name
+      self.remoteId = remoteId
+      self.phase = phase
+      self.provider = provider
       self.startedAt = startedAt
     }
   }
@@ -375,7 +384,10 @@ public final class RunnerOrchestrator {
   }
 
   public var runners: [ManagedRunner] {
-    slots.map { ManagedRunner(id: $0.name, remoteId: $0.remoteId, phase: $0.phase) }
+    slots.map {
+      ManagedRunner(
+        id: $0.name, remoteId: $0.remoteId, phase: $0.phase, startedAt: $0.startedAt)
+    }
   }
 
   public func start() async {
@@ -385,7 +397,7 @@ public final class RunnerOrchestrator {
     lastError = nil
     notify()
     await reconcile()
-    guard state == .starting else { return } // stop() may have raced us
+    guard state == .starting else { return }  // stop() may have raced us
     state = .online
     startReconcileLoop()
     notify()
@@ -393,7 +405,7 @@ public final class RunnerOrchestrator {
 
   public func stop() async {
     guard state != .offline else { return }
-    epoch += 1 // invalidate any in-flight provision / pending recycle
+    epoch += 1  // invalidate any in-flight provision / pending recycle
     stopReconcileLoop()
     state = .stopping
     notify()
@@ -502,8 +514,10 @@ public final class RunnerOrchestrator {
         lastError = "Can't reach GitHub's runner API — holding the fleet (not spawning more)."
         ControlPlaneLog.log(
           "reconcile.listRunners_outage_hold",
-          ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
-           "failingSec": String(Int(Date().timeIntervalSince(since)))])
+          [
+            "repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+            "failingSec": String(Int(Date().timeIntervalSince(since))),
+          ])
         notify()
         return
       }
@@ -530,7 +544,8 @@ public final class RunnerOrchestrator {
         return min(liveBusy + demand, self.config.maxRunners)
       }, epoch: myEpoch)
     guard epoch == myEpoch, state == .starting || state == .online else { return }
-    let target = min(busyNames.intersection(Set(slots.map(\.name))).count + demand, config.maxRunners)
+    let target = min(
+      busyNames.intersection(Set(slots.map(\.name))).count + demand, config.maxRunners)
     if slots.count > target {
       await trimIdleSurplus(downTo: target, idle: health.idle, epoch: myEpoch)
     } else {
@@ -716,9 +731,11 @@ public final class RunnerOrchestrator {
         slot.onlineSince = now  // idle-refresh clock: from registration, not launch
         ControlPlaneLog.log(
           "runner.online",
-          ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
-           "runner": slot.name,
-           "bootSeconds": String(Int(max(0, now.timeIntervalSince(slot.startedAt))))])
+          [
+            "repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+            "runner": slot.name,
+            "bootSeconds": String(Int(max(0, now.timeIntervalSince(slot.startedAt)))),
+          ])
       }
       consecutiveLaunchFailures = 0  // a runner reached GitHub: launches work again
       // Idle age is measured from `onlineSince` (registration), NOT `startedAt`
@@ -756,9 +773,11 @@ public final class RunnerOrchestrator {
         item.slot.reaped = true  // before stop(): its onExit can fire immediately
         ControlPlaneLog.log(
           "runner.reap",
-          ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
-           "runner": item.slot.name, "reason": item.reason,
-           "lifetimeSeconds": String(Int(max(0, now.timeIntervalSince(item.slot.startedAt))))])
+          [
+            "repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+            "runner": item.slot.name, "reason": item.reason,
+            "lifetimeSeconds": String(Int(max(0, now.timeIntervalSince(item.slot.startedAt)))),
+          ])
         stopProviderOffMain(item.slot)
       }
       slots.removeAll { staleIds.contains(ObjectIdentifier($0)) }
@@ -786,10 +805,12 @@ public final class RunnerOrchestrator {
       guard epoch == myEpoch, state == .online else { return health }
       ControlPlaneLog.log(
         "runner.reap",
-        ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
-         "runner": item.slot.name, "reason": "idle_jit_refresh",
-         "onlineSeconds": String(Int(max(0, now.timeIntervalSince(item.slot.onlineSince ?? now)))),
-         "lifetimeSeconds": String(Int(max(0, now.timeIntervalSince(item.slot.startedAt))))])
+        [
+          "repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+          "runner": item.slot.name, "reason": "idle_jit_refresh",
+          "onlineSeconds": String(Int(max(0, now.timeIntervalSince(item.slot.onlineSince ?? now)))),
+          "lifetimeSeconds": String(Int(max(0, now.timeIntervalSince(item.slot.startedAt)))),
+        ])
       stopProviderOffMain(item.slot)
       slots.removeAll { $0 === item.slot }
       notify()
@@ -808,8 +829,10 @@ public final class RunnerOrchestrator {
     if let budget, !budget.tryAcquire(os) {
       ControlPlaneLog.log(
         "provision.budget_denied",
-        ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
-         "inUse": String(budget.inUse(os))])
+        [
+          "repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+          "inUse": String(budget.inUse(os)),
+        ])
       if !demand.waitingForCapacity {
         demand.waitingForCapacity = true
         notify()
@@ -890,8 +913,10 @@ public final class RunnerOrchestrator {
         try? await controlPlane.deleteRunner(id: jit.runnerId)
         ControlPlaneLog.log(
           "provision.cleanup_registered",
-          ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
-           "runner": jit.runnerName])
+          [
+            "repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+            "runner": jit.runnerName,
+          ])
       } else if await deregisterOfflineRunnerNamed(controlPlane, name: name) {
         ControlPlaneLog.log(
           "provision.cleanup_named",
@@ -900,8 +925,10 @@ public final class RunnerOrchestrator {
       lastError = String(describing: error)
       ControlPlaneLog.log(
         "provision.error",
-        ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
-         "error": String(String(describing: error).prefix(200))])
+        [
+          "repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+          "error": String(String(describing: error).prefix(200)),
+        ])
       notify()
       return false
     }
@@ -924,8 +951,10 @@ public final class RunnerOrchestrator {
       slot.earlyExitStatus = status
       ControlPlaneLog.log(
         "runner.exit",
-        ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
-         "runner": slot.name, "status": String(status), "classification": "during_launch"])
+        [
+          "repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+          "runner": slot.name, "status": String(status), "classification": "during_launch",
+        ])
       return
     }
 
@@ -941,16 +970,19 @@ public final class RunnerOrchestrator {
     // we never saw online skips local history — GitHub's run history still has
     // it.)
     let lifetime = Date().timeIntervalSince(slot.startedAt)
-    let launchFailure = status != 0 && !slot.confirmedOnline && !slot.reaped
+    let launchFailure =
+      status != 0 && !slot.confirmedOnline && !slot.reaped
       && lifetime < launchFailureGraceInterval
     ControlPlaneLog.log(
       "runner.exit",
-      ["repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
-       "runner": slot.name, "status": String(status),
-       "classification": launchFailure
-         ? "launch_failure" : (slot.reaped ? "maintenance" : "natural"),
-       "confirmedOnline": String(slot.confirmedOnline),
-       "lifetimeSeconds": String(Int(max(0, lifetime)))])
+      [
+        "repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+        "runner": slot.name, "status": String(status),
+        "classification": launchFailure
+          ? "launch_failure" : (slot.reaped ? "maintenance" : "natural"),
+        "confirmedOnline": String(slot.confirmedOnline),
+        "lifetimeSeconds": String(Int(max(0, lifetime))),
+      ])
     if launchFailure {
       consecutiveLaunchFailures += 1
       lastError = "Runner \(slot.name) exited during launch (status \(status))."

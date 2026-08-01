@@ -131,7 +131,8 @@ struct DashboardView: View {
         // combos: discovery finds demand across every admin repo.
         (app.state == .offline && !hasWatchableFleet)
           || app.windowsSetupBusy  // can't clone the base while it's being (re)built
-          || app.state == .starting || app.state == .stopping)
+          || app.state == .starting || app.state == .stopping
+      )
       .help(
         app.windowsSetupBusy
           ? "Wait for the Windows base image to finish building before going online."
@@ -285,7 +286,8 @@ struct DashboardView: View {
         // All-repos arms orchestrators LAZILY (per queued job, reaped when
         // quiet), so a live count would flutter and undercount the scope.
         if app.plan.isAllRepos {
-          return queued > 0 ? "Online · watching all repos · \(queued) queued"
+          return queued > 0
+            ? "Online · watching all repos · \(queued) queued"
             : "Online · watching all repos"
         }
         let repos = app.watchedRepoCount
@@ -316,7 +318,8 @@ struct DashboardView: View {
       return "All repositories scope · \(overrideText)."
     }
     if repoCount == 0 { return "No repositories configured — add one to begin." }
-    return "\(repoCount) repo\(repoCount == 1 ? "" : "s") · \(comboCount) platform combo\(comboCount == 1 ? "" : "s") configured."
+    return
+      "\(repoCount) repo\(repoCount == 1 ? "" : "s") · \(comboCount) platform combo\(comboCount == 1 ? "" : "s") configured."
   }
 
   /// Bottom-strip right note: shown ONLY when Windows VMs are actually capped
@@ -378,7 +381,8 @@ private struct RunnersPane: View {
       let rs = byRepo[plan.repo.fullName] ?? []
       let active = rs.filter { app.busyRunnerNames.contains($0.runner.id) }.count
       return RepoGroup(
-        repo: plan.repo, summary: app.plan.isAllRepos ? "Override · \(plan.summary())" : plan.summary(),
+        repo: plan.repo,
+        summary: app.plan.isAllRepos ? "Override · \(plan.summary())" : plan.summary(),
         enabledPlatforms: plan.enabledPlatforms,
         runners: rs, activeCount: active)
     }
@@ -442,7 +446,9 @@ private struct RunnersPane: View {
           if app.isSignedIn {
             DashboardEmptyState(
               systemImage: "tray", title: "No repositories",
-              message: "Add a repository to manage its self-hosted runners. Then pick a platform for it on the right.")
+              message:
+                "Add a repository to manage its self-hosted runners. Then pick a platform for it on the right."
+            )
             Button {
               showAddRepo = true
             } label: {
@@ -457,7 +463,9 @@ private struct RunnersPane: View {
             // repos"). Point them straight at the connect flow instead.
             DashboardEmptyState(
               systemImage: "person.crop.circle.badge.questionmark", title: "Sign in to GitHub",
-              message: "Connect your GitHub account to see the repositories you can add self-hosted runners to.")
+              message:
+                "Connect your GitHub account to see the repositories you can add self-hosted runners to."
+            )
             Button {
               app.presentSettings(.general)
             } label: {
@@ -516,7 +524,8 @@ private struct RunnersPane: View {
   }
 
   private var addRepoHelp: String {
-    app.plan.isAllRepos ? "Add or remove repository overrides (⌘N)" : "Add or remove repositories (⌘N)"
+    app.plan.isAllRepos
+      ? "Add or remove repository overrides (⌘N)" : "Add or remove repositories (⌘N)"
   }
 
   private var allRepositoriesHeader: some View {
@@ -570,7 +579,11 @@ private struct RunnersPane: View {
       // aligned instead.
       if hasRunners {
         Button {
-          if collapsed.contains(group.id) { collapsed.remove(group.id) } else { collapsed.insert(group.id) }
+          if collapsed.contains(group.id) {
+            collapsed.remove(group.id)
+          } else {
+            collapsed.insert(group.id)
+          }
         } label: {
           Image(systemName: collapsed.contains(group.id) ? "chevron.right" : "chevron.down")
             .font(.caption2).foregroundStyle(.secondary).frame(width: 12)
@@ -818,7 +831,7 @@ private final class SpinningRingView: NSView {
     let side = min(bounds.width, bounds.height)
     let square = CGRect(x: 0, y: 0, width: side, height: side)
     ring.bounds = square
-    ring.anchorPoint = CGPoint(x: 0.5, y: 0.5)   // rotate about the ring's center
+    ring.anchorPoint = CGPoint(x: 0.5, y: 0.5)  // rotate about the ring's center
     ring.position = CGPoint(x: bounds.midX, y: bounds.midY)
     let inset = ringLineWidth / 2 + 0.5
     ring.path = CGPath(ellipseIn: square.insetBy(dx: inset, dy: inset), transform: nil)
@@ -842,7 +855,7 @@ private final class SpinningRingView: NSView {
 
   override func viewDidChangeEffectiveAppearance() {
     super.viewDidChangeEffectiveAppearance()
-    applyStyle()   // re-resolve the stroke color for the new light/dark appearance
+    applyStyle()  // re-resolve the stroke color for the new light/dark appearance
   }
 
   override func viewDidChangeBackingProperties() {
@@ -884,11 +897,11 @@ private final class SpinningRingView: NSView {
     guard window != nil, ring.animation(forKey: Self.spinKey) == nil else { return }
     let spin = CABasicAnimation(keyPath: "transform.rotation.z")
     spin.fromValue = 0
-    spin.toValue = -Double.pi * 2      // clockwise (y-up layer), matching the old SwiftUI ring
+    spin.toValue = -Double.pi * 2  // clockwise (y-up layer), matching the old SwiftUI ring
     spin.duration = 1
     spin.repeatCount = .infinity
     spin.isRemovedOnCompletion = false
-    spin.timingFunction = CAMediaTimingFunction(name: .linear)   // constant angular speed
+    spin.timingFunction = CAMediaTimingFunction(name: .linear)  // constant angular speed
     ring.add(spin, forKey: Self.spinKey)
   }
 }
@@ -927,7 +940,11 @@ private struct RunnerDetailView: View {
         VStack(alignment: .leading, spacing: 12) {
           switch app.runnerJobs[row.runner.id] {
           case .loading, .none:
-            HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Looking up the current job on GitHub…").font(.caption).foregroundStyle(.secondary) }
+            HStack(spacing: 8) {
+              ProgressView().controlSize(.small)
+              Text("Looking up the current job on GitHub…").font(.caption).foregroundStyle(
+                .secondary)
+            }
           case .running:
             // GitHub says the runner is busy, but the jobs API hasn't published the
             // matching job/steps yet — show a running state consistent with the
@@ -938,16 +955,22 @@ private struct RunnerDetailView: View {
                 ProgressView().controlSize(.small)
                 Text("Running a job — waiting for GitHub to publish its steps…").font(.callout)
               }
-              Text("Live logs aren't available while a job is in progress; the full log appears under History once it finishes.")
-                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+              Text(
+                "Live logs aren't available while a job is in progress; the full log appears under History once it finishes."
+              )
+              .font(.caption).foregroundStyle(.secondary).fixedSize(
+                horizontal: false, vertical: true)
             }
           case .found(let job):
             jobSteps(job)
           case .notFound:
             VStack(alignment: .leading, spacing: 4) {
               Text("No job running on this runner right now.").font(.callout)
-              Text("This runner was started for a queued job and is waiting for GitHub to assign it; if the job went elsewhere, the fleet retires it shortly. The full log appears under History once a job finishes.")
-                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+              Text(
+                "This runner was started for a queued job and is waiting for GitHub to assign it; if the job went elsewhere, the fleet retires it shortly. The full log appears under History once a job finishes."
+              )
+              .font(.caption).foregroundStyle(.secondary).fixedSize(
+                horizontal: false, vertical: true)
             }
           case .error(let message):
             Banner(message, severity: .warning, icon: "wifi.exclamationmark")
@@ -961,7 +984,7 @@ private struct RunnerDetailView: View {
     .task(id: row.runner.id) {
       while !Task.isCancelled {
         await app.loadRunnerJob(
-          for: row.runner.id, repo: row.repoFullName,
+          for: row.runner.id, repo: row.repoFullName, startedAt: row.runner.startedAt,
           busy: app.busyRunnerNames.contains(row.runner.id))
         try? await Task.sleep(nanoseconds: 4_000_000_000)
       }
@@ -975,7 +998,8 @@ private struct RunnerDetailView: View {
       Text(job.name).font(.headline)
       Spacer()
       if let url = job.htmlURL.flatMap(URL.init) {
-        Link(destination: url) { Label("GitHub", systemImage: "arrow.up.forward.square") }.font(.caption)
+        Link(destination: url) { Label("GitHub", systemImage: "arrow.up.forward.square") }.font(
+          .caption)
       }
     }
     if let steps = job.steps, !steps.isEmpty {
@@ -984,7 +1008,8 @@ private struct RunnerDetailView: View {
           HStack(spacing: 8) {
             let icon = stepIcon(status: step.status, conclusion: step.conclusion)
             Image(systemName: icon.name).foregroundStyle(icon.color).font(.caption)
-            Text(step.name).font(.callout).foregroundStyle(step.status == "completed" ? .primary : .secondary)
+            Text(step.name).font(.callout).foregroundStyle(
+              step.status == "completed" ? .primary : .secondary)
             Spacer(minLength: 0)
           }
         }
@@ -1005,7 +1030,9 @@ private struct HistoryPane: View {
   @State private var confirmClear = false
 
   enum OutcomeFilter: String, CaseIterable, Identifiable {
-    case all = "All", passed = "Passed", failed = "Failed"
+    case all = "All"
+    case passed = "Passed"
+    case failed = "Failed"
     var id: String { rawValue }
   }
 
@@ -1034,10 +1061,14 @@ private struct HistoryPane: View {
           Image(systemName: "magnifyingglass").font(.caption).foregroundStyle(.secondary)
           TextField("Filter runs…", text: $search).textFieldStyle(.plain).font(.callout)
           if !app.runHistory.isEmpty {
-            Button { confirmClear = true } label: { Image(systemName: "trash") }
-              .buttonStyle(.borderless).controlSize(.small)
-              .help("Clear run history")
-              .accessibilityLabel("Clear run history")
+            Button {
+              confirmClear = true
+            } label: {
+              Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless).controlSize(.small)
+            .help("Clear run history")
+            .accessibilityLabel("Clear run history")
           }
         }
         .padding(.horizontal, 10).padding(.vertical, 6)
@@ -1073,9 +1104,26 @@ private struct HistoryPane: View {
           message: "Pick a run to view its GitHub Actions job log inline.")
       }
     }
-    // Back-fill the true GitHub conclusion for recent rows so their status is
-    // correct without opening each one. Bounded + on-appear only (not a poller).
-    .task { await app.resolveRecentConclusions() }
+    // Back-fill the true GitHub conclusion without opening each row. A just-
+    // finished job can lag the agent exit by a few seconds, so retry only while
+    // this pane is visible, only for recent unsettled rows, and for at most one
+    // minute. A new history row changes the task id and starts a fresh bounded
+    // settlement window.
+    .task(id: app.runHistory.first?.id) {
+      for attempt in 0..<12 {
+        await app.resolveRecentConclusions()
+        let shouldRetry = app.runHistory.prefix(12).contains { record in
+          let unsettled = record.jobConclusion == nil || record.jobConclusion == .inProgress
+          return unsettled && Date().timeIntervalSince(record.endedAt) < 5 * 60
+        }
+        guard shouldRetry, attempt < 11, !Task.isCancelled else { return }
+        do {
+          try await Task.sleep(nanoseconds: 5_000_000_000)
+        } catch {
+          return
+        }
+      }
+    }
     // Clearing history is irreversible and a single small-icon tap — confirm it.
     .confirmationDialog(
       "Clear all run history?", isPresented: $confirmClear, titleVisibility: .visible
@@ -1083,7 +1131,8 @@ private struct HistoryPane: View {
       Button("Clear", role: .destructive) { app.clearRunHistory() }
       Button("Cancel", role: .cancel) {}
     } message: {
-      Text("This permanently deletes all recorded runs and their cached logs. This can't be undone.")
+      Text(
+        "This permanently deletes all recorded runs and their cached logs. This can't be undone.")
     }
   }
 }
@@ -1101,7 +1150,8 @@ private struct HistoryRow: View {
           .font(.caption2).foregroundStyle(.secondary)
       }
       Spacer(minLength: 0)
-      Text(durationString(record.duration)).font(.caption2).foregroundStyle(.tertiary).monospacedDigit()
+      Text(durationString(record.duration)).font(.caption2).foregroundStyle(.tertiary)
+        .monospacedDigit()
     }
     .padding(.vertical, 2)
   }
@@ -1121,7 +1171,31 @@ private struct RunDetailView: View {
       Divider()
       content
     }
-    .task(id: record.id) { await app.loadJobLog(for: record) }
+    .task(id: record.id) {
+      // GitHub commonly indexes a completed job before its downloadable log.
+      // Retry that specific 404/not-ready state for one minute while this detail
+      // remains visible; old/expired logs stay a single request.
+      for attempt in 0..<12 {
+        await app.loadJobLog(for: record)
+        guard let state = app.jobLogs[record.id], case .notReady = state,
+          Date().timeIntervalSince(record.endedAt) < 5 * 60,
+          attempt < 11, !Task.isCancelled
+        else { return }
+        do {
+          try await Task.sleep(nanoseconds: 5_000_000_000)
+        } catch {
+          return
+        }
+      }
+    }
+  }
+
+  private var fetchedJob: WorkflowJob? {
+    switch app.jobLogs[record.id] {
+    case .loaded(let job, _): return job
+    case .notReady(let job): return job
+    default: return nil
+    }
   }
 
   private var meta: some View {
@@ -1133,8 +1207,7 @@ private struct RunDetailView: View {
         .help("How long the runner process was alive (launch → exit) — not the job's runtime.")
       // The job's actual runtime, from the fetched job (no extra call). Shown only
       // when it's meaningfully shorter than agent uptime, so it doesn't just echo it.
-      if case .loaded(let job?, _) = app.jobLogs[record.id],
-        let s = job.startedAt, let e = job.completedAt,
+      if let job = fetchedJob, let s = job.startedAt, let e = job.completedAt,
         record.duration - e.timeIntervalSince(s) > 5
       {
         metaItem("Job time", durationString(e.timeIntervalSince(s)))
@@ -1146,21 +1219,25 @@ private struct RunDetailView: View {
         metaItem("Agent exit", "\(code)")
       }
       Spacer()
-      if case .loaded(let job, _) = app.jobLogs[record.id], let url = job?.htmlURL.flatMap(URL.init) {
-        Link(destination: url) { Label("GitHub", systemImage: "arrow.up.forward.square") }.font(.caption)
+      if let url = fetchedJob?.htmlURL.flatMap(URL.init) {
+        Link(destination: url) { Label("GitHub", systemImage: "arrow.up.forward.square") }.font(
+          .caption)
       }
       Button {
         Task { await app.loadJobLog(for: record, force: true) }
-      } label: { Image(systemName: "arrow.clockwise") }
-        .glassButton().controlSize(.small).help("Re-fetch the log from GitHub")
-        .accessibilityLabel("Re-fetch log from GitHub")
+      } label: {
+        Image(systemName: "arrow.clockwise")
+      }
+      .glassButton().controlSize(.small).help("Re-fetch the log from GitHub")
+      .accessibilityLabel("Re-fetch log from GitHub")
     }
     .padding(.horizontal, 16).padding(.vertical, 8)
   }
 
   private func metaItem(_ label: String, _ value: String) -> some View {
     VStack(alignment: .leading, spacing: 0) {
-      Text(label).font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary).tracking(0.4)
+      Text(label).font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary).tracking(
+        0.4)
       Text(value).font(.caption.weight(.medium)).monospacedDigit()
     }
   }
@@ -1180,8 +1257,19 @@ private struct RunDetailView: View {
       } else {
         LogConsole(lines: lines, search: $logSearch)
       }
+    case .notReady(let job):
+      VStack(spacing: 8) {
+        ProgressView()
+        Text("GitHub is preparing this job's log…")
+          .font(.caption).foregroundStyle(.secondary)
+        Text("Mactions will retry automatically for one minute.")
+          .font(.caption2).foregroundStyle(.tertiary)
+      }
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+      .accessibilityLabel("GitHub is preparing the log for \(job.name)")
     case .unavailable(let message):
-      DashboardEmptyState(systemImage: "exclamationmark.triangle", title: "Log unavailable", message: message)
+      DashboardEmptyState(
+        systemImage: "exclamationmark.triangle", title: "Log unavailable", message: message)
     }
   }
 
@@ -1212,7 +1300,8 @@ private struct RunDetailView: View {
         systemImage: "doc.plaintext", title: "No log available",
         message: job == nil
           ? "Found no matching job on GitHub."
-          : "The job was found, but its log isn't downloadable (still running, or past GitHub's retention).")
+          : "The job was found, but its log isn't downloadable (still running, or past GitHub's retention)."
+      )
     }
   }
 }
@@ -1224,7 +1313,10 @@ private struct LogConsole: View {
   @Binding var search: String
 
   /// One matched line, identified by its original index in the full log.
-  struct IndexedLine: Identifiable { let id: Int; let text: String }
+  struct IndexedLine: Identifiable {
+    let id: Int
+    let text: String
+  }
 
   // Memoized filter results: recomputed ONLY when the search text or the log
   // changes (onAppear / onChange), never on every body re-render. Without this,
@@ -1237,11 +1329,18 @@ private struct LogConsole: View {
       HStack(spacing: 6) {
         Image(systemName: "magnifyingglass").font(.caption2).foregroundStyle(.secondary)
         TextField("Search in log…", text: $search).textFieldStyle(.plain).font(.caption)
-        Text(search.isEmpty ? "\(lines.count) lines" : "\(matches.count) match\(matches.count == 1 ? "" : "es")")
-          .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
-        Button { copyAll() } label: { Image(systemName: "doc.on.doc") }
-          .buttonStyle(.borderless).controlSize(.small).help("Copy the full log")
-          .accessibilityLabel("Copy the full log")
+        Text(
+          search.isEmpty
+            ? "\(lines.count) lines" : "\(matches.count) match\(matches.count == 1 ? "" : "es")"
+        )
+        .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+        Button {
+          copyAll()
+        } label: {
+          Image(systemName: "doc.on.doc")
+        }
+        .buttonStyle(.borderless).controlSize(.small).help("Copy the full log")
+        .accessibilityLabel("Copy the full log")
       }
       .padding(.horizontal, 10).padding(.vertical, 6)
       .liquidGlass(in: Capsule())  // search field = control layer
@@ -1312,8 +1411,10 @@ private struct MemoryPane: View {
           gauge(sample)
           sparkline
           breakdown(sample)
-          Text("“In use” = wired + active + compressed (tracks memory pressure, like Activity Monitor's Memory Used). Per-bucket figures are summed live from process RSS.")
-            .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+          Text(
+            "“In use” = wired + active + compressed (tracks memory pressure, like Activity Monitor's Memory Used). Per-bucket figures are summed live from process RSS."
+          )
+          .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
         } else {
           HStack(spacing: 8) {
             ProgressView().controlSize(.small)
@@ -1332,8 +1433,10 @@ private struct MemoryPane: View {
       HStack {
         Text("Memory in use").font(.headline)
         Spacer()
-        Text("\(formatBytes(s.usedBytes)) / \(formatBytes(s.totalBytes)) · \(Int(s.usedFraction * 100))%")
-          .font(.caption.weight(.medium)).foregroundStyle(.secondary).monospacedDigit()
+        Text(
+          "\(formatBytes(s.usedBytes)) / \(formatBytes(s.totalBytes)) · \(Int(s.usedFraction * 100))%"
+        )
+        .font(.caption.weight(.medium)).foregroundStyle(.secondary).monospacedDigit()
       }
       MemoryBar(fraction: s.usedFraction)
     }
@@ -1353,7 +1456,8 @@ private struct MemoryPane: View {
 
   private func breakdown(_ s: MemorySample) -> some View {
     VStack(alignment: .leading, spacing: 0) {
-      Text("BREAKDOWN").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary).tracking(0.6)
+      Text("BREAKDOWN").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+        .tracking(0.6)
         .padding(.bottom, 6)
       row("Windows VMs", s.windowsVMBytes, systemImage: "cube.box")
       row("Local runners", s.localRunnerBytes, systemImage: "bolt")
@@ -1369,7 +1473,8 @@ private struct MemoryPane: View {
       Image(systemName: systemImage).font(.caption).foregroundStyle(.secondary).frame(width: 18)
       Text(label).font(.callout)
       Spacer()
-      Text(formatBytes(bytes)).font(.callout.weight(.medium)).monospacedDigit().foregroundStyle(.secondary)
+      Text(formatBytes(bytes)).font(.callout.weight(.medium)).monospacedDigit().foregroundStyle(
+        .secondary)
     }
     .padding(.vertical, 3)
   }
@@ -1394,7 +1499,8 @@ private struct Sparkline: View {
   let values: [Double]
   var body: some View {
     GeometryReader { geo in
-      let w = geo.size.width, h = geo.size.height
+      let w = geo.size.width
+      let h = geo.size.height
       if values.count >= 2 {
         let maxIndex = Double(values.count - 1)
         let points = values.enumerated().map { i, v in
@@ -1432,7 +1538,8 @@ private struct DetailHeader: View {
 
   var body: some View {
     HStack(spacing: 10) {
-      OSLogo(os: os, size: 16).frame(width: 20).help(os.displayName).accessibilityLabel(os.displayName)
+      OSLogo(os: os, size: 16).frame(width: 20).help(os.displayName).accessibilityLabel(
+        os.displayName)
       VStack(alignment: .leading, spacing: 1) {
         Text(title).font(.headline).lineLimit(1).truncationMode(.middle)
         Text(subtitle).font(.system(size: 11).monospaced()).foregroundStyle(.secondary)
@@ -1503,9 +1610,11 @@ private func formatBytes(_ bytes: UInt64) -> String {
 private func durationString(_ seconds: TimeInterval) -> String {
   let total = max(0, Int(seconds.rounded()))
   if total < 60 { return "\(total)s" }
-  let m = total / 60, s = total % 60
+  let m = total / 60
+  let s = total % 60
   if m < 60 { return s == 0 ? "\(m)m" : "\(m)m \(s)s" }
-  let h = m / 60, mm = m % 60
+  let h = m / 60
+  let mm = m % 60
   return mm == 0 ? "\(h)h" : "\(h)h \(mm)m"
 }
 

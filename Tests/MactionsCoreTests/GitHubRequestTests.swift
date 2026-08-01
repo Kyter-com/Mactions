@@ -47,6 +47,7 @@ final class GitHubRequestTests: XCTestCase {
     XCTAssertEqual(
       runs.url?.absoluteString,
       "https://api.github.com/repos/acme/example/actions/runs?per_page=40")
+    XCTAssertEqual(runs.cachePolicy, .reloadIgnoringLocalCacheData)
 
     let jobs = client.listJobsRequest(runId: 99)
     XCTAssertEqual(jobs.httpMethod, "GET")
@@ -54,6 +55,14 @@ final class GitHubRequestTests: XCTestCase {
       jobs.url?.absoluteString,
       "https://api.github.com/repos/acme/example/actions/runs/99/jobs?per_page=100&filter=all"
     )
+    XCTAssertEqual(jobs.cachePolicy, .reloadIgnoringLocalCacheData)
+
+    let job = client.jobRequest(jobId: 7)
+    XCTAssertEqual(job.httpMethod, "GET")
+    XCTAssertEqual(
+      job.url?.absoluteString,
+      "https://api.github.com/repos/acme/example/actions/jobs/7")
+    XCTAssertEqual(job.cachePolicy, .reloadIgnoringLocalCacheData)
 
     let logs = client.jobLogsRequest(jobId: 7)
     XCTAssertEqual(logs.httpMethod, "GET")
@@ -85,6 +94,13 @@ final class GitHubRequestTests: XCTestCase {
     XCTAssertNil(job.steps?.last?.conclusion)
   }
 
+  func testClientHTTPErrorHasUsefulLocalizedDescription() {
+    let error = GitHubClient.ClientError.http(502, "upstream unavailable")
+    XCTAssertEqual(
+      error.localizedDescription,
+      "GitHub API HTTP 502: upstream unavailable")
+  }
+
   /// The re-run-attempt fix: when a run has two jobs sharing our (unique) runner
   /// name — attempt 1 and a later attempt 2 — `pickJob` must return the NEWEST by
   /// `startedAt`, so a re-run resolves to its real (latest) result, not attempt 1.
@@ -102,15 +118,23 @@ final class GitHubRequestTests: XCTestCase {
       decoder.dateDecodingStrategy = .iso8601
       return try! decoder.decode(WorkflowJob.self, from: json)
     }
-    let attempt1 = job(id: 1, runner: "mactions-host-ab12cd", startedAt: "2024-06-01T12:00:00Z", conclusion: "failure")
-    let attempt2 = job(id: 2, runner: "mactions-host-ab12cd", startedAt: "2024-06-01T12:30:00Z", conclusion: "success")
-    let other = job(id: 3, runner: "mactions-host-zzzz", startedAt: "2024-06-01T12:45:00Z", conclusion: "failure")
+    let attempt1 = job(
+      id: 1, runner: "mactions-host-ab12cd", startedAt: "2024-06-01T12:00:00Z",
+      conclusion: "failure")
+    let attempt2 = job(
+      id: 2, runner: "mactions-host-ab12cd", startedAt: "2024-06-01T12:30:00Z",
+      conclusion: "success")
+    let other = job(
+      id: 3, runner: "mactions-host-zzzz", startedAt: "2024-06-01T12:45:00Z", conclusion: "failure")
 
     // Order shouldn't matter — newest attempt wins regardless of array position.
-    XCTAssertEqual(GitHubClient.pickJob([attempt1, attempt2, other], runnerName: "mactions-host-ab12cd")?.id, 2)
-    XCTAssertEqual(GitHubClient.pickJob([attempt2, attempt1], runnerName: "mactions-host-ab12cd")?.id, 2)
+    XCTAssertEqual(
+      GitHubClient.pickJob([attempt1, attempt2, other], runnerName: "mactions-host-ab12cd")?.id, 2)
+    XCTAssertEqual(
+      GitHubClient.pickJob([attempt2, attempt1], runnerName: "mactions-host-ab12cd")?.id, 2)
     // No matching runner → nil (the honest "no matching job" path).
-    XCTAssertNil(GitHubClient.pickJob([attempt1, attempt2, other], runnerName: "mactions-host-nope"))
+    XCTAssertNil(
+      GitHubClient.pickJob([attempt1, attempt2, other], runnerName: "mactions-host-nope"))
     XCTAssertNil(GitHubClient.pickJob([], runnerName: "mactions-host-ab12cd"))
   }
 
@@ -119,12 +143,14 @@ final class GitHubRequestTests: XCTestCase {
     XCTAssertEqual(codeReq.httpMethod, "POST")
     XCTAssertEqual(codeReq.url, GitHubAuth.deviceCodeURL)
     XCTAssertEqual(codeReq.value(forHTTPHeaderField: "Accept"), "application/json")
-    let codeBody = (try? JSONSerialization.jsonObject(with: codeReq.httpBody ?? Data())) as? [String: String]
+    let codeBody =
+      (try? JSONSerialization.jsonObject(with: codeReq.httpBody ?? Data())) as? [String: String]
     XCTAssertEqual(codeBody?["client_id"], "Iv1.abc")
     XCTAssertEqual(codeBody?["scope"], "repo")
 
     let tokenReq = GitHubAuth.accessTokenRequest(clientId: "Iv1.abc", deviceCode: "dev_1")
-    let tokenBody = (try? JSONSerialization.jsonObject(with: tokenReq.httpBody ?? Data())) as? [String: String]
+    let tokenBody =
+      (try? JSONSerialization.jsonObject(with: tokenReq.httpBody ?? Data())) as? [String: String]
     XCTAssertEqual(tokenBody?["device_code"], "dev_1")
     XCTAssertEqual(tokenBody?["grant_type"], "urn:ietf:params:oauth:grant-type:device_code")
   }
@@ -155,6 +181,11 @@ final class GitHubRequestTests: XCTestCase {
     XCTAssertEqual(
       plain.url?.absoluteString,
       "https://api.github.com/repos/acme/example/actions/runs?per_page=40")
+
+    let secondPage = client.listWorkflowRunsRequest(perPage: 100, page: 2)
+    XCTAssertEqual(
+      secondPage.url?.absoluteString,
+      "https://api.github.com/repos/acme/example/actions/runs?per_page=100&page=2")
   }
 
   func testWorkflowJobDecodesRunsOnLabels() throws {

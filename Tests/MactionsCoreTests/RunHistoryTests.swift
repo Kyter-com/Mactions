@@ -57,7 +57,7 @@ final class RunHistoryTests: XCTestCase {
     let record = RunRecord(
       id: "mactions-host-zz99", os: .windows, repo: "o/r", remoteId: 7,
       startedAt: start, endedAt: start.addingTimeInterval(60), exitStatus: 0,
-      outcome: .completed, jobConclusion: .failure)
+      outcome: .completed, jobConclusion: .failure, githubJobId: 123_456)
 
     let encoder = JSONEncoder()
     encoder.dateEncodingStrategy = .iso8601
@@ -67,6 +67,7 @@ final class RunHistoryTests: XCTestCase {
     let decoded = try decoder.decode([RunRecord].self, from: try encoder.encode([record]))
     XCTAssertEqual(decoded, [record])
     XCTAssertEqual(decoded.first?.jobConclusion, .failure)
+    XCTAssertEqual(decoded.first?.githubJobId, 123_456)
   }
 
   /// Back-compat: history written before `jobConclusion` existed has no such key.
@@ -82,6 +83,7 @@ final class RunHistoryTests: XCTestCase {
     decoder.dateDecodingStrategy = .iso8601
     let decoded = try decoder.decode([RunRecord].self, from: json)
     XCTAssertNil(decoded.first?.jobConclusion)
+    XCTAssertNil(decoded.first?.githubJobId)
     XCTAssertEqual(decoded.first?.resolvedStatus, .unknownCompleted)
     XCTAssertEqual(decoded.first?.statusLabel, "Completed")
   }
@@ -132,8 +134,10 @@ final class RunHistoryTests: XCTestCase {
     typealias C = RunRecord.JobConclusion
     XCTAssertEqual(C.resolve(status: "completed", conclusion: "failure", exitStatus: 0), .failure)
     XCTAssertEqual(C.resolve(status: "completed", conclusion: "success", exitStatus: 0), .success)
-    XCTAssertEqual(C.resolve(status: "completed", conclusion: "timed_out", exitStatus: 0), .timedOut)
-    XCTAssertEqual(C.resolve(status: "completed", conclusion: "cancelled", exitStatus: 0), .cancelled)
+    XCTAssertEqual(
+      C.resolve(status: "completed", conclusion: "timed_out", exitStatus: 0), .timedOut)
+    XCTAssertEqual(
+      C.resolve(status: "completed", conclusion: "cancelled", exitStatus: 0), .cancelled)
     XCTAssertEqual(C.resolve(status: "completed", conclusion: "skipped", exitStatus: 0), .skipped)
     XCTAssertEqual(C.resolve(status: "completed", conclusion: "neutral", exitStatus: 0), .neutral)
     // Completed with a null conclusion ≈ still settling.
@@ -142,7 +146,8 @@ final class RunHistoryTests: XCTestCase {
     XCTAssertEqual(C.resolve(status: "in_progress", conclusion: nil, exitStatus: 0), .inProgress)
     XCTAssertEqual(C.resolve(status: "queued", conclusion: nil, exitStatus: nil), .inProgress)
     // A non-zero agent exit wins: the agent crashed, the job may never have run.
-    XCTAssertEqual(C.resolve(status: "completed", conclusion: "success", exitStatus: 1), .agentFailed)
+    XCTAssertEqual(
+      C.resolve(status: "completed", conclusion: "success", exitStatus: 1), .agentFailed)
     XCTAssertEqual(C.resolve(status: "queued", conclusion: nil, exitStatus: 5), .agentFailed)
   }
 }

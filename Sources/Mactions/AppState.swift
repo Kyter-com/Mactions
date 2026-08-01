@@ -237,7 +237,7 @@ final class AppState: ObservableObject {
   /// common cause of "steps/logs never show". Surfaced instead of being swallowed
   /// as a silent "no job".
   static func actionsErrorMessage(_ error: Error) -> String {
-    if case let GitHubClient.ClientError.http(code, _) = error, code == 403 || code == 404 {
+    if case GitHubClient.ClientError.http(let code, _) = error, code == 403 || code == 404 {
       return
         "GitHub returned \(code) reading this repo's Actions. The signed-in token can register runners but may lack \"Actions: read\" — reconnect with a classic token that has the `repo` scope, or a fine-grained token with Actions: Read-only."
     }
@@ -388,7 +388,9 @@ final class AppState: ObservableObject {
 
   /// Parse a comma-separated label string into a trimmed, non-empty token list.
   static func parseLabels(_ text: String) -> [String] {
-    text.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    text.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter {
+      !$0.isEmpty
+    }
   }
 
   // MARK: Plan mutation (the per-(repo,platform) config)
@@ -569,6 +571,7 @@ final class AppState: ObservableObject {
     do {
       let token = try GitHubCLIAuth.currentToken()
       try TokenStore.save(token)
+      resetActionsCaches()
       isSignedIn = true
       errorBanner = nil
       statusMessage = "Signed in via GitHub CLI."
@@ -593,6 +596,7 @@ final class AppState: ObservableObject {
         NSWorkspace.shared.open(code.verificationURI)
         let token = try await GitHubAuth.pollForToken(clientId: clientId, deviceCode: code)
         try TokenStore.save(token)
+        resetActionsCaches()
         isSignedIn = true
         errorBanner = nil
         statusMessage = "Signed in."
@@ -610,6 +614,7 @@ final class AppState: ObservableObject {
     guard !trimmed.isEmpty else { return }
     do {
       try TokenStore.save(trimmed)
+      resetActionsCaches()
       isSignedIn = true
       errorBanner = nil
       statusMessage = "Token saved."
@@ -622,6 +627,7 @@ final class AppState: ObservableObject {
   func signOut() {
     Task { await goOfflineAndWait() }
     try? TokenStore.clear()
+    resetActionsCaches()
     isSignedIn = false
     availableRepos = []
     statusMessage = "Signed out."
@@ -636,7 +642,7 @@ final class AppState: ObservableObject {
 
   func loadRepos() async {
     guard let token = TokenStore.load() else { return }
-    guard !reposLoading else { return } // dedupe concurrent loads
+    guard !reposLoading else { return }  // dedupe concurrent loads
     reposLoading = true
     defer { reposLoading = false }
     do {
@@ -667,7 +673,10 @@ final class AppState: ObservableObject {
 
   func goOnline() {
     errorBanner = nil  // a fresh attempt clears any prior blocking error
-    guard let token = TokenStore.load() else { reportBlockingError("Sign in to GitHub first."); return }
+    guard let token = TokenStore.load() else {
+      reportBlockingError("Sign in to GitHub first.")
+      return
+    }
     // All-repos mode needs no explicit repo list — discovery finds demand
     // across every admin repo, seeded from the plan's default platforms.
     guard !plan.repos.isEmpty || plan.isAllRepos else {
@@ -676,7 +685,8 @@ final class AppState: ObservableObject {
     }
     let combos = plan.enabledCombos()
     guard !combos.isEmpty || plan.isAllRepos else {
-      reportBlockingError("Enable at least one platform for a repo (select it on the left to configure).")
+      reportBlockingError(
+        "Enable at least one platform for a repo (select it on the left to configure).")
       return
     }
     guard !combos.isEmpty || !plan.defaultPlatforms.isEmpty else {
@@ -690,7 +700,8 @@ final class AppState: ObservableObject {
     guard invalid.isEmpty else {
       let names = invalid.map { "\($0.repo.name) (\($0.os.displayName))" }.joined(separator: ", ")
       reportBlockingError(
-        "Fix labels for: \(names). Each combo's labels must be non-empty and include `self-hosted`.")
+        "Fix labels for: \(names). Each combo's labels must be non-empty and include `self-hosted`."
+      )
       return
     }
     // The Windows base image is mid-(re)build — going online would clone a base
@@ -750,7 +761,8 @@ final class AppState: ObservableObject {
         let macOSDiscoveryRequested =
           discoveryPlatforms.contains(RunnerOS.macOS.rawValue) ? plan.defaultCount(for: .macOS) : 0
         let windowsDiscoveryRequested =
-          discoveryPlatforms.contains(RunnerOS.windows.rawValue) ? plan.defaultCount(for: .windows) : 0
+          discoveryPlatforms.contains(RunnerOS.windows.rawValue)
+          ? plan.defaultCount(for: .windows) : 0
         let linuxDiscoveryRequested =
           discoveryPlatforms.contains(RunnerOS.linux.rawValue) ? plan.defaultCount(for: .linux) : 0
         let macOSRequested =
@@ -831,7 +843,8 @@ final class AppState: ObservableObject {
         }
         guard fleetEpoch == myEpoch else { return }  // went offline during the probe
         let linuxFactory: LinuxContainerProviderFactory? =
-          linuxReady ? linuxCLI.map { LinuxContainerProviderFactory(image: linuxImg, cli: $0) } : nil
+          linuxReady
+          ? linuxCLI.map { LinuxContainerProviderFactory(image: linuxImg, cli: $0) } : nil
         // Containers are far lighter than a Fusion VM (sub-second start, shared
         // kernel), so the cap is CPU/RAM-driven and looser than the Windows VM
         // budget. 0 => host can't fit even one safely (skip Linux + say so).
@@ -847,7 +860,9 @@ final class AppState: ObservableObject {
         // demand bursty and concurrent, so capacity is spent when a runner is
         // actually provisioned and refunded when it exits — N combos can no
         // longer pre-claim the whole budget while idle.
-        let budget = HostBudget(limits: [.macOS: maxMacOS, .windows: maxWindowsVMs, .linux: maxLinux])
+        let budget = HostBudget(limits: [
+          .macOS: maxMacOS, .windows: maxWindowsVMs, .linux: maxLinux,
+        ])
         fleetBudget = budget
         fleetFactories = [:]
         if let factory, maxMacOS > 0 { fleetFactories[.macOS] = factory }
@@ -908,7 +923,7 @@ final class AppState: ObservableObject {
           }
         }
         guard fleetEpoch == myEpoch else {
-          for orch in created { await orch.stop() } // user went offline; undo
+          for orch in created { await orch.stop() }  // user went offline; undo
           return
         }
         state = .online
@@ -1025,7 +1040,7 @@ final class AppState: ObservableObject {
 
   func goOfflineAndWait() async {
     guard !orchestrators.isEmpty || state != .offline else { return }
-    fleetEpoch += 1 // invalidate any in-flight goOnline
+    fleetEpoch += 1  // invalidate any in-flight goOnline
     discoveryTask?.cancel()
     discoveryTask = nil
     state = .stopping
@@ -1064,7 +1079,10 @@ final class AppState: ObservableObject {
 
   /// Remove everything Mactions wrote to disk (cached agent + run files).
   func cleanUpHostFiles() {
-    guard state == .offline else { statusMessage = "Go offline first."; return }
+    guard state == .offline else {
+      statusMessage = "Go offline first."
+      return
+    }
     HostCleanup.purgeAll()
     statusMessage = "Removed the cached agent and all run files."
   }
@@ -1278,12 +1296,15 @@ final class AppState: ObservableObject {
   /// Button-triggered only; the long-blocking `brew install` runs off the main
   /// actor so the popover stays responsive.
   func installWindowsFreePrerequisites() {
-    guard state == .offline else { statusMessage = "Go offline first."; return }
+    guard state == .offline else {
+      statusMessage = "Go offline first."
+      return
+    }
     guard !windowsPreflightBusy else { return }
     let report = windowsPreflight ?? WindowsPreflight.detect()
     windowsPreflight = report
     switch WindowsPreflight.installPlan(for: report) {
-    case let .homebrewMissing(message):
+    case .homebrewMissing(let message):
       statusMessage = message
       return
     case .nothingToInstall:
@@ -1293,7 +1314,8 @@ final class AppState: ObservableObject {
       break
     }
     windowsPreflightBusy = true
-    statusMessage = "Installing free Windows prerequisites (ISO converter tools + xorriso via Homebrew)…"
+    statusMessage =
+      "Installing free Windows prerequisites (ISO converter tools + xorriso via Homebrew)…"
     Task {
       let result = await Self.runFreeInstall(report)
       windowsPreflightBusy = false
@@ -1303,10 +1325,11 @@ final class AppState: ObservableObject {
         statusMessage = "Installed the free Windows prerequisites."
       case .nothingToInstall:
         statusMessage = "All free Windows prerequisites are already installed."
-      case let .homebrewMissing(message):
+      case .homebrewMissing(let message):
         statusMessage = message
-      case let .failed(command, stderr):
-        statusMessage = "Install failed (`\(command)`): \(stderr.isEmpty ? "see Homebrew output" : stderr)"
+      case .failed(let command, let stderr):
+        statusMessage =
+          "Install failed (`\(command)`): \(stderr.isEmpty ? "see Homebrew output" : stderr)"
       }
     }
   }
@@ -1331,7 +1354,10 @@ final class AppState: ObservableObject {
   /// flags one. `force: false` (initial "Set up Windows runner") fast-paths when
   /// a ready base already exists, so a stray re-click doesn't re-download GBs.
   func setUpWindowsRunner(force: Bool = false) {
-    guard state == .offline else { statusMessage = "Go offline first."; return }
+    guard state == .offline else {
+      statusMessage = "Go offline first."
+      return
+    }
     guard !windowsSetupBusy else { return }
     guard let script = Self.prepareWindowsImageScript() else {
       statusMessage = "Couldn't find scripts/prepare-windows-image."
@@ -1368,23 +1394,24 @@ final class AppState: ObservableObject {
     Task {
       // 1) Install missing FREE deps (off the main actor — it may shell out).
       if case .install = WindowsPreflight.installPlan(for: report) {
-        statusMessage = "Installing free Windows prerequisites (ISO converter tools + xorriso via Homebrew)…"
+        statusMessage =
+          "Installing free Windows prerequisites (ISO converter tools + xorriso via Homebrew)…"
         let install = await Self.runFreeInstall(report)
         windowsPreflight = WindowsPreflight.detect()
         switch install {
         case .installed, .nothingToInstall:
           break  // proceed to the build
-        case let .homebrewMissing(message):
+        case .homebrewMissing(let message):
           statusMessage = message
           endWindowsSetup()
           return
-        case let .failed(command, stderr):
+        case .failed(let command, let stderr):
           statusMessage =
             "Couldn't install prerequisites (`\(command)`): \(stderr.isEmpty ? "see Homebrew output" : stderr)"
           endWindowsSetup()
           return
         }
-      } else if case let .homebrewMissing(message) = WindowsPreflight.installPlan(for: report) {
+      } else if case .homebrewMissing(let message) = WindowsPreflight.installPlan(for: report) {
         statusMessage = message
         endWindowsSetup()
         return
@@ -1401,7 +1428,8 @@ final class AppState: ObservableObject {
       // 3) Build the base image. prepare-windows-image auto-resolves + downloads
       // the latest Win11 ARM64 ISO (UUP dump) when no --iso is passed, then
       // drives the base-VM build. The blocking shell-out runs off the main actor.
-      statusMessage = "Setting up the Windows runner (downloading + building the base image — this takes a while)…"
+      statusMessage =
+        "Setting up the Windows runner (downloading + building the base image — this takes a while)…"
       // Stream the prep scripts' phase markers into the live stepper as the build
       // runs. The continuation is Sendable (safe to yield from the script's drain
       // threads); we consume on the MainActor and advance the stepper forward-only.
@@ -1438,7 +1466,8 @@ final class AppState: ObservableObject {
         windowsSetupFailure = nil
         windowsImageReady = false
         saveConfig()
-        statusMessage = "Windows setup cancelled. The base image is unchanged — re-run Rebuild when ready."
+        statusMessage =
+          "Windows setup cancelled. The base image is unchanged — re-run Rebuild when ready."
         return
       }
       if let result, result.ok {
@@ -1480,7 +1509,9 @@ final class AppState: ObservableObject {
           .map(String.init)
           .first { $0.hasPrefix("error: ") }
         let detail =
-          errorLine.map { String($0.dropFirst("error: ".count)).trimmingCharacters(in: .whitespaces) }
+          errorLine.map {
+            String($0.dropFirst("error: ".count)).trimmingCharacters(in: .whitespaces)
+          }
           ?? "the prep script failed"
         // Classify: an upstream/network cause (UUP dump down, a 522) isn't the
         // user's setup and is safe to retry (the ~8 GB download resumes); a local
@@ -1579,9 +1610,10 @@ final class AppState: ObservableObject {
       if health.toolsUp { parts.append("VMware Tools ✓") }
       if let secs = health.elapsedSecs, secs >= 60 { parts.append("\(secs / 60) min build") }
       // Only surface the guest log while it actually exists (purge-able).
-      windowsGuestLogPath = health.guestLogPath.flatMap {
-        FileManager.default.fileExists(atPath: $0) ? $0 : nil
-      } ?? Self.latestGuestBuildLogPath()
+      windowsGuestLogPath =
+        health.guestLogPath.flatMap {
+          FileManager.default.fileExists(atPath: $0) ? $0 : nil
+        } ?? Self.latestGuestBuildLogPath()
     } else {
       windowsGuestLogPath = Self.latestGuestBuildLogPath()
     }
@@ -1660,7 +1692,10 @@ final class AppState: ObservableObject {
   /// `windowsMaintenance`/`windowsUpdateNotice` (NOT `statusMessage` — see that
   /// property: this fires on every popover `onAppear`).
   func checkForWindowsImageUpdate() {
-    guard windowsImageReady else { clearWindowsUpdateNudge(); return }
+    guard windowsImageReady else {
+      clearWindowsUpdateNudge()
+      return
+    }
     // Recipe dimension first — local, instant, every onAppear.
     applyMaintenance(
       WindowsImage.maintenanceReason(
@@ -1772,13 +1807,17 @@ final class AppState: ObservableObject {
     case .unknown, .ready:
       return nil
     case .notSetUp:
-      return "Linux is enabled but the runner image has not been pulled on this Mac. Pull \(linuxRunnerImage) to run Linux jobs."
+      return
+        "Linux is enabled but the runner image has not been pulled on this Mac. Pull \(linuxRunnerImage) to run Linux jobs."
     case .runtimeMissing:
-      return "Linux is enabled but Apple container is not installed or is unsupported on this macOS. Install Apple container (macOS 26+), then pull the runner image."
+      return
+        "Linux is enabled but Apple container is not installed or is unsupported on this macOS. Install Apple container (macOS 26+), then pull the runner image."
     case .daemonUnavailable:
-      return "Linux is enabled but Apple container is installed and its daemon is not running. Open Linux setup to start it; if the image is still present, Mactions will skip the re-pull."
+      return
+        "Linux is enabled but Apple container is installed and its daemon is not running. Open Linux setup to start it; if the image is still present, Mactions will skip the re-pull."
     case .imageMissing:
-      return "Linux was set up before, but \(linuxRunnerImage) is no longer present locally. Re-pull the runner image to restore Linux jobs."
+      return
+        "Linux was set up before, but \(linuxRunnerImage) is no longer present locally. Re-pull the runner image to restore Linux jobs."
     }
   }
 
@@ -1850,7 +1889,10 @@ final class AppState: ObservableObject {
   /// button) re-pulls even if the image is already recorded; `force: false` (the
   /// initial tile tap) fast-paths when the image is already present + daemon up.
   func setUpLinuxRunner(force: Bool = false) {
-    guard state == .offline else { statusMessage = "Go offline first."; return }
+    guard state == .offline else {
+      statusMessage = "Go offline first."
+      return
+    }
     guard !linuxSetupBusy else { return }
     guard let cli = LinuxContainerProviderFactory.detectInstalledCLI() else {
       applyLinuxAvailability(.runtimeMissing)
@@ -2037,14 +2079,30 @@ final class AppState: ObservableObject {
   private func recordRun(_ record: RunRecord) {
     runHistory.insert(record, at: 0)
     if runHistory.count > RunHistoryStore.maxRecords {
-      runHistory.removeLast(runHistory.count - RunHistoryStore.maxRecords)
+      let overflow = runHistory.count - RunHistoryStore.maxRecords
+      let removedIDs = runHistory.suffix(overflow).map(\.id)
+      runHistory.removeLast(overflow)
+      for id in removedIDs {
+        jobLogs.removeValue(forKey: id)
+        jobLogRecency.removeAll { $0 == id }
+        jobLogRequestGeneration.removeValue(forKey: id)
+      }
     }
     persistHistory()
+    // Correlate promptly even when the History pane is closed, then persist the
+    // stable GitHub job id. That makes logs a direct lookup after relaunch rather
+    // than depending on the run still being inside GitHub's recent first page.
+    Task { @MainActor [weak self] in await self?.resolveRecentConclusions() }
   }
 
   /// Wipe the persisted run history (dashboard "Clear" button).
   func clearRunHistory() {
+    historyRequestEpoch += 1
+    conclusionResolutionGeneration += 1
     runHistory = []
+    jobLogs = [:]
+    jobLogRecency = []
+    jobLogRequestGeneration = [:]
     persistHistory()
   }
 
@@ -2129,7 +2187,9 @@ final class AppState: ObservableObject {
       guard parent.path != probe.path else { break }
       probe = parent
     }
-    if let values = try? probe.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+    if let values = try? probe.resourceValues(forKeys: [
+      .volumeAvailableCapacityForImportantUsageKey
+    ]),
       let capacity = values.volumeAvailableCapacityForImportantUsage
     {
       return UInt64(max(0, capacity))
@@ -2162,8 +2222,10 @@ final class AppState: ObservableObject {
       while !Task.isCancelled {
         // The ps + Mach sampling runs on a detached task; the `await` SUSPENDS the
         // main actor (never blocks it) and we only publish the result here.
-        let sample = await Task.detached { MemorySampler.sample(runsRootPath: HostCleanup.runsRoot().path) }
-          .value
+        let sample = await Task.detached {
+          MemorySampler.sample(runsRootPath: HostCleanup.runsRoot().path)
+        }
+        .value
         guard let self, !Task.isCancelled else { break }
         self.appendMemorySample(sample)
         try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -2191,10 +2253,41 @@ final class AppState: ObservableObject {
   /// one run → one job's log.
   enum JobLogState: Sendable, Equatable {
     case loading
+    /// GitHub knows the job but has not published its downloadable log yet.
+    /// Kept distinct from an empty successful response so recent jobs can retry.
+    case notReady(job: WorkflowJob)
     case loaded(job: WorkflowJob?, lines: [String])
     case unavailable(String)
   }
   @Published var jobLogs: [String: JobLogState] = [:]
+
+  /// Parsed logs can be large. Keep only a small LRU working set instead of
+  /// retaining every log the user has opened during a long dashboard session.
+  private static let maxCachedJobLogs = 8
+  private var jobLogRecency: [String] = []
+
+  /// Logical request generations prevent canceled / superseded work from
+  /// publishing after a selection, auth account, or history reset changed.
+  private var authRequestEpoch = 0
+  private var historyRequestEpoch = 0
+  private var jobLogRequestGeneration: [String: Int] = [:]
+  private var runnerJobRequestGeneration: [String: Int] = [:]
+  private var conclusionResolutionGeneration = 0
+  private var busyRefreshGeneration = 0
+
+  private func touchJobLog(_ id: String) {
+    jobLogRecency.removeAll { $0 == id }
+    jobLogRecency.append(id)
+  }
+
+  private func setJobLog(_ state: JobLogState, for id: String) {
+    touchJobLog(id)
+    jobLogs[id] = state
+    while jobLogRecency.count > Self.maxCachedJobLogs {
+      let evicted = jobLogRecency.removeFirst()
+      jobLogs.removeValue(forKey: evicted)
+    }
+  }
 
   /// Live-job lookup state for a currently-online runner, keyed by runner name.
   /// Used to show the running job's step checklist (GitHub doesn't expose a live
@@ -2214,60 +2307,185 @@ final class AppState: ObservableObject {
   }
   @Published var runnerJobs: [String: RunnerJobState] = [:]
 
+  /// Keep one Actions client per repo so its ETag store survives the dashboard's
+  /// 4-second refresh loop. Reconstructing a client on every tick discarded the
+  /// conditional-request cache and forced full responses each time.
+  private var actionsClients: [String: GitHubClient] = [:]
+  private static let maxActionsClients = 64
+  private var actionsClientRecency: [String] = []
+
+  private static func isCancellation(_ error: Error) -> Bool {
+    error is CancellationError || (error as? URLError)?.code == .cancelled
+  }
+
+  private func isCurrentJobLogRequest(
+    id: String, generation: Int, authEpoch: Int, historyEpoch: Int
+  ) -> Bool {
+    !Task.isCancelled
+      && authRequestEpoch == authEpoch
+      && historyRequestEpoch == historyEpoch
+      && jobLogRequestGeneration[id] == generation
+      && runHistory.contains { $0.id == id }
+  }
+
+  /// Tokens can change without restarting the app. Drop API clients (which retain
+  /// the old token) and any token-scoped fetched state immediately on auth changes.
+  private func resetActionsCaches() {
+    authRequestEpoch += 1
+    historyRequestEpoch += 1
+    conclusionResolutionGeneration += 1
+    busyRefreshGeneration += 1
+    actionsClients = [:]
+    actionsClientRecency = []
+    jobLogs = [:]
+    jobLogRecency = []
+    jobLogRequestGeneration = [:]
+    runnerJobRequestGeneration = [:]
+    runnerJobs = [:]
+    busyRunnerNames = []
+  }
+
   private func client(forRepo repo: String) -> GitHubClient? {
     guard let token = TokenStore.load() else { return nil }
+    if let cached = actionsClients[repo], cached.token == token {
+      actionsClientRecency.removeAll { $0 == repo }
+      actionsClientRecency.append(repo)
+      return cached
+    }
     let parts = repo.split(separator: "/")
     guard parts.count == 2 else { return nil }
-    return GitHubClient(owner: String(parts[0]), repo: String(parts[1]), token: token)
+    let client = GitHubClient(owner: String(parts[0]), repo: String(parts[1]), token: token)
+    actionsClients[repo] = client
+    actionsClientRecency.removeAll { $0 == repo }
+    actionsClientRecency.append(repo)
+    while actionsClientRecency.count > Self.maxActionsClients {
+      actionsClients.removeValue(forKey: actionsClientRecency.removeFirst())
+    }
+    return client
   }
 
   /// Fetch (and cache) a past run's GitHub Actions job log for inline display.
   /// Correlates by the unique runner name, then downloads the job log. Cheap to
   /// re-call: returns the cached result unless `force`.
   func loadJobLog(for record: RunRecord, force: Bool = false) async {
-    if !force, let state = jobLogs[record.id], case .loaded = state { return }
-    guard let client = client(forRepo: record.repo) else {
-      jobLogs[record.id] = .unavailable("Sign in to GitHub to fetch logs.")
+    if !force, let state = jobLogs[record.id], case .loaded = state {
+      touchJobLog(record.id)
       return
     }
-    jobLogs[record.id] = .loading
+    guard runHistory.contains(where: { $0.id == record.id }) else { return }
+    guard let client = client(forRepo: record.repo) else {
+      setJobLog(.unavailable("Sign in to GitHub to fetch logs."), for: record.id)
+      return
+    }
+    let generation = (jobLogRequestGeneration[record.id] ?? 0) + 1
+    jobLogRequestGeneration[record.id] = generation
+    let authEpoch = authRequestEpoch
+    let historyEpoch = historyRequestEpoch
+    setJobLog(.loading, for: record.id)
     // `findJob` / `fetchJobLog` are nonisolated async, so they run OFF the main
     // actor (the awaits suspend it, never block) AND respect cancellation: closing
     // the dashboard cancels this `.task`, which cancels the in-flight URLSession
     // calls. (Task.detached would have detached from that cancellation.)
     let job: WorkflowJob?
     do {
-      job = try await client.findJob(runnerName: record.id, since: record.startedAt)
+      let persistedJobId = runHistory.first(where: { $0.id == record.id })?.githubJobId
+      if let persistedJobId {
+        job = try await client.getJob(jobId: persistedJobId, etagged: true)
+      } else {
+        job = try await client.findJob(
+          runnerName: record.id, since: record.startedAt, until: record.endedAt,
+          etagged: true)
+      }
     } catch {
+      if Self.isCancellation(error)
+        || !isCurrentJobLogRequest(
+          id: record.id, generation: generation, authEpoch: authEpoch,
+          historyEpoch: historyEpoch)
+      {
+        return
+      }
       // A hard Actions-read failure (e.g. missing `Actions: read` scope) — surface
       // the real reason instead of an indexing-miss message. Leave `jobConclusion`
       // untouched so the row self-heals once access is fixed.
-      jobLogs[record.id] = .unavailable(Self.actionsErrorMessage(error))
+      setJobLog(.unavailable(Self.actionsErrorMessage(error)), for: record.id)
       return
     }
+    guard
+      isCurrentJobLogRequest(
+        id: record.id, generation: generation, authEpoch: authEpoch,
+        historyEpoch: historyEpoch)
+    else { return }
     guard let job else {
-      jobLogs[record.id] = .unavailable(
-        "No matching job found on GitHub — it may have expired, or GitHub hasn't indexed it yet.")
+      setJobLog(
+        .unavailable(
+          "No matching job found on GitHub — it may have expired, or GitHub hasn't indexed it yet."),
+        for: record.id)
       // Leave `jobConclusion` untouched: a transient indexing miss must not get
       // stamped as a permanent state — the row keeps its honest provisional status
       // and self-heals on the next fetch.
       return
     }
-    let text = (try? await client.fetchJobLog(jobId: job.id)) ?? ""
-    jobLogs[record.id] = .loaded(job: job, lines: await splitLines(text))
-    // Back-fill the TRUE result so History stops trusting the agent exit code.
-    updateRunConclusion(
-      record.id,
-      to: .resolve(status: job.status, conclusion: job.conclusion, exitStatus: record.exitStatus))
+    // Persist both the stable direct-lookup id and TRUE result. Future refreshes
+    // and app launches no longer need a recent-runs sweep for this record.
+    updateRun(record.id, from: job)
+    do {
+      let text = try await client.fetchJobLog(jobId: job.id)
+      guard
+        isCurrentJobLogRequest(
+          id: record.id, generation: generation, authEpoch: authEpoch,
+          historyEpoch: historyEpoch)
+      else { return }
+      let lines = await splitLines(text)
+      guard
+        isCurrentJobLogRequest(
+          id: record.id, generation: generation, authEpoch: authEpoch,
+          historyEpoch: historyEpoch)
+      else { return }
+      setJobLog(.loaded(job: job, lines: lines), for: record.id)
+    } catch let GitHubClient.ClientError.http(code, _) where code == 404 {
+      guard
+        isCurrentJobLogRequest(
+          id: record.id, generation: generation, authEpoch: authEpoch,
+          historyEpoch: historyEpoch)
+      else { return }
+      // We successfully read the job, so this 404 is the log endpoint's normal
+      // "not ready / expired" response — not a missing Actions-read scope. Only
+      // a freshly-finished run is retryable; an old retained row must not claim
+      // GitHub is still preparing a log that has actually expired or been deleted.
+      if Date().timeIntervalSince(record.endedAt) < 5 * 60 {
+        setJobLog(.notReady(job: job), for: record.id)
+      } else {
+        setJobLog(
+          .unavailable(
+            "The job was found, but its log is no longer downloadable (it expired or the run was deleted)."
+          ),
+          for: record.id)
+      }
+    } catch {
+      if Self.isCancellation(error)
+        || !isCurrentJobLogRequest(
+          id: record.id, generation: generation, authEpoch: authEpoch,
+          historyEpoch: historyEpoch)
+      {
+        return
+      }
+      // Network/rate-limit/server failures are not empty logs. Keep them visible
+      // and retryable so a transient outage never masquerades as deleted output.
+      setJobLog(
+        .unavailable("Couldn't download this job's log: \(error.localizedDescription)"),
+        for: record.id)
+    }
   }
 
-  /// Patch the resolved GitHub conclusion onto a recorded run (in memory + disk).
-  /// No-ops when unchanged so it never churns the history file. Re-persists through
-  /// the existing serialized `persistHistory()` chain (no new queue).
-  private func updateRunConclusion(_ id: String, to conclusion: RunRecord.JobConclusion) {
-    guard let i = runHistory.firstIndex(where: { $0.id == id }),
-      runHistory[i].jobConclusion != conclusion
+  /// Persist the stable GitHub job id and its current true conclusion together.
+  /// No-ops when unchanged so ETagged settlement polls never churn the file.
+  private func updateRun(_ id: String, from job: WorkflowJob) {
+    guard let i = runHistory.firstIndex(where: { $0.id == id }) else { return }
+    let conclusion = RunRecord.JobConclusion.resolve(
+      status: job.status, conclusion: job.conclusion, exitStatus: runHistory[i].exitStatus)
+    guard runHistory[i].githubJobId != job.id || runHistory[i].jobConclusion != conclusion
     else { return }
+    runHistory[i].githubJobId = job.id
     runHistory[i].jobConclusion = conclusion
     persistHistory()
   }
@@ -2278,18 +2496,54 @@ final class AppState: ObservableObject {
   /// sweep resolves every pending runner from that repo, so it costs ~one sweep per
   /// repo rather than one per row.
   func resolveRecentConclusions(limit: Int = 12) async {
-    let unresolved = runHistory.prefix(limit).filter { $0.jobConclusion == nil }
+    // `.inProgress` is also unresolved: GitHub can still be settling the job when
+    // the ephemeral agent exits. Treating it as terminal left History stuck on
+    // "Running" forever after one unlucky early lookup.
+    conclusionResolutionGeneration += 1
+    let generation = conclusionResolutionGeneration
+    let authEpoch = authRequestEpoch
+    let historyEpoch = historyRequestEpoch
+    let unresolved = runHistory.prefix(limit).filter {
+      $0.githubJobId == nil || $0.jobConclusion == nil || $0.jobConclusion == .inProgress
+    }
     guard !unresolved.isEmpty else { return }
     for (repo, records) in Dictionary(grouping: unresolved, by: { $0.repo }) {
-      if Task.isCancelled { return }
-      guard let client = client(forRepo: repo),
-        let jobs = await client.recentJobs(since: records.map(\.startedAt).min() ?? Date())
-      else { continue }
+      guard !Task.isCancelled, authRequestEpoch == authEpoch,
+        historyRequestEpoch == historyEpoch,
+        conclusionResolutionGeneration == generation
+      else { return }
+      guard let client = client(forRepo: repo) else { continue }
+      var undiscovered: [RunRecord] = []
       for record in records {
+        guard let jobId = record.githubJobId else {
+          undiscovered.append(record)
+          continue
+        }
+        let job: WorkflowJob
+        do {
+          job = try await client.getJob(jobId: jobId, etagged: true)
+        } catch {
+          if Self.isCancellation(error) { return }
+          continue
+        }
+        guard !Task.isCancelled, authRequestEpoch == authEpoch,
+          historyRequestEpoch == historyEpoch,
+          conclusionResolutionGeneration == generation
+        else { return }
+        updateRun(record.id, from: job)
+      }
+      guard !undiscovered.isEmpty,
+        let jobs = await client.recentJobs(
+          since: undiscovered.map(\.startedAt).min() ?? Date(),
+          until: undiscovered.map(\.endedAt).max(), etagged: true)
+      else { continue }
+      guard !Task.isCancelled, authRequestEpoch == authEpoch,
+        historyRequestEpoch == historyEpoch,
+        conclusionResolutionGeneration == generation
+      else { return }
+      for record in undiscovered {
         guard let job = GitHubClient.pickJob(jobs, runnerName: record.id) else { continue }
-        updateRunConclusion(
-          record.id,
-          to: .resolve(status: job.status, conclusion: job.conclusion, exitStatus: record.exitStatus))
+        updateRun(record.id, from: job)
       }
     }
   }
@@ -2297,30 +2551,49 @@ final class AppState: ObservableObject {
   /// Split text into lines off the main actor (nonisolated async) so a large log
   /// never churns the main thread when it's stored/rendered.
   private nonisolated func splitLines(_ text: String) async -> [String] {
-    text.isEmpty ? [] : text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+    text.isEmpty
+      ? [] : text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
   }
 
   /// Look up the job a currently-online runner is executing (for the live step
   /// checklist). Re-callable on a poll; updates the cached entry in place.
   /// Poll GitHub for which of our runners are BUSY (executing a job) so the
   /// dashboard's activity ring spins only during a real job — not for an idle but
-  /// online runner. Cheap: one `listRunners` per selected repo. Driven by the
-  /// Runners pane's `.task` while it's visible; clears itself when offline.
+  /// online runner. Cheap: one ETagged `listRunners` per repo with visible runners.
+  /// Driven by the Runners pane's `.task` while it's visible; clears itself offline.
   func refreshRunnerBusy() async {
+    busyRefreshGeneration += 1
+    let generation = busyRefreshGeneration
+    let authEpoch = authRequestEpoch
     guard state == .online, TokenStore.load() != nil else {
       if !busyRunnerNames.isEmpty { busyRunnerNames = [] }
       return
     }
     var busy: Set<String> = []
-    // Poll every repo with a live orchestrator — fleetRepo covers the explicit
-    // plan AND all-repos discovered fleets (whose runners would otherwise never
-    // show the activity ring).
-    for repoName in Set(fleetRepo.values) {
+    // Only repos with a visible runner need a busy-status dot. Polling every
+    // scale-zero orchestrator every six seconds wasted quota while showing no UI.
+    // `listRunners` is ETagged, so unchanged live fleets return quota-free 304s.
+    let runnersByRepo = Dictionary(grouping: runners, by: \.repoFullName)
+    for (repoName, localRunners) in runnersByRepo {
+      guard !Task.isCancelled, authRequestEpoch == authEpoch,
+        busyRefreshGeneration == generation, state == .online
+      else { return }
       guard let client = client(forRepo: repoName) else { continue }
-      if let remote = try? await client.listRunners() {
+      do {
+        let remote = try await client.listRunners()
+        guard !Task.isCancelled, authRequestEpoch == authEpoch,
+          busyRefreshGeneration == generation, state == .online
+        else { return }
         for runner in remote where runner.busy { busy.insert(runner.name) }
+      } catch {
+        if Self.isCancellation(error) { return }
+        // Preserve the last known verdict for this repo during a transient
+        // failure; an outage must not make a genuinely busy runner look idle.
+        let localNames = Set(localRunners.map { $0.runner.id })
+        busy.formUnion(busyRunnerNames.intersection(localNames))
       }
     }
+    busy.formIntersection(Set(runners.map { $0.runner.id }))
     // Skip the publish when the busy set is unchanged (the common case on a
     // steady fleet) — an unconditional write here fired objectWillChange every
     // 6s and relayout the whole window even when nothing moved.
@@ -2330,25 +2603,55 @@ final class AppState: ObservableObject {
   /// `busy` is GitHub's runner-API verdict for this runner (from `busyRunnerNames`):
   /// it decides whether an unmatched lookup reads as `.running` (busy → job just
   /// not indexed yet) or `.notFound` (idle ephemeral runner). When the jobs API
-  /// itself reports an in-progress job, the runner is also added to
-  /// `runnersWithLiveJob` so the activity ring spins even if the runner API lagged.
-  func loadRunnerJob(for runnerName: String, repo: String, busy: Bool) async {
+  /// itself reports an in-progress job, its step checklist remains authoritative
+  /// even if the separate runner busy-state poll is briefly behind.
+  func loadRunnerJob(
+    for runnerName: String, repo: String, startedAt: Date, busy: Bool
+  ) async {
+    let generation = (runnerJobRequestGeneration[runnerName] ?? 0) + 1
+    runnerJobRequestGeneration[runnerName] = generation
+    let authEpoch = authRequestEpoch
+    func isCurrent() -> Bool {
+      !Task.isCancelled && authRequestEpoch == authEpoch
+        && runnerJobRequestGeneration[runnerName] == generation
+        && runners.contains { $0.runner.id == runnerName }
+    }
     guard let client = client(forRepo: repo) else {
-      runnerJobs[runnerName] = .error("Sign in to GitHub to see the running job's steps.")
+      if isCurrent() {
+        runnerJobs[runnerName] = .error("Sign in to GitHub to see the running job's steps.")
+      }
       return
     }
     if runnerJobs[runnerName] == nil { runnerJobs[runnerName] = .loading }
-    let since = Date().addingTimeInterval(-3 * 3600)  // runner came up recently
+
+    // Once correlation found the stable job id, refresh that one job directly.
+    // This is one ETagged request instead of re-listing recent runs and walking
+    // their jobs on every 4-second tick.
+    if case .found(let knownJob) = runnerJobs[runnerName] {
+      do {
+        let refreshed = try await client.getJob(jobId: knownJob.id, etagged: true)
+        guard isCurrent() else { return }
+        runnerJobs[runnerName] = .found(refreshed)
+      } catch {
+        if Self.isCancellation(error) || !isCurrent() { return }
+        runnerJobs[runnerName] = .error(Self.actionsErrorMessage(error))
+      }
+      return
+    }
+
     // Structured await: off-main (nonisolated async) + cancels when the runner is
     // deselected / the dashboard closes. findJob throws on an Actions-read failure
     // (e.g. missing scope) so we surface it instead of mislabeling it "no job".
     do {
-      let job = try await client.findJob(runnerName: runnerName, since: since)
+      let job = try await client.findJob(
+        runnerName: runnerName, since: startedAt, preferActive: true, etagged: true)
+      guard isCurrent() else { return }
       // No job matched yet: if the runner API says it's busy, the job just isn't
       // indexed yet (`.running`, consistent with the spinning ring); otherwise the
       // ephemeral runner is genuinely idle (`.notFound`).
       runnerJobs[runnerName] = job.map(RunnerJobState.found) ?? (busy ? .running : .notFound)
     } catch {
+      if Self.isCancellation(error) || !isCurrent() { return }
       runnerJobs[runnerName] = .error(Self.actionsErrorMessage(error))
     }
   }
@@ -2402,10 +2705,26 @@ final class AppState: ObservableObject {
     // whole window each time (the other published values below are diffed too).
     var structureChanged = false
     let sorted = rows.sorted { $0.id < $1.id }
-    if sorted != runners { runners = sorted; structureChanged = true }
+    if sorted != runners {
+      runners = sorted
+      structureChanged = true
+    }
+    // Runner names are unique per ephemeral registration. Once a row disappears,
+    // its live job/checklist and request generation can never be useful again.
+    let liveRunnerIDs = Set(sorted.map { $0.runner.id })
+    let liveRunnerJobs = runnerJobs.filter { liveRunnerIDs.contains($0.key) }
+    if liveRunnerJobs != runnerJobs { runnerJobs = liveRunnerJobs }
+    runnerJobRequestGeneration = runnerJobRequestGeneration.filter {
+      liveRunnerIDs.contains($0.key)
+    }
+    let liveBusy = busyRunnerNames.intersection(liveRunnerIDs)
+    if liveBusy != busyRunnerNames { busyRunnerNames = liveBusy }
     if demand != repoQueuedJobs { repoQueuedJobs = demand }
     let watched = Set(fleetRepo.values)
-    if watched != watchedRepos { watchedRepos = watched; structureChanged = true }
+    if watched != watchedRepos {
+      watchedRepos = watched
+      structureChanged = true
+    }
     if pollFailing != repoPollFailing { repoPollFailing = pollFailing }
     if waitingCapacity != repoWaitingForCapacity { repoWaitingForCapacity = waitingCapacity }
     if launchFailures != repoLaunchFailure { repoLaunchFailure = launchFailures }

@@ -14,7 +14,7 @@ import Foundation
 public struct RunRecord: Codable, Sendable, Identifiable, Equatable {
   public enum Outcome: String, Codable, Sendable {
     case completed  // exited 0 on its own while the fleet was online
-    case failed     // exited non-zero on its own while online (agent crash / error)
+    case failed  // exited non-zero on its own while online (agent crash / error)
   }
 
   /// The *true* result, resolved from the GitHub job once we can find it — NOT the
@@ -30,7 +30,7 @@ public struct RunRecord: Codable, Sendable, Identifiable, Equatable {
     case timedOut = "timed_out"
     case neutral
     case skipped
-    case inProgress = "in_progress"    // job still running / queued on GitHub
+    case inProgress = "in_progress"  // job still running / queued on GitHub
     case agentFailed = "agent_failed"  // agent exited non-zero (crash; job may not have run)
 
     /// Resolve the persisted conclusion from a fetched GitHub job + the agent exit.
@@ -42,13 +42,13 @@ public struct RunRecord: Codable, Sendable, Identifiable, Equatable {
       if let code = exitStatus, code != 0 { return .agentFailed }
       guard status == "completed" else { return .inProgress }
       switch conclusion {
-      case "success":   return .success
-      case "failure":   return .failure
+      case "success": return .success
+      case "failure": return .failure
       case "timed_out": return .timedOut
       case "cancelled": return .cancelled
-      case "skipped":   return .skipped
-      case "neutral":   return .neutral
-      default:          return .inProgress  // completed with a null conclusion ≈ still settling
+      case "skipped": return .skipped
+      case "neutral": return .neutral
+      default: return .inProgress  // completed with a null conclusion ≈ still settling
       }
     }
   }
@@ -74,13 +74,18 @@ public struct RunRecord: Codable, Sendable, Identifiable, Equatable {
   public let outcome: Outcome
   /// The true GitHub job result, back-filled from the Jobs API. `nil` until
   /// resolved (offline, not fetched yet, or the job isn't indexed). `var` so
-  /// `AppState.updateRunConclusion` can patch it in place in the in-memory array.
+  /// AppState can patch it in place in the in-memory array.
   public var jobConclusion: JobConclusion?
+  /// Stable GitHub Actions job id, persisted as soon as runner-name correlation
+  /// succeeds. Keeping it with the history row makes logs and conclusion refreshes
+  /// direct O(1) lookups after an app restart instead of repeatedly searching a
+  /// repo's moving workflow-run window. Optional for legacy history JSON.
+  public var githubJobId: Int?
 
   public init(
     id: String, os: RunnerOS, repo: String, remoteId: Int?,
     startedAt: Date, endedAt: Date, exitStatus: Int32?, outcome: Outcome,
-    jobConclusion: JobConclusion? = nil
+    jobConclusion: JobConclusion? = nil, githubJobId: Int? = nil
   ) {
     self.id = id
     self.os = os
@@ -91,6 +96,7 @@ public struct RunRecord: Codable, Sendable, Identifiable, Equatable {
     self.exitStatus = exitStatus
     self.outcome = outcome
     self.jobConclusion = jobConclusion
+    self.githubJobId = githubJobId
   }
 
   /// Runner lifetime in seconds (came-up → exited). See the note on `startedAt`.
@@ -106,10 +112,10 @@ public struct RunRecord: Codable, Sendable, Identifiable, Equatable {
       return outcome == .completed ? .unknownCompleted : .failed
     }
     switch c {
-    case .success:                          return .passed
+    case .success: return .passed
     case .failure, .timedOut, .agentFailed: return .failed
-    case .cancelled, .skipped, .neutral:    return .neutral
-    case .inProgress:                       return .running
+    case .cancelled, .skipped, .neutral: return .neutral
+    case .inProgress: return .running
     }
   }
 
@@ -119,13 +125,13 @@ public struct RunRecord: Codable, Sendable, Identifiable, Equatable {
       return outcome == .completed ? "Completed" : "Failed"
     }
     switch c {
-    case .success:     return "Passed"
-    case .failure:     return "Failed"
-    case .timedOut:    return "Timed out"
-    case .cancelled:   return "Cancelled"
-    case .skipped:     return "Skipped"
-    case .neutral:     return "Neutral"
-    case .inProgress:  return "Running"
+    case .success: return "Passed"
+    case .failure: return "Failed"
+    case .timedOut: return "Timed out"
+    case .cancelled: return "Cancelled"
+    case .skipped: return "Skipped"
+    case .neutral: return "Neutral"
+    case .inProgress: return "Running"
     case .agentFailed: return "Agent failed"
     }
   }

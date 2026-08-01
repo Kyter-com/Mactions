@@ -118,7 +118,8 @@ final class GitHubQueuedJobsTests: XCTestCase {
           200, [:],
           self.json(
             #"{"jobs": [{"id": 10, "run_id": 1, "name": "a", "status": "queued", "labels": ["self-hosted", "macOS"]},"#
-              + #"{"id": 11, "run_id": 1, "name": "b", "status": "completed", "labels": ["self-hosted", "macOS"]}]}"#)
+              + #"{"id": 11, "run_id": 1, "name": "b", "status": "completed", "labels": ["self-hosted", "macOS"]}]}"#
+          )
         )
       }
       if url.contains("/actions/runs/2/jobs") {
@@ -126,7 +127,8 @@ final class GitHubQueuedJobsTests: XCTestCase {
           200, [:],
           self.json(
             #"{"jobs": [{"id": 20, "run_id": 2, "name": "c", "status": "in_progress", "labels": ["self-hosted", "Linux"]},"#
-              + #"{"id": 21, "run_id": 2, "name": "d", "status": "queued", "labels": ["self-hosted", "Windows", "mactions"]}]}"#)
+              + #"{"id": 21, "run_id": 2, "name": "d", "status": "queued", "labels": ["self-hosted", "Windows", "mactions"]}]}"#
+          )
         )
       }
       return (404, [:], self.json(#"{"message": "unexpected: \#(url)"}"#))
@@ -147,7 +149,8 @@ final class GitHubQueuedJobsTests: XCTestCase {
     let runsBody = json(
       #"{"workflow_runs": [{"id": 1, "created_at": "\#(now)", "status": "queued"}]}"#)
     let jobsBody = json(
-      #"{"jobs": [{"id": 10, "run_id": 1, "name": "a", "status": "queued", "labels": ["self-hosted"]}]}"#)
+      #"{"jobs": [{"id": 10, "run_id": 1, "name": "a", "status": "queued", "labels": ["self-hosted"]}]}"#
+    )
     StubURLProtocol.handler = { request in
       let url = request.url!.absoluteString
       if url.contains("/actions/runs?") {
@@ -184,7 +187,8 @@ final class GitHubQueuedJobsTests: XCTestCase {
         return (
           200, [:],
           self.json(
-            #"{"workflow_runs": [{"id": 5, "created_at": "\#(old)", "updated_at": "\#(now)", "status": "queued"}]}"#)
+            #"{"workflow_runs": [{"id": 5, "created_at": "\#(old)", "updated_at": "\#(now)", "status": "queued"}]}"#
+          )
         )
       }
       if url.contains("/actions/runs?") {
@@ -194,7 +198,8 @@ final class GitHubQueuedJobsTests: XCTestCase {
         return (
           200, [:],
           self.json(
-            #"{"jobs": [{"id": 50, "run_id": 5, "name": "retry", "status": "queued", "labels": ["self-hosted", "mactions"]}]}"#)
+            #"{"jobs": [{"id": 50, "run_id": 5, "name": "retry", "status": "queued", "labels": ["self-hosted", "mactions"]}]}"#
+          )
         )
       }
       return (404, [:], Data())
@@ -202,6 +207,120 @@ final class GitHubQueuedJobsTests: XCTestCase {
 
     let labels = try await client.listQueuedJobLabels()
     XCTAssertEqual(labels, [["self-hosted", "mactions"]])
+  }
+
+  /// Runner→job correlation needs the same re-run timestamp rule as demand
+  /// detection. A manual re-run can happen hours or days after the original run,
+  /// so filtering only on created_at loses the live runner and its History log.
+  func testFindJobUsesUpdatedAtForOldReRun() async throws {
+    let old = iso(Date().addingTimeInterval(-3 * 24 * 3600))
+    let now = iso(Date())
+    StubURLProtocol.handler = { request in
+      let url = request.url!.absoluteString
+      if url.contains("/actions/runs?") {
+        return (
+          200, [:],
+          self.json(
+            #"{"workflow_runs": [{"id": 5, "created_at": "\#(old)", "updated_at": "\#(now)", "status": "in_progress"}]}"#
+          )
+        )
+      }
+      if url.contains("/actions/runs/5/jobs") {
+        return (
+          200, [:],
+          self.json(
+            #"{"total_count": 1, "jobs": [{"id": 50, "run_id": 5, "name": "retry", "status": "in_progress", "runner_name": "mactions-host-rerun"}]}"#
+          )
+        )
+      }
+      return (404, [:], Data())
+    }
+
+    let job = try await client.findJob(
+      runnerName: "mactions-host-rerun", since: Date().addingTimeInterval(-60))
+
+    XCTAssertEqual(job?.id, 50)
+  }
+
+  /// A readable workflow-runs list does not prove the token can read Jobs. If
+  /// every candidate's Jobs request fails, surface that API error instead of
+  /// misreporting a scope failure or outage as "no matching job".
+  func testFindJobThrowsWhenEveryCandidateJobsRequestFails() async {
+    let now = iso(Date())
+    StubURLProtocol.handler = { request in
+      let url = request.url!
+      if url.path == "/repos/o/r/actions/runs" {
+        return (
+          200, [:],
+          self.json(
+            #"{"workflow_runs":[{"id":5,"created_at":"\#(now)","updated_at":"\#(now)","status":"in_progress"}]}"#
+          )
+        )
+      }
+      if url.path == "/repos/o/r/actions/runs/5/jobs" {
+        return (403, [:], self.json(#"{"message":"Resource not accessible by token"}"#))
+      }
+      return (404, [:], Data())
+    }
+
+    do {
+      _ = try await client.findJob(
+        runnerName: "mactions-host-scope", since: Date().addingTimeInterval(-60))
+      XCTFail("expected the Jobs API failure to propagate")
+    } catch GitHubClient.ClientError.http(let code, _) {
+      XCTAssertEqual(code, 403)
+    } catch {
+      XCTFail("unexpected error: \(error)")
+    }
+  }
+
+  /// GitHub allows matrices larger than one 100-item Jobs API page. Missing page
+  /// 2 can hide queued demand or make a valid ephemeral runner impossible to
+  /// correlate, so listJobs must honor total_count and paginate.
+  func testListJobsPaginatesAllPages() async throws {
+    func jobsBody(ids: ClosedRange<Int>, total: Int) -> Data {
+      let jobs: [[String: Any]] = ids.map {
+        ["id": $0, "run_id": 9, "name": "job-\($0)", "status": "queued"]
+      }
+      return try! JSONSerialization.data(withJSONObject: ["total_count": total, "jobs": jobs])
+    }
+    StubURLProtocol.handler = { request in
+      let page = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+        .queryItems?.first(where: { $0.name == "page" })?.value
+      if page == "2" { return (200, [:], jobsBody(ids: 101...101, total: 101)) }
+      return (200, [:], jobsBody(ids: 1...100, total: 101))
+    }
+
+    let jobs = try await client.listJobs(runId: 9)
+
+    XCTAssertEqual(jobs.count, 101)
+    XCTAssertEqual(jobs.last?.id, 101)
+    XCTAssertEqual(StubURLProtocol.seen.count, 2)
+    XCTAssertTrue(StubURLProtocol.seen[1].url!.absoluteString.contains("page=2"))
+  }
+
+  /// After initial runner-name correlation, live refreshes use the direct job
+  /// endpoint. Its ETag must survive across ticks and replay the cached job on a
+  /// 304 so a steady checklist does not consume primary rate-limit quota.
+  func testDirectJobRefreshReplaysETaggedBody() async throws {
+    let body = json(
+      #"{"id": 50, "run_id": 5, "name": "build", "status": "in_progress", "runner_name": "mactions-host-live", "steps": [{"name": "Test", "status": "in_progress", "conclusion": null, "number": 1}]}"#
+    )
+    StubURLProtocol.handler = { request in
+      if request.value(forHTTPHeaderField: "If-None-Match") == #"W/"job-etag""# {
+        return (304, [:], Data())
+      }
+      return (200, ["ETag": #"W/"job-etag""#], body)
+    }
+
+    let first = try await client.getJob(jobId: 50, etagged: true)
+    let second = try await client.getJob(jobId: 50, etagged: true)
+
+    XCTAssertEqual(first, second)
+    XCTAssertEqual(second.steps?.first?.status, "in_progress")
+    XCTAssertEqual(
+      StubURLProtocol.seen.last?.value(forHTTPHeaderField: "If-None-Match"),
+      #"W/"job-etag""#)
   }
 
   /// A failed poll must throw (the orchestrator HOLDS the fleet on a throw) —
@@ -246,5 +365,111 @@ final class GitHubQueuedJobsTests: XCTestCase {
         "https://api.github.com/repos/o/r/actions/runners?per_page=100",
         "https://api.github.com/repos/o/r/actions/runners?per_page=100&page=2",
       ])
+  }
+
+  /// The visible-runner poll runs every six seconds. It must use the ETag GitHub
+  /// exposes on this endpoint; otherwise nine watched repos alone can exhaust a
+  /// 5,000-request hourly token budget.
+  func testListRunnersReplaysETaggedBodyOn304() async throws {
+    let body = json(
+      #"{"total_count":1,"runners":[{"id":1,"name":"r1","status":"online","busy":true}]}"#)
+    StubURLProtocol.handler = { request in
+      if request.value(forHTTPHeaderField: "If-None-Match") == #"W/"runners-etag""# {
+        return (304, [:], Data())
+      }
+      return (200, ["ETag": #"W/"runners-etag""#], body)
+    }
+
+    let first = try await client.listRunners()
+    let second = try await client.listRunners()
+
+    XCTAssertEqual(second, first)
+    XCTAssertEqual(second.first?.busy, true)
+    XCTAssertEqual(
+      StubURLProtocol.seen.last?.value(forHTTPHeaderField: "If-None-Match"),
+      #"W/"runners-etag""#)
+  }
+
+  /// History survives restarts and can outlive the first workflow-runs page.
+  /// Correlation must paginate to the runner's time window instead of silently
+  /// making a still-retained GitHub log unreachable after 100 newer runs.
+  func testFindJobPaginatesPastFirstWorkflowRunsPage() async throws {
+    let now = Date()
+    func runsBody(ids: ClosedRange<Int>, at date: Date) -> Data {
+      let runs: [[String: Any]] = ids.map {
+        [
+          "id": $0, "created_at": self.iso(date), "updated_at": self.iso(date),
+          "status": "completed",
+        ]
+      }
+      return try! JSONSerialization.data(withJSONObject: ["workflow_runs": runs])
+    }
+    StubURLProtocol.handler = { request in
+      let url = request.url!
+      if url.path == "/repos/o/r/actions/runs" {
+        let page = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+          .queryItems?.first(where: { $0.name == "page" })?.value
+        if page == "2" { return (200, [:], runsBody(ids: 999...999, at: now)) }
+        // Outside the requested upper bound, so no Jobs API calls are wasted on
+        // these 100 newer records while we advance to page 2.
+        return (200, [:], runsBody(ids: 1...100, at: now.addingTimeInterval(3600)))
+      }
+      if url.path == "/repos/o/r/actions/runs/999/jobs" {
+        return (
+          200, [:],
+          self.json(
+            #"{"total_count":1,"jobs":[{"id":700,"run_id":999,"name":"old history","status":"completed","conclusion":"success","runner_name":"mactions-host-history"}]}"#
+          )
+        )
+      }
+      return (404, [:], Data())
+    }
+
+    let job = try await client.findJob(
+      runnerName: "mactions-host-history", since: now.addingTimeInterval(-60),
+      until: now.addingTimeInterval(60), maxPages: 2)
+
+    XCTAssertEqual(job?.id, 700)
+    XCTAssertEqual(
+      StubURLProtocol.seen.filter { $0.url?.path == "/repos/o/r/actions/runs" }.count, 2)
+    XCTAssertFalse(
+      StubURLProtocol.seen.contains {
+        $0.url?.path.contains("/jobs") == true && $0.url?.path != "/repos/o/r/actions/runs/999/jobs"
+      })
+  }
+
+  /// A workflow's `updated_at` can advance well after this runner exits because
+  /// matrix/sibling jobs are still executing. Correlation uses interval overlap,
+  /// not a requirement that the workflow's final update lands inside our job.
+  func testFindJobIncludesWorkflowSpanningRunnerLifetime() async throws {
+    let now = Date()
+    let began = iso(now.addingTimeInterval(-2 * 3600))
+    let finished = iso(now.addingTimeInterval(2 * 3600))
+    StubURLProtocol.handler = { request in
+      let url = request.url!
+      if url.path == "/repos/o/r/actions/runs" {
+        return (
+          200, [:],
+          self.json(
+            #"{"workflow_runs":[{"id":88,"created_at":"\#(began)","updated_at":"\#(finished)","status":"in_progress"}]}"#
+          )
+        )
+      }
+      if url.path == "/repos/o/r/actions/runs/88/jobs" {
+        return (
+          200, [:],
+          self.json(
+            #"{"total_count":1,"jobs":[{"id":808,"run_id":88,"name":"matrix leg","status":"completed","conclusion":"success","runner_name":"mactions-host-span"}]}"#
+          )
+        )
+      }
+      return (404, [:], Data())
+    }
+
+    let job = try await client.findJob(
+      runnerName: "mactions-host-span", since: now.addingTimeInterval(-60),
+      until: now.addingTimeInterval(60))
+
+    XCTAssertEqual(job?.id, 808)
   }
 }
