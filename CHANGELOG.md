@@ -3,6 +3,25 @@
 All notable changes to Mactions are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.9] - 2026-07-31
+
+### Improved
+
+- **Live runner job tracking is faster and more reliable.** Initial correlation
+  uses the provider's real launch time so long-running jobs remain discoverable,
+  then refreshes the known job directly every four seconds with ETags instead of
+  repeatedly scanning recent workflow runs. Busy-runner polling now touches only
+  repos with visible runners, so scale-zero repos consume no dashboard quota.
+- **History keeps durable links to GitHub job logs.** Runner exit now resolves and
+  persists the stable GitHub job id promptly, while bounded recovery pagination,
+  conclusion settlement retries, log-indexing retries, cache limits, and request
+  generation guards keep logs available across newer runs, app restarts,
+  sign-out, Clear, and transient GitHub failures.
+- **Runner-environment documentation now has one clear contract.** BASE.md
+  defines the cross-platform inclusion policy, PARITY.md records the recipe-v14
+  contract, and detailed Windows architecture and incident history have moved
+  from AGENTS.md into WINDOWS.md.
+
 ## [0.1.8] - 2026-07-15
 
 ### Fixed
