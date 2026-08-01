@@ -3,11 +3,15 @@
 This is the honest, per-OS contract for anyone pointing an existing workflow at
 a Mactions runner: what matches GitHub-hosted behavior, what deliberately
 differs, and what to do about each difference. It is the companion to
-[BASE.md](BASE.md) (the philosophy: bake in runner/OS *semantics*, leave
-*convenience tools* to the workflow) and the working résumé of the
+[BASE.md](BASE.md) (the philosophy: provide runner/OS *semantics*, leave
+*convenience tools* to the workflow), with Windows implementation history in
+[WINDOWS.md](WINDOWS.md), and the working résumé of the
 [issue #37](https://github.com/Kyter-com/Mactions/issues/37) parity audit —
 every claim below was verified against the official images, GitHub docs, or
 adversarially fact-checked research (2026-06).
+
+Evidence snapshot: hosted-image comparisons were audited in 2026-06; repository
+state was reconciled on 2026-07-31 against Windows provisioning recipe **v14**.
 
 Compared against: GitHub-hosted `windows-11-arm` (image `20260525.56.1`),
 `macos-latest`/`macos-26` (arm64), and `ubuntu-24.04-arm` — public-repo tier.
@@ -183,9 +187,13 @@ just like hosted (appended, so System32's `find`/`sort` still win on both).
 ### Base lifecycle (Mactions-only concept)
 
 A **missing** base blocks the Windows fleet (jobs queue unclaimed until built);
-a **stale** base (newer Windows GA, or a provisioning-recipe bump like v12)
+a **stale** base (newer Windows GA, or a provisioning-recipe bump like v14)
 still runs jobs fine — staleness only surfaces the rebuild nudge in the app.
 Recipe-only rebuilds reuse the cached ISO.
+
+Recipe v14 changes provider correctness rather than workflow semantics: it adds
+redundant VMware-Tools JIT delivery, an explicit guest outcome marker, and
+failure-log capture, so guest power-off alone can no longer produce exit 0.
 
 ---
 
@@ -229,15 +237,17 @@ Closest to hosted of the three — it *is* GitHub's runner image
 - **`jobs.<id>.container`, `services:`, docker-in-workflow are unsupported**
   (no Docker socket in the job). Hosted Linux *does* support these — the one
   Linux capability gap; a trusted-repo opt-in is deferred.
-- **Isolation**: shares the host kernel (Apple `container` gives a lightweight
-  VM per container). Trusted/private repos only — same guidance GitHub gives
-  for all self-hosted runners.
+- **Isolation**: [Apple Containerization](https://github.com/apple/containerization#design)
+  executes each container inside its own lightweight VM with a guest Linux
+  kernel; it does **not** share the macOS host kernel. Mactions still limits this
+  proof-of-concept self-hosted fleet to trusted/private repos because jobs run on
+  a personal host and the runtime is an evolving security boundary.
 
 ---
 
 ## Maintainer notes
 
-- Windows parity changes ride `PROVISIONING_RECIPE_VERSION` (currently **13**)
+- Windows parity changes ride `PROVISIONING_RECIPE_VERSION` (currently **14**)
   — bump `scripts/prepare-windows-image` and
   `WindowsImage.currentProvisioningRecipeVersion` together (a unit test
   enforces it), and keep `bootstrap.ps1` pure ASCII with its UTF-8 BOM.
