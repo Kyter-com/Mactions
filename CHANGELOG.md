@@ -3,6 +3,20 @@
 All notable changes to Mactions are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.10] - 2026-08-02
+
+### Fixed
+
+- **Stopping a runner no longer leaves a runaway process behind.** Teardown
+  signaled only the agent's top-level `run.sh`, so its Runner.Listener and
+  Runner.Worker children survived, were adopted by launchd, and then spun at
+  ~100% CPU once their working copy was deleted. Five had piled up on one Mac,
+  burning about five of fourteen cores, and each leak slowed the next job enough
+  to trigger the next reap: the interval between reaps collapsed from two hours
+  to twenty-six minutes and real CI jobs were cancelled. Teardown now stops that
+  run's whole process tree before deleting it, scoped so a job running
+  alongside it is untouched.
+
 ## [0.1.9] - 2026-07-31
 
 ### Improved
