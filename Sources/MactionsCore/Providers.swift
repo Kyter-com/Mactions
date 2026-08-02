@@ -182,12 +182,53 @@ public final class LocalProcessProvider: RunnerProvider, @unchecked Sendable {
   }
 
   /// Idempotent: delete this run's working copy so nothing is left on the host.
+  /// Kills any surviving agent descendants FIRST — see `killDescendants()`.
   private func cleanup() {
     lock.lock()
     if cleaned { lock.unlock(); return }
     cleaned = true
     lock.unlock()
+    killDescendants()
     try? FileManager.default.removeItem(at: runDirectory)
+  }
+
+  /// Kill anything still running out of this run's clone, scoped to THIS run.
+  ///
+  /// `Process.terminate()` signals only our direct child (`run.sh`). The real
+  /// tree is `run.sh → bash → Runner.Listener → Runner.Worker → Runner.Worker`,
+  /// so everything below `run.sh` survives a stop/reap, reparents to launchd,
+  /// and then spins at ~100% CPU once the directory below is deleted from under
+  /// it. Observed live 2026-08-01: five orphaned `Runner.Worker` processes at
+  /// PPID=1 burning ~5 of 14 cores, one per `sustained_unhealthy` reap. That
+  /// starves the host, which makes the NEXT runner look unhealthy, which reaps
+  /// and leaks again — the reap interval collapsed from 2h06 to 0h26 and it
+  /// cancelled real CI jobs.
+  ///
+  /// Matching on `runDirectory.path` scopes this to one run: the directory name
+  /// carries a random per-run suffix, so a concurrent run's agents can never
+  /// match. That is the difference from `HostCleanup.killOrphanRunnerProcesses()`,
+  /// which matches the whole `runs/` root and is therefore only safe before
+  /// going online.
+  ///
+  /// On the happy path the agent has already exited, so `pkill` matches nothing
+  /// and `pgrep` returns non-zero immediately — no added latency, no escalation.
+  private func killDescendants() {
+    Self.killProcesses(under: runDirectory.path)
+  }
+
+  /// SIGTERM everything whose command line mentions `path`, wait briefly for the
+  /// tree to fall over, then SIGKILL whatever is left. Static + internal so the
+  /// behaviour (including the scoping guarantee) is unit-testable without
+  /// launching a real runner agent.
+  static func killProcesses(under path: String) {
+    _ = try? Shell.run("/usr/bin/pkill", ["-f", path])
+    // Poll rather than sleep a fixed interval: the common case (nothing left)
+    // costs a single `pgrep` and returns immediately.
+    for _ in 0..<20 {
+      guard let alive = try? Shell.run("/usr/bin/pgrep", ["-f", path]), alive.ok else { return }
+      Thread.sleep(forTimeInterval: 0.1)
+    }
+    _ = try? Shell.run("/usr/bin/pkill", ["-9", "-f", path])
   }
 }
 
