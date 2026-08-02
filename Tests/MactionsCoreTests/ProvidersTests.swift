@@ -37,26 +37,47 @@ final class ProvidersTests: XCTestCase {
   /// while exec'ing the signed original, and it keeps running after `rm -rf` —
   /// exactly like the real orphaned Runner.Worker processes, which survived for
   /// hours after their run directory was deleted.
-  private func spawnSleeper(under directory: URL) throws -> Process {
+  /// `ignoresTermination` makes the stand-in survive SIGTERM, so the SIGKILL
+  /// escalation is actually exercised. Without it every stand-in dies on the
+  /// first signal and the escalation branch is dead code in the suite.
+  private func spawnSleeper(under directory: URL, ignoresTermination: Bool = false) throws
+    -> Process
+  {
     let binDirectory = directory.appendingPathComponent("bin", isDirectory: true)
     try FileManager.default.createDirectory(at: binDirectory, withIntermediateDirectories: true)
     let sleeper = binDirectory.appendingPathComponent("Runner.Worker")
     try? FileManager.default.removeItem(at: sleeper)
+    // perl, not a shell script: a script exits on its own the moment the
+    // directory is unlinked, and a COPY of a system binary is SIGKILLed at exec
+    // because copying breaks the platform binary's code signature. A symlink
+    // keeps argv[0] under the run directory (what `pkill -f` matches) while
+    // exec'ing the signed original, and it keeps running after `rm -rf` —
+    // exactly like the real orphans, which outlived their directory by hours.
+    // perl also lets us ignore SIGTERM inside ONE process, with no child to leak.
+    let target = ignoresTermination ? "/usr/bin/perl" : "/bin/sleep"
     try FileManager.default.createSymbolicLink(
-      at: sleeper, withDestinationURL: URL(fileURLWithPath: "/bin/sleep"))
+      at: sleeper, withDestinationURL: URL(fileURLWithPath: target))
 
     let process = Process()
     process.executableURL = sleeper
-    process.arguments = ["300"]
+    process.arguments =
+      ignoresTermination ? ["-e", "$SIG{TERM}='IGNORE'; sleep 300"] : ["300"]
     try process.run()
 
     // Wait until it is actually visible to pgrep, so teardown cannot race the
-    // spawn and "pass" by killing nothing.
+    // spawn and "pass" by killing nothing. Assert it: a stand-in that never
+    // started would make every assertion below vacuous.
+    let pattern = LocalProcessProvider.escapeForExtendedRegex(directory.path) + "(/|[[:space:]]|$)"
+    var visible = false
     let deadline = Date().addingTimeInterval(5)
     while Date() < deadline {
-      if let found = try? Shell.run("/usr/bin/pgrep", ["-f", directory.path]), found.ok { break }
+      if let found = try? Shell.run("/usr/bin/pgrep", ["-f", pattern]), found.ok {
+        visible = true
+        break
+      }
       Thread.sleep(forTimeInterval: 0.05)
     }
+    XCTAssertTrue(visible, "stand-in agent never became visible to pgrep under \(directory.path)")
     return process
   }
 
@@ -65,12 +86,12 @@ final class ProvidersTests: XCTestCase {
     while process.isRunning, Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
   }
 
-  /// `Process.terminate()` only signals our direct child (`run.sh`), so the
-  /// Runner.Listener/Runner.Worker grandchildren survive a stop or a reap,
-  /// reparent to launchd, and then spin at ~100% CPU once their working copy is
-  /// deleted underneath them. Observed live 2026-08-01: five orphaned workers
-  /// burning ~5 of 14 cores, one per `sustained_unhealthy` reap, each leak
-  /// slowing the next job enough to trigger the next reap.
+  /// `Process.terminate()` only signals our direct child (`run.sh`), so a
+  /// `Runner.Worker` can outlive a stop or a reap, reparent to launchd, and spin
+  /// at ~100% CPU once its working copy is deleted underneath it. Observed live
+  /// 2026-08-01: five orphaned workers at PPID=1, one per `sustained_unhealthy`
+  /// reap, every run directory already gone.
+  ///
   /// Drives the REAL teardown path (`stop()` → `cleanup()`), not just the helper,
   /// so deleting the kill from `cleanup()` fails this test rather than silently
   /// reintroducing the leak.
@@ -108,25 +129,83 @@ final class ProvidersTests: XCTestCase {
   /// `HostCleanup.killOrphanRunnerProcesses()` (which matches the whole `runs/`
   /// root and is therefore only safe before going online): tearing one run down
   /// must never touch a CONCURRENT run's agents.
-  func testKillProcessesUnderLeavesOtherRunsAlone() throws {
+  ///
+  /// Uses `run-1` / `run-10` on purpose. That is the REAL hazard: a bare
+  /// `pkill -f .../run-1` also kills `.../run-10` (verified by hand). Production
+  /// ids end in a fixed-length hex suffix so it cannot bite today, but the helper
+  /// must not depend on its caller's naming to be safe, so the pattern is
+  /// anchored. Names that merely differ (`doomed` / `bystander`) would pass even
+  /// with an unanchored match and prove nothing.
+  func testKillProcessesUnderLeavesAPrefixCollidingRunAlone() throws {
     let root = FileManager.default.temporaryDirectory
       .appendingPathComponent("mactions-test-scope-\(UUID().uuidString)", isDirectory: true)
     defer { try? FileManager.default.removeItem(at: root) }
-    let doomed = root.appendingPathComponent("run-doomed", isDirectory: true)
-    let bystander = root.appendingPathComponent("run-bystander", isDirectory: true)
+    let doomed = root.appendingPathComponent("run-1", isDirectory: true)
+    let bystander = root.appendingPathComponent("run-10", isDirectory: true)
 
     let doomedProcess = try spawnSleeper(under: doomed)
+    defer { if doomedProcess.isRunning { doomedProcess.terminate() } }
     let bystanderProcess = try spawnSleeper(under: bystander)
-    defer {
-      if doomedProcess.isRunning { doomedProcess.terminate() }
-      if bystanderProcess.isRunning { bystanderProcess.terminate() }
-    }
+    defer { if bystanderProcess.isRunning { bystanderProcess.terminate() } }
 
     LocalProcessProvider.killProcesses(under: doomed.path)
 
     waitForExit(doomedProcess)
     XCTAssertFalse(doomedProcess.isRunning, "the targeted run must be torn down")
     XCTAssertTrue(
-      bystanderProcess.isRunning, "a concurrent run must survive another run's teardown")
+      bystanderProcess.isRunning, "a prefix-colliding concurrent run must not be killed")
+  }
+
+  /// A descendant that ignores SIGTERM must still die. Without this the 20-poll
+  /// loop and the `pkill -9` line are dead code: a plain `sleep` exits on the
+  /// first signal, so the escalation never runs and could be deleted with the
+  /// suite still green. The wedged `Runner.Worker` this whole fix targets is
+  /// precisely a process that is not responding normally.
+  func testKillProcessesEscalatesToSIGKILLForATermIgnoringDescendant() throws {
+    let runDirectory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("mactions-test-stubborn-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: runDirectory) }
+
+    let stubborn = try spawnSleeper(under: runDirectory, ignoresTermination: true)
+    defer { if stubborn.isRunning { stubborn.terminate() } }
+
+    LocalProcessProvider.killProcesses(under: runDirectory.path)
+
+    waitForExit(stubborn)
+    XCTAssertFalse(stubborn.isRunning, "a SIGTERM-ignoring descendant must be SIGKILLed")
+  }
+
+  /// An empty runner id collapses `runsRoot.appendingPathComponent("")` to the
+  /// runs root, which would turn a run-scoped kill into a host-wide SIGKILL of
+  /// every concurrent runner. Teardown must refuse rather than do that.
+  func testTeardownRefusesToKillTheEntireRunsRoot() throws {
+    let runsRoot = FileManager.default.temporaryDirectory
+      .appendingPathComponent("mactions-test-root-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: runsRoot) }
+
+    // A runner belonging to some OTHER run, sitting directly under the root.
+    let sibling = runsRoot.appendingPathComponent("mactions-other-abc123", isDirectory: true)
+    let siblingProcess = try spawnSleeper(under: sibling)
+    defer { if siblingProcess.isRunning { siblingProcess.terminate() } }
+
+    let provider = LocalProcessProvider(
+      id: "",
+      templateDirectory: runsRoot.appendingPathComponent("template", isDirectory: true),
+      runsRoot: runsRoot)
+    provider.stop()
+
+    XCTAssertTrue(
+      siblingProcess.isRunning,
+      "an empty id must not let teardown sweep the whole runs root")
+  }
+
+  /// The ERE escaping the anchored pattern depends on. A path containing regex
+  /// metacharacters (`.mactions` alone has one) must match literally.
+  func testEscapeForExtendedRegexEscapesMetacharacters() {
+    XCTAssertEqual(
+      LocalProcessProvider.escapeForExtendedRegex("/Users/x/.mactions/runs/a+b"),
+      "/Users/x/\\.mactions/runs/a\\+b")
+    // `/` is an ordinary character in ERE; escaping it is undefined per POSIX.
+    XCTAssertFalse(LocalProcessProvider.escapeForExtendedRegex("/a/b").contains("\\/"))
   }
 }

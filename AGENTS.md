@@ -157,7 +157,7 @@ Friendly by design — no env vars, no hand-copied long tokens.
 
 ```bash
 swift build          # compiles MactionsCore + the app
-swift test           # 241 unit tests (requests, Actions job/run pagination/direct refresh + ETags, device-flow guard, queued-jobs polling, repo lister, scale-from-zero orchestrator, host budget, shared repo control plane + discovery ledger, cleanup, run-scoped agent teardown, Windows VM command shapes + image/preflight logic, Linux container command shapes + budget + setup-progress, RunnerOS labels)
+swift test           # 244 unit tests (requests, Actions job/run pagination/direct refresh + ETags, device-flow guard, queued-jobs polling, repo lister, scale-from-zero orchestrator, host budget, shared repo control plane + discovery ledger, cleanup, run-scoped agent teardown, Windows VM command shapes + image/preflight logic, Linux container command shapes + budget + setup-progress, RunnerOS labels)
 swift run Mactions   # launches the app for dev
 ```
 

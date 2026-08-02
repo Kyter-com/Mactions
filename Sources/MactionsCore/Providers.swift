@@ -35,6 +35,7 @@ public protocol RunnerProviderFactory {
 public final class LocalProcessProvider: RunnerProvider, @unchecked Sendable {
   public let id: String
   private let templateDirectory: URL
+  private let runsRoot: URL
   private let runDirectory: URL
   private var process: Process?
   private var cleaned = false
@@ -45,6 +46,7 @@ public final class LocalProcessProvider: RunnerProvider, @unchecked Sendable {
   public init(id: String, templateDirectory: URL, runsRoot: URL) {
     self.id = id
     self.templateDirectory = templateDirectory
+    self.runsRoot = runsRoot
     self.runDirectory = runsRoot.appendingPathComponent(id, isDirectory: true)
   }
 
@@ -163,13 +165,25 @@ public final class LocalProcessProvider: RunnerProvider, @unchecked Sendable {
     lock.lock(); self.process = process; lock.unlock()
   }
 
+  /// Terminate the agent, then clean up UNCONDITIONALLY.
+  ///
+  /// Do NOT defer the cleanup to `terminationHandler`. On the reap path the app
+  /// stays up so the handler does eventually fire, but on quit / go-offline the
+  /// process can exit first — and `AppState.goOfflineAndWait()` then calls
+  /// `HostCleanup.purgeRuns()`, deleting the run tree out from under descendants
+  /// nothing has killed yet. That is exactly how a 100%-CPU orphan is made.
+  ///
+  /// `LinuxContainerProvider.stop()` already does this, for the same reason
+  /// ("one zombie per reap cycle"). `cleanup()` is idempotent via `cleaned`, so
+  /// a later terminationHandler is a harmless no-op.
+  ///
+  /// This is synchronous and can take ~2s when a descendant ignores SIGTERM, so
+  /// callers on the main actor must not invoke it inline — see
+  /// `RunnerOrchestrator.stop()` and `stopProviderOffMain`.
   public func stop() {
     lock.lock(); let process = self.process; self.process = nil; lock.unlock()
-    if let process, process.isRunning {
-      process.terminate() // terminationHandler runs cleanup()
-    } else {
-      cleanup()
-    }
+    process?.terminate()
+    cleanup()
   }
 
   /// APFS copy-on-write clone keeps the per-run copy near-instant and almost
@@ -195,40 +209,92 @@ public final class LocalProcessProvider: RunnerProvider, @unchecked Sendable {
   /// Kill anything still running out of this run's clone, scoped to THIS run.
   ///
   /// `Process.terminate()` signals only our direct child (`run.sh`). The real
-  /// tree is `run.sh → bash → Runner.Listener → Runner.Worker → Runner.Worker`,
-  /// so everything below `run.sh` survives a stop/reap, reparents to launchd,
-  /// and then spins at ~100% CPU once the directory below is deleted from under
-  /// it. Observed live 2026-08-01: five orphaned `Runner.Worker` processes at
-  /// PPID=1 burning ~5 of 14 cores, one per `sustained_unhealthy` reap. That
-  /// starves the host, which makes the NEXT runner look unhealthy, which reaps
-  /// and leaks again — the reap interval collapsed from 2h06 to 0h26 and it
-  /// cancelled real CI jobs.
+  /// tree is `run.sh → bash → Runner.Listener → Runner.Worker → Runner.Worker`.
+  /// Observed live 2026-08-01: five `Runner.Worker` processes left at PPID=1,
+  /// each spinning at ~100% CPU on a 14-core Mac, one per `sustained_unhealthy`
+  /// reap, every one of their run directories already deleted.
   ///
-  /// Matching on `runDirectory.path` scopes this to one run: the directory name
-  /// carries a random per-run suffix, so a concurrent run's agents can never
-  /// match. That is the difference from `HostCleanup.killOrphanRunnerProcesses()`,
-  /// which matches the whole `runs/` root and is therefore only safe before
-  /// going online.
+  /// Note only the WORKERS were orphaned, not the bash layers or the Listener —
+  /// five reaps left five strays, not ~20. So the gap is narrower than "the
+  /// subtree survives SIGTERM": the Listener exits but does not guarantee its
+  /// Worker is dead. That also means a Worker can be stranded by a NORMAL job
+  /// completion with no teardown involved, which this covers too, since a
+  /// natural `run.sh` exit still runs `cleanup()`.
   ///
-  /// On the happy path the agent has already exited, so `pkill` matches nothing
-  /// and `pgrep` returns non-zero immediately — no added latency, no escalation.
+  /// (An earlier version of this comment claimed the leak starved the host and
+  /// caused the next reap, a closed feedback loop. The data does not support
+  /// that: macOS runner boot time held at ~32s with zero orphans and with all
+  /// five live, and the first reap preceded any orphan. The leak is real; the
+  /// loop was not established.)
+  ///
+  /// Refuses to run unless the target really is a directory BELOW `runsRoot`.
+  /// An empty `id` would collapse `runsRoot.appendingPathComponent("")` to the
+  /// runs root itself and turn a run-scoped kill into a host-wide SIGKILL of
+  /// every concurrent runner.
   private func killDescendants() {
-    Self.killProcesses(under: runDirectory.path)
+    let root = runsRoot.standardizedFileURL.path
+    let run = runDirectory.standardizedFileURL.path
+    guard run != root, run.hasPrefix(root + "/") else {
+      ControlPlaneLog.log("runner.teardown_kill_refused", ["runner": id, "path": run])
+      return
+    }
+    Self.killProcesses(under: run, runner: id)
   }
 
-  /// SIGTERM everything whose command line mentions `path`, wait briefly for the
-  /// tree to fall over, then SIGKILL whatever is left. Static + internal so the
-  /// behavior (including the scoping guarantee) is unit-testable without
-  /// launching a real runner agent.
-  static func killProcesses(under path: String) {
-    _ = try? Shell.run("/usr/bin/pkill", ["-f", path])
-    // Poll rather than sleep a fixed interval: the common case (nothing left)
-    // costs a single `pgrep` and returns immediately.
+  /// SIGTERM everything running out of `path`, wait briefly for the tree to fall
+  /// over, then SIGKILL whatever ignored it. Static + internal so the behavior
+  /// (including the scoping guarantee) is unit-testable without launching a real
+  /// runner agent.
+  ///
+  /// The pattern is anchored so a path cannot match a longer sibling: bare
+  /// `pkill -f /runs/run-1` also kills `/runs/run-10` (verified). Production ids
+  /// end in a fixed-length hex suffix so that cannot happen today, but the
+  /// helper must not depend on its caller's naming scheme to be safe.
+  static func killProcesses(under path: String, runner: String = "") {
+    // `pkill -f` takes an extended regex, so escape the path and require the
+    // next character to be a path separator, whitespace, or end-of-line.
+    let pattern = escapeForExtendedRegex(path) + "(/|[[:space:]]|$)"
+
+    // Happy path: the agent already exited, so there is nothing to signal.
+    guard stillAlive(pattern) else { return }
+
+    _ = try? Shell.run("/usr/bin/pkill", ["-f", pattern])
+    // Poll rather than sleep a fixed interval, so a tree that dies promptly
+    // costs milliseconds instead of a fixed wait.
     for _ in 0..<20 {
-      guard let alive = try? Shell.run("/usr/bin/pgrep", ["-f", path]), alive.ok else { return }
+      if !stillAlive(pattern) {
+        ControlPlaneLog.log(
+          "runner.teardown_kill", ["runner": runner, "escalated": "false", "survived": "false"])
+        return
+      }
       Thread.sleep(forTimeInterval: 0.1)
     }
-    _ = try? Shell.run("/usr/bin/pkill", ["-9", "-f", path])
+    _ = try? Shell.run("/usr/bin/pkill", ["-9", "-f", pattern])
+    let survived = stillAlive(pattern)
+    ControlPlaneLog.log(
+      "runner.teardown_kill",
+      ["runner": runner, "escalated": "true", "survived": String(survived)])
+  }
+
+  /// Whether anything still matches `pattern`. Fails SAFE: `pgrep` exits 1 for
+  /// "no match", but 2/3 mean pgrep itself failed (bad args, internal error) and
+  /// must NOT read as "nothing left", or the SIGKILL escalation is skipped while
+  /// reporting success. Anything other than a definite 1 counts as alive.
+  private static func stillAlive(_ pattern: String) -> Bool {
+    guard let probe = try? Shell.run("/usr/bin/pgrep", ["-f", pattern]) else { return true }
+    return probe.status != 1
+  }
+
+  /// Escape only the POSIX ERE metacharacters. `/` is deliberately NOT escaped:
+  /// it is an ordinary character in ERE, and escaping an ordinary character is
+  /// undefined behavior per POSIX.
+  static func escapeForExtendedRegex(_ value: String) -> String {
+    var escaped = ""
+    for character in value {
+      if "\\.[]{}()*+?^$|".contains(character) { escaped.append("\\") }
+      escaped.append(character)
+    }
+    return escaped
   }
 }
 
