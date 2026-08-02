@@ -218,7 +218,7 @@ public final class LocalProcessProvider: RunnerProvider, @unchecked Sendable {
 
   /// SIGTERM everything whose command line mentions `path`, wait briefly for the
   /// tree to fall over, then SIGKILL whatever is left. Static + internal so the
-  /// behaviour (including the scoping guarantee) is unit-testable without
+  /// behavior (including the scoping guarantee) is unit-testable without
   /// launching a real runner agent.
   static func killProcesses(under path: String) {
     _ = try? Shell.run("/usr/bin/pkill", ["-f", path])
