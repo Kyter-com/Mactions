@@ -432,8 +432,23 @@ public final class RunnerOrchestrator {
     }
     // Now reclaim the local VMs/containers/processes (the registrations are
     // already gone, so a leftover here is just disk — swept on next go-online).
+    //
+    // Off the main actor, but AWAITED. LocalProcessProvider.stop() now kills the
+    // agent's process tree synchronously and can take ~2s when a descendant
+    // ignores SIGTERM; this orchestrator is @MainActor, so calling it inline
+    // would freeze the UI — the same reason `stopProviderOffMain` exists. But we
+    // must not fire-and-forget either: the whole point is that a quit cannot
+    // exit before those descendants are dead, which is what stranded them in the
+    // first place. Running the slots concurrently keeps the total wait at one
+    // provider's teardown rather than the sum, so it stays inside the caller's
+    // quit deadline.
+    await withTaskGroup(of: Void.self) { group in
+      for slot in current {
+        let provider = slot.provider
+        group.addTask { await Task.detached { provider.stop() }.value }
+      }
+    }
     for slot in current {
-      slot.provider.stop()
       releaseBudget(slot)
     }
     state = .offline
