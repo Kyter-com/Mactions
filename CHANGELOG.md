@@ -3,6 +3,44 @@
 All notable changes to Mactions are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.11] - 2026-08-02
+
+### Fixed
+
+- **Quitting the app no longer strands a runaway runner process.** 0.1.10 stopped
+  the leak when a runner was reaped, but not when the app itself shut down:
+  teardown left the cleanup to an async callback that a quitting process could
+  exit before running, while going offline deleted the run folder anyway. That is
+  the same runaway-process condition, on a path most people hit far more often.
+  Shutdown now stops each runner's processes before removing its folder, and does
+  it for all runners at once and off the UI thread so quitting stays responsive.
+- **Tearing down one runner can no longer touch another.** The match was a plain
+  substring, so a runner folder whose name is a prefix of another one's would
+  have taken the second runner down with it. Names in practice never collide, so
+  this was latent rather than observed, but the match is now exact.
+- **A runner process that ignores the polite stop signal is now forced to exit.**
+  Two paths could report success while skipping the escalation: a hung process
+  probe was read as "nothing left to stop", and nothing exercised the forced
+  path, so it could have regressed unnoticed.
+- **A runner with a missing name can no longer stop every other runner.** The
+  empty name resolved to the shared runners folder, which would have applied a
+  single teardown to the whole fleet. It is now refused outright.
+
+### Improved
+
+- **Runner teardown is now recorded.** Each teardown logs whether it had to force
+  a process to exit and whether anything survived, so the underlying stall this
+  guards against stays visible instead of being silently cleaned up.
+
+### Note on the 0.1.10 entry
+
+The 0.1.10 note said each leaked process slowed the next job enough to trigger
+the next teardown. The leak and the teardowns were both real, but that causal
+link was not established: runner startup time was unchanged with zero leaked
+processes and with five, and the first teardown happened before any leak existed.
+The underlying stall that starts the sequence is still unexplained and is tracked
+separately.
+
 ## [0.1.10] - 2026-08-02
 
 ### Fixed
