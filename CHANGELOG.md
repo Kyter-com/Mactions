@@ -3,6 +3,34 @@
 All notable changes to Mactions are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Improved
+
+- **Updated for the macOS 27 / Xcode 27 toolchain, with the new APIs adopted
+  where they improve something real** (the deployment target stays macOS 13 —
+  everything is availability-gated with the same fallback pattern as the
+  existing Liquid Glass helpers):
+  - **Confirmation dialogs use macOS 27's item-binding API** — one optional
+    state carries both the confirm-state and its payload, replacing the Bool +
+    separate-value pattern, so what the user confirms is exactly what the
+    dialog was armed with. The dialogs also got more honest in the process: the
+    fleet-restart dialog now names the repos whose in-flight jobs a restart
+    would fail on GitHub, the clear-history dialog states how many runs it will
+    delete, and the Windows-rebuild dialog snapshots the maintenance state it
+    was armed with so a background update check can't change the offer
+    mid-presentation.
+  - **Custom chrome now follows the 2027 inactive-window treatment**: the
+    dashboard's status strip dims when the window is not key, via the new
+    `appearsActive` environment value (no-op on older macOS).
+  - **`@ContentBuilder`** (the unified result builder new in Xcode 27) replaces
+    `@ViewBuilder` on the dashboard's two heaviest builders, cutting their
+    type-check time.
+  - **Sparkle bumped to 2.10.0** (current stable).
+  - **Two Swift 6.4 `ImplicitStrongCapture` warnings in `goOnline` are fixed**
+    with an explicit `[self]` capture (behavior unchanged; the build is
+    warning-clean again on the new compiler).
+
 ## [0.1.11] - 2026-08-02
 
 ### Fixed

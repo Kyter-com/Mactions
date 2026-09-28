@@ -418,5 +418,6 @@ struct StatusStrip: View {
     .padding(.horizontal, MactionsTheme.Spacing.section)
     .padding(.vertical, MactionsTheme.Spacing.tight)
     .frame(maxWidth: .infinity)
+    .inactiveWindowDimmed()
   }
 }

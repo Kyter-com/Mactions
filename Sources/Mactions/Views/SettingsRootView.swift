@@ -226,7 +226,11 @@ private struct GeneralSettingsTab: View {
 
 private struct WindowsSettingsTab: View {
   @EnvironmentObject private var app: AppState
-  @State private var confirmRebuild = false
+  /// The pending rebuild confirmation, item-binding style (macOS 27): the item
+  /// snapshot is the maintenance state the dialog was armed WITH, so the
+  /// destructive button's label and the message can't shift mid-presentation if
+  /// a background update check re-classifies the base (e.g. recipe → both).
+  @State private var pendingRebuild: WindowsImage.MaintenanceReason?
   @State private var showBuildOptions = false
 
   var body: some View {
@@ -306,20 +310,22 @@ private struct WindowsSettingsTab: View {
     } header: {
       Text("Windows runner image")
     }
-    .confirmationDialog(
-      "Rebuild the Windows base image?", isPresented: $confirmRebuild, titleVisibility: .visible
-    ) {
-      Button(rebuildConfirmLabel, role: .destructive) { app.setUpWindowsRunner(force: true) }
+    .itemConfirmationDialog(
+      "Rebuild the Windows base image?", item: $pendingRebuild, titleVisibility: .visible
+    ) { maintenance in
+      Button(rebuildConfirmLabel(for: maintenance), role: .destructive) {
+        app.setUpWindowsRunner(force: true)
+      }
       Button("Cancel", role: .cancel) {}
-    } message: {
-      Text(rebuildDialogMessage)
+    } message: { maintenance in
+      Text(rebuildDialogMessage(for: maintenance))
     }
   }
 
   @ViewBuilder
   private var rebuildButton: some View {
     Button {
-      confirmRebuild = true
+      pendingRebuild = app.windowsMaintenance
     } label: {
       Label(
         app.windowsMaintenance.needsRebuild ? "Rebuild Windows image" : "Rebuild / update image",
@@ -356,13 +362,15 @@ private struct WindowsSettingsTab: View {
     }
   }
 
-  private var rebuildConfirmLabel: String {
-    if case .provisioningOutdated = app.windowsMaintenance { return "Rebuild (reuses cached ISO)" }
+  /// Both read the DIALOG's snapshot (not live `app.windowsMaintenance`) so what
+  /// the user confirms is exactly what they were shown when they tapped Rebuild.
+  private func rebuildConfirmLabel(for maintenance: WindowsImage.MaintenanceReason) -> String {
+    if case .provisioningOutdated = maintenance { return "Rebuild (reuses cached ISO)" }
     return "Rebuild (re-downloads ~8 GB)"
   }
 
-  private var rebuildDialogMessage: String {
-    if case .provisioningOutdated = app.windowsMaintenance {
+  private func rebuildDialogMessage(for maintenance: WindowsImage.MaintenanceReason) -> String {
+    if case .provisioningOutdated = maintenance {
       return "Rebuilds the base VM headless with the updated runner setup recipe — about 30–40 minutes. Reuses the cached Win11 ARM64 ISO (the Windows build is unchanged), so no large re-download. Replaces the existing base image."
     }
     return "Re-downloads the latest Win11 ARM64 ISO (~8 GB) and rebuilds the base VM headless — about 30–40 minutes. This replaces the existing base image."

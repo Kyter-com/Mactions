@@ -716,7 +716,13 @@ final class AppState: ObservableObject {
     state = .starting
     statusMessage = "Preparing runner agent…"
     let repos = selectedRepos
-    Task {
+    // Explicit `[self]`: the whole go-online body reads main-actor state, so the
+    // Task captures self strongly — and Swift 6.4's ImplicitStrongCapture
+    // diagnostic otherwise flags the ownership MISMATCH with the deliberately
+    // weak `[weak self]` orch callbacks below (orch → AppState must not be a
+    // retain cycle). Making the outer capture explicit silences the diagnostic
+    // while keeping both capture intents as written.
+    Task { [self] in
       // Reap a prior crash/force-quit's orphans OFF the main actor — sweepOrphans
       // shells out (pkill + `vmrun stop hard`/`deleteVM` + `rm -rf`), which can
       // block for seconds with leftover clones and would otherwise stall the UI

@@ -18,7 +18,11 @@ private let allRepositoriesSelectionID = "__mactions_all_repositories__"
 struct DashboardView: View {
   @EnvironmentObject private var app: AppState
   @State private var tab: Tab? = .runners
-  @State private var confirmRestart = false
+  /// The pending fleet-restart confirmation — the macOS 27 item-binding dialog
+  /// pattern: one optional carries BOTH the confirm-state and its payload (the
+  /// repos whose live runners a confirmed restart would fail on GitHub). No
+  /// Bool + separate payload pair to drift out of sync.
+  @State private var pendingRestartRepos: [String]?
   /// The Runners grid selection — a repo header id (`owner/name`) or a runner
   /// child id (`owner/name#runner`). Lifted here so the Configure panel can bind
   /// to whichever repo is in focus. Selecting a repo opens its config on the
@@ -47,6 +51,10 @@ struct DashboardView: View {
     return selection?.split(separator: "#", maxSplits: 1).first.map(String.init)
   }
 
+  // @ContentBuilder (the macOS 27 unified builder) instead of @ViewBuilder —
+  // this is the app's largest single body and historically the slowest to
+  // type-check; ContentBuilder collapses the result-builder overload search.
+  @ContentBuilder
   var body: some View {
     VStack(spacing: 0) {
       headerBar
@@ -226,7 +234,11 @@ struct DashboardView: View {
         .font(.callout).foregroundStyle(.orange)
       Spacer(minLength: MactionsTheme.Spacing.control)
       Button("Restart fleet") {
-        if app.runners.isEmpty { app.restartFleet() } else { confirmRestart = true }
+        if app.runners.isEmpty {
+          app.restartFleet()
+        } else {
+          pendingRestartRepos = app.runners.map(\.repoFullName).sorted()
+        }
       }
       .controlSize(.small)
       .disabled(app.state == .starting || app.state == .stopping)
@@ -234,16 +246,26 @@ struct DashboardView: View {
     .padding(.horizontal, MactionsTheme.Spacing.section)
     .padding(.vertical, MactionsTheme.Spacing.control)
     .background(Color.orange.opacity(0.12))
-    .confirmationDialog(
-      "Restart the fleet now?", isPresented: $confirmRestart, titleVisibility: .visible
-    ) {
+    .itemConfirmationDialog(
+      "Restart the fleet now?", item: $pendingRestartRepos, titleVisibility: .visible
+    ) { scope in
       Button("Restart and cancel running jobs", role: .destructive) { app.restartFleet() }
       Button("Cancel", role: .cancel) {}
-    } message: {
-      Text(
-        "Restarting deregisters the live runners, and GitHub fails any job they are "
-          + "running. Failed jobs are not re-queued — re-run them from GitHub afterward.")
+    } message: { scope in
+      Text(restartDialogMessage(scope))
     }
+  }
+
+  /// The concrete cost of a confirmed restart: which repos' runners get
+  /// deregistered (and thus which in-flight jobs GitHub will fail). The item
+  /// holds one entry per runner; the repos are deduped for the message.
+  private func restartDialogMessage(_ scope: [String]) -> String {
+    let repos = Set(scope).sorted()
+    let names = repos.joined(separator: ", ")
+    return
+      "Restarting deregisters the live runners across \(repos.count) repo\(repos.count == 1 ? "" : "s") "
+      + "(\(names)), and GitHub fails any job they are running. Failed jobs are not re-queued — "
+      + "re-run them from GitHub afterward."
   }
 
   /// Shown when a runner substrate needs attention — e.g. a stale Windows base
@@ -678,7 +700,10 @@ private struct RunnersPane: View {
 
   // MARK: Right — the selected runner's live detail OR the repo's Configure panel
 
-  @ViewBuilder private var rightPanel: some View {
+  // @ContentBuilder: five alternative detail branches — the second-heaviest
+  // builder in the app after `body`.
+  @ContentBuilder
+  private var rightPanel: some View {
     // A live runner is selected → show its job/step detail.
     if let id = selection, id.contains("#"),
       let row = app.runners.first(where: { $0.id == id })
@@ -1027,7 +1052,10 @@ private struct HistoryPane: View {
   @State private var selected: String?
   @State private var search = ""
   @State private var filter: OutcomeFilter = .all
-  @State private var confirmClear = false
+  /// The pending clear-history confirmation — item-binding dialog: the item is
+  /// the number of runs about to be deleted, so the message always states the
+  /// real cost and the state is one optional, not Bool + counter.
+  @State private var pendingClearCount: Int?
 
   enum OutcomeFilter: String, CaseIterable, Identifiable {
     case all = "All"
@@ -1062,7 +1090,7 @@ private struct HistoryPane: View {
           TextField("Filter runs…", text: $search).textFieldStyle(.plain).font(.callout)
           if !app.runHistory.isEmpty {
             Button {
-              confirmClear = true
+              pendingClearCount = app.runHistory.count
             } label: {
               Image(systemName: "trash")
             }
@@ -1125,14 +1153,15 @@ private struct HistoryPane: View {
       }
     }
     // Clearing history is irreversible and a single small-icon tap — confirm it.
-    .confirmationDialog(
-      "Clear all run history?", isPresented: $confirmClear, titleVisibility: .visible
-    ) {
+    .itemConfirmationDialog(
+      "Clear all run history?", item: $pendingClearCount, titleVisibility: .visible
+    ) { _ in
       Button("Clear", role: .destructive) { app.clearRunHistory() }
       Button("Cancel", role: .cancel) {}
-    } message: {
+    } message: { count in
       Text(
-        "This permanently deletes all recorded runs and their cached logs. This can't be undone.")
+        "This permanently deletes \(count) recorded run\(count == 1 ? "" : "s") and their cached "
+          + "logs. This can't be undone.")
     }
   }
 }
@@ -1681,5 +1710,85 @@ extension View {
     } else {
       self.buttonStyle(.bordered)
     }
+  }
+
+  /// macOS 27: dim custom chrome when the window is INACTIVE — native windows
+  /// dim their icons/text on the 2027 releases, and custom surfaces can follow
+  /// via `appearsActive`. Below macOS 27 this is a no-op (no change to the old
+  /// look). Apply to app-drawn chrome only, never to content.
+  @ViewBuilder
+  func inactiveWindowDimmed() -> some View {
+    if #available(macOS 27.0, *) {
+      self.modifier(InactiveWindowDim())
+    } else {
+      self
+    }
+  }
+
+  /// Confirmation dialog driven by an optional ITEM instead of a Bool — the
+  /// macOS 27 item-binding pattern (`confirmationDialog(_:item:)`, the same
+  /// shape sheets always had). Setting the item presents the dialog with that
+  /// value; dismissing clears it, so the confirm state and its payload can no
+  /// longer disagree (the Bool+separate-payload model needed two @State vars
+  /// kept in sync by hand). Falls back to the isPresented form on macOS 13–26
+  /// by deriving the Bool from the item — same behavior, one state var.
+  ///
+  /// Availability note: the new overload is macOS 27+; the #available branch is
+  /// what keeps the macOS 13 deployment target compiling.
+  @ViewBuilder
+  func itemConfirmationDialog<Item, Buttons: View, Message: View>(
+    _ title: String,
+    item: Binding<Item?>,
+    titleVisibility: Visibility = .automatic,
+    @ViewBuilder buttons: @escaping (Item) -> Buttons,
+    @ViewBuilder message: @escaping (Item) -> Message
+  ) -> some View {
+    if #available(macOS 27.0, *) {
+      self.modifier(
+        ItemBoundConfirmationDialog(
+          title: title, item: item, titleVisibility: titleVisibility,
+          buttons: buttons, message: message))
+    } else {
+      self.confirmationDialog(
+        title,
+        isPresented: Binding(get: { item.wrappedValue != nil }, set: { if !$0 { item.wrappedValue = nil } }),
+        titleVisibility: titleVisibility
+      ) {
+        if let value = item.wrappedValue { buttons(value) }
+      } message: {
+        if let value = item.wrappedValue { message(value) }
+      }
+    }
+  }
+}
+
+/// The macOS 27 item-binding `confirmationDialog` in a ViewModifier so the
+/// `@available(macOS 27.0, *)` overload call lives in one gated place.
+private struct ItemBoundConfirmationDialog<Item, Buttons: View, Message: View>: ViewModifier {
+  let title: String
+  @Binding var item: Item?
+  let titleVisibility: Visibility
+  let buttons: (Item) -> Buttons
+  let message: (Item) -> Message
+
+  func body(content: Content) -> some View {
+    content.confirmationDialog(
+      title, item: $item, titleVisibility: titleVisibility,
+      actions: { value in buttons(value) },
+      message: { value in message(value) })
+  }
+}
+
+/// macOS 27's inactive-window treatment for custom chrome: dim icon/text
+/// opacity when the window loses key, via the new `appearsActive` environment
+/// value. The struct exists so the `@Environment` read lives inside an
+/// `@available(macOS 27.0, *)` type (per the repo's availability-gating
+/// convention, even though the SDK back-deploys the env value).
+@available(macOS 27.0, *)
+private struct InactiveWindowDim: ViewModifier {
+  @Environment(\.appearsActive) private var appearsActive
+
+  func body(content: Content) -> some View {
+    content.opacity(appearsActive ? 1 : 0.55)
   }
 }
