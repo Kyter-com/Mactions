@@ -432,7 +432,8 @@ private struct RunnersPane: View {
     }
     // Poll which of our runners GitHub reports as executing a job (`busy`) so the
     // activity ring spins only during a real job. Runs while this pane shows.
-    .task {
+    .task(id: app.dashboardVisible) {
+      guard app.dashboardVisible else { return }
       while !Task.isCancelled {
         await app.refreshRunnerBusy()
         try? await Task.sleep(nanoseconds: 6_000_000_000)
@@ -1004,7 +1005,8 @@ private struct RunnerDetailView: View {
       }
     }
     // Poll the running job's steps while this runner is selected (off-main).
-    .task(id: row.runner.id) {
+    .task(id: app.dashboardVisible ? row.runner.id : nil) {
+      guard app.dashboardVisible else { return }
       while !Task.isCancelled {
         await app.loadRunnerJob(
           for: row.runner.id, repo: row.repoFullName, startedAt: row.runner.startedAt,
@@ -1134,7 +1136,8 @@ private struct HistoryPane: View {
     // this pane is visible, only for recent unsettled rows, and for at most one
     // minute. A new history row changes the task id and starts a fresh bounded
     // settlement window.
-    .task(id: app.runHistory.first?.id) {
+    .task(id: app.dashboardVisible ? app.runHistory.first?.id : nil) {
+      guard app.dashboardVisible else { return }
       for attempt in 0..<12 {
         await app.resolveRecentConclusions()
         let shouldRetry = app.runHistory.prefix(12).contains { record in
@@ -1197,6 +1200,7 @@ private struct RunDetailView: View {
   @EnvironmentObject private var app: AppState
   @State private var logSearch = ""
   @State private var retryingLog = false
+  @State private var retryGeneration = 0
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
@@ -1207,9 +1211,14 @@ private struct RunDetailView: View {
       Divider()
       content
     }
-    .task(id: record.id) {
+    .task(id: app.dashboardVisible ? record.id : nil) {
+      guard app.dashboardVisible, !Task.isCancelled else { return }
+      retryGeneration += 1
+      let generation = retryGeneration
       retryingLog = true
-      defer { retryingLog = false }
+      defer {
+        if retryGeneration == generation { retryingLog = false }
+      }
       // GitHub commonly indexes a completed job before its downloadable log.
       // Retry that specific 404/not-ready state for one minute while this detail
       // remains visible; old/expired logs stay a single request.

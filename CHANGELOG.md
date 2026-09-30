@@ -23,6 +23,13 @@ All notable changes to Mactions are documented here. This project adheres to
 
 ### Fixed
 
+- **Wake waits for fleet teardown before bringing runners online again.**
+  Overlapping shutdown requests share one teardown, so late cleanup cannot
+  remove a newly started fleet. Sleep defers a pending restart; Offline,
+  sign-out, and quit cancel it. Sleep/wake and shutdown boundaries are logged.
+- **Dashboard polling stops when its retained window is closed or hidden.**
+  Runner status, job steps, history retries, and memory sampling resume when
+  the window becomes visible again; the fleet continues running in the background.
 - **Clear History preserves runs that finish while its confirmation is open.**
   The dialog captures record IDs as well as the count, and removes only those
   records and their cached logs. New runs and their pending lookups are retained.

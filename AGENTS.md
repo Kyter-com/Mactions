@@ -74,6 +74,8 @@ scripts/                                       (driven by AppState + provider)
 
 **Lifecycle:** the app is a regular windowed macOS app. Closing the dashboard leaves the app and fleet running; quitting is the "go offline" signal. `AppDelegate.applicationShouldTerminate` returns `.terminateLater`, runs `goOfflineAndWait()`, then replies — with a 6s hard timeout so a hung network call can't wedge quit. Ephemeral runners + GitHub's offline sweep are the backstop for force-quit/crash.
 
+`FleetLifecycle` coalesces concurrent shutdown requests and orders restart/sleep/wake: resume waits for teardown, another sleep defers it, and explicit Offline/sign-out/quit cancel it. `goOnline()` only starts from `.offline` while awake and not quitting. Sleep/wake and shutdown boundaries are recorded in the control-plane log. Dashboard polling and memory sampling are separately gated by AppKit window visibility, since the window and SwiftUI hierarchy are retained after close.
+
 ## Providers
 
 `RunnerProvider` is the substrate one runner executes on.
@@ -157,7 +159,7 @@ Friendly by design — no env vars, no hand-copied long tokens.
 
 ```bash
 swift build          # compiles MactionsCore + the app
-swift test           # 249 unit tests (requests, Actions job/run pagination/direct refresh + ETags, device-flow guard, queued-jobs polling, repo lister, scale-from-zero orchestrator, host budget, shared repo control plane + discovery ledger, cleanup, run-scoped agent teardown, Windows VM command shapes + image/preflight logic, Linux container command shapes + budget + setup-progress, RunnerOS labels)
+swift test           # 258 unit tests (requests, Actions job/run pagination/direct refresh + ETags, device-flow guard, queued-jobs polling, repo lister, scale-from-zero orchestrator, sleep/wake/restart ordering, host budget, shared repo control plane + discovery ledger, cleanup, run-scoped agent teardown, Windows VM command shapes + image/preflight logic, Linux container command shapes + budget + setup-progress, RunnerOS labels)
 swift run Mactions   # launches the app for dev
 ```
 

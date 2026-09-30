@@ -61,6 +61,9 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
       center.addObserver(
         self, selector: #selector(scheduleContentRelayout),
         name: NSWindow.didChangeOcclusionStateNotification, object: win)
+      center.addObserver(
+        self, selector: #selector(updateDashboardVisibility),
+        name: NSWindow.didChangeOcclusionStateNotification, object: win)
     }
     NSApp.activate(ignoringOtherApps: true)
     guard let window else { return }
@@ -74,7 +77,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
     // without a sidebar/control caught in the focus ring.
     window.makeFirstResponder(window.contentView)
     // Sample live memory only while the dashboard is visible.
-    AppState.shared.startMemorySampling()
+    updateDashboardVisibility()
   }
 
   // MARK: NSWindowDelegate
@@ -84,7 +87,14 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
     // keeps working after a close. The window object is retained
     // (isReleasedWhenClosed = false) and reused on the next show(). This is purely
     // a UI-presence change; it never touches the fleet (closing ≠ quitting).
-    AppState.shared.stopMemorySampling()
+    AppState.shared.setDashboardVisible(false)
+  }
+
+  @objc private func updateDashboardVisibility() {
+    let visible = window.map {
+      $0.isVisible && !$0.isMiniaturized && $0.occlusionState.contains(.visible)
+    } ?? false
+    AppState.shared.setDashboardVisible(visible)
   }
 
   // MARK: Render-recovery guard

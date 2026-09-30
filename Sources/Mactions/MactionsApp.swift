@@ -87,28 +87,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       self, selector: #selector(systemDidWake), name: NSWorkspace.didWakeNotification, object: nil)
   }
 
-  /// True iff the fleet was online when the Mac went to sleep, so `systemDidWake`
-  /// knows to bring it back. Main-actor state.
-  private var wasOnlineBeforeSleep = false
-
   @objc private func systemWillSleep(_ notification: Notification) {
     let state = AppState.shared
-    guard state.state != .offline else {
-      wasOnlineBeforeSleep = false
-      return
-    }
-    wasOnlineBeforeSleep = true
+    ControlPlaneLog.log("host.sleep", ["fleetState": state.state.rawValue])
     // Best-effort within the brief pre-sleep window. stop() deregisters FIRST, so
     // even if the local VM teardown doesn't finish before sleep, the registration
     // removal (the part that prevents a GitHub-side ghost) lands fast.
-    Task { @MainActor in await state.goOfflineAndWait() }
+    state.suspendForSleep()
   }
 
   @objc private func systemDidWake(_ notification: Notification) {
-    guard wasOnlineBeforeSleep else { return }
-    wasOnlineBeforeSleep = false
-    // Resume the fleet we paused for sleep.
-    AppState.shared.goOnline()
+    let state = AppState.shared
+    ControlPlaneLog.log("host.wake", ["fleetState": state.state.rawValue])
+    state.lifecycle.didWake {
+      ControlPlaneLog.log("host.resume")
+      state.goOnline()
+    }
   }
 
   /// Closing the dashboard window must NOT quit the app — quitting is what takes
@@ -131,6 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   /// backstop if this is skipped (force-quit, crash).
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     let state = AppState.shared
+    state.prepareForQuit()
     if state.state == .offline { return .terminateNow }
 
     // Two independent main-actor tasks race to reply: the teardown, and a 6 s
