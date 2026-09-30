@@ -179,3 +179,19 @@ public enum RunHistoryStore {
     return (try? data.write(to: fileURL(), options: .atomic)) != nil
   }
 }
+
+/// The exact records offered by a clear-history confirmation. Runner exits and
+/// conclusion updates can arrive while the dialog is open; neither may expand
+/// the deletion beyond the IDs the user was shown.
+public struct RunHistoryClearRequest: Sendable {
+  public let ids: Set<String>
+  public var count: Int { ids.count }
+
+  public init(records: [RunRecord]) {
+    ids = Set(records.map(\.id))
+  }
+
+  public func remaining(in records: [RunRecord]) -> [RunRecord] {
+    records.filter { !ids.contains($0.id) }
+  }
+}

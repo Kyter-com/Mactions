@@ -2101,14 +2101,17 @@ final class AppState: ObservableObject {
     Task { @MainActor [weak self] in await self?.resolveRecentConclusions() }
   }
 
-  /// Wipe the persisted run history (dashboard "Clear" button).
-  func clearRunHistory() {
-    historyRequestEpoch += 1
-    conclusionResolutionGeneration += 1
-    runHistory = []
-    jobLogs = [:]
-    jobLogRecency = []
-    jobLogRequestGeneration = [:]
+  /// Delete only the history offered by the confirmation, preserving any runs
+  /// that finished while it was open and their in-flight log/conclusion lookups.
+  func clearRunHistory(_ request: RunHistoryClearRequest) {
+    runHistory = request.remaining(in: runHistory)
+    for id in request.ids {
+      jobLogs.removeValue(forKey: id)
+      jobLogRequestGeneration.removeValue(forKey: id)
+    }
+    jobLogRecency.removeAll { request.ids.contains($0) }
+    // Late responses for removed IDs fail isCurrentJobLogRequest / updateRun's
+    // membership guards. A global epoch bump would strand retained log loads.
     persistHistory()
   }
 

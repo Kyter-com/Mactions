@@ -22,8 +22,8 @@ options:
 packages:
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
-    # 2.10.0 is the current stable (Sep 2026) — the floor the Sparkle project
-    # itself points at. `from` keeps SemVer-compatible patches flowing.
+    # Sparkle 2.10 requires macOS 12, below our macOS 13 deployment target.
+    # `from` allows compatible 2.x updates.
     from: 2.10.0
 
 settings:

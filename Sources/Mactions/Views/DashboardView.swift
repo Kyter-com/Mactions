@@ -51,9 +51,7 @@ struct DashboardView: View {
     return selection?.split(separator: "#", maxSplits: 1).first.map(String.init)
   }
 
-  // @ContentBuilder (the macOS 27 unified builder) instead of @ViewBuilder —
-  // this is the app's largest single body and historically the slowest to
-  // type-check; ContentBuilder collapses the result-builder overload search.
+  // Xcode 27's unified builder is back-deployed to our macOS 13 target.
   @ContentBuilder
   var body: some View {
     VStack(spacing: 0) {
@@ -122,6 +120,7 @@ struct DashboardView: View {
         Label("Settings", systemImage: "gearshape")
       }
       .help("GitHub account, Windows/Linux base setup, and defaults (⌘,).")
+      .accessibilityLabel("Settings")
 
       Button {
         app.toggleOnline()
@@ -131,6 +130,7 @@ struct DashboardView: View {
           systemImage: app.state == .offline ? "play.fill" : "stop.fill")
       }
       .glassProminentButton()
+      .accessibilityLabel(app.state == .offline ? "Go online" : "Go offline")
       .keyboardShortcut("o", modifiers: .command)
       .disabled(
         // The empty-combos gate only blocks GOING online — never disable "Go
@@ -237,7 +237,7 @@ struct DashboardView: View {
         if app.runners.isEmpty {
           app.restartFleet()
         } else {
-          pendingRestartRepos = app.runners.map(\.repoFullName).sorted()
+          pendingRestartRepos = Set(app.runners.map(\.repoFullName)).sorted()
         }
       }
       .controlSize(.small)
@@ -246,9 +246,9 @@ struct DashboardView: View {
     .padding(.horizontal, MactionsTheme.Spacing.section)
     .padding(.vertical, MactionsTheme.Spacing.control)
     .background(Color.orange.opacity(0.12))
-    .itemConfirmationDialog(
+    .confirmationDialog(
       "Restart the fleet now?", item: $pendingRestartRepos, titleVisibility: .visible
-    ) { scope in
+    ) { _ in
       Button("Restart and cancel running jobs", role: .destructive) { app.restartFleet() }
       Button("Cancel", role: .cancel) {}
     } message: { scope in
@@ -258,13 +258,13 @@ struct DashboardView: View {
 
   /// The concrete cost of a confirmed restart: which repos' runners get
   /// deregistered (and thus which in-flight jobs GitHub will fail). The item
-  /// holds one entry per runner; the repos are deduped for the message.
+  /// holds the repositories with live runners when the dialog was opened.
   private func restartDialogMessage(_ scope: [String]) -> String {
-    let repos = Set(scope).sorted()
-    let names = repos.joined(separator: ", ")
+    let names = scope.prefix(3).joined(separator: ", ")
+      + (scope.count > 3 ? ", and \(scope.count - 3) more" : "")
     return
-      "Restarting deregisters the live runners across \(repos.count) repo\(repos.count == 1 ? "" : "s") "
-      + "(\(names)), and GitHub fails any job they are running. Failed jobs are not re-queued — "
+      "There are live runners in \(names). Restarting stops the entire fleet, including any "
+      + "jobs that start before you confirm. GitHub fails interrupted jobs; "
       + "re-run them from GitHub afterward."
   }
 
@@ -700,8 +700,6 @@ private struct RunnersPane: View {
 
   // MARK: Right — the selected runner's live detail OR the repo's Configure panel
 
-  // @ContentBuilder: five alternative detail branches — the second-heaviest
-  // builder in the app after `body`.
   @ContentBuilder
   private var rightPanel: some View {
     // A live runner is selected → show its job/step detail.
@@ -1052,10 +1050,8 @@ private struct HistoryPane: View {
   @State private var selected: String?
   @State private var search = ""
   @State private var filter: OutcomeFilter = .all
-  /// The pending clear-history confirmation — item-binding dialog: the item is
-  /// the number of runs about to be deleted, so the message always states the
-  /// real cost and the state is one optional, not Bool + counter.
-  @State private var pendingClearCount: Int?
+  /// Capture IDs as well as the count so newly finished runs survive Clear.
+  @State private var pendingClear: RunHistoryClearRequest?
 
   enum OutcomeFilter: String, CaseIterable, Identifiable {
     case all = "All"
@@ -1090,7 +1086,7 @@ private struct HistoryPane: View {
           TextField("Filter runs…", text: $search).textFieldStyle(.plain).font(.callout)
           if !app.runHistory.isEmpty {
             Button {
-              pendingClearCount = app.runHistory.count
+              pendingClear = RunHistoryClearRequest(records: app.runHistory)
             } label: {
               Image(systemName: "trash")
             }
@@ -1126,6 +1122,7 @@ private struct HistoryPane: View {
       // filtered out doesn't show detail for a row that isn't in the list.
       if let record = filtered.first(where: { $0.id == selected }) {
         RunDetailView(record: record)
+          .id(record.id)
       } else {
         DashboardEmptyState(
           systemImage: "sidebar.right", title: "Select a run",
@@ -1153,21 +1150,27 @@ private struct HistoryPane: View {
       }
     }
     // Clearing history is irreversible and a single small-icon tap — confirm it.
-    .itemConfirmationDialog(
-      "Clear all run history?", item: $pendingClearCount, titleVisibility: .visible
-    ) { _ in
-      Button("Clear", role: .destructive) { app.clearRunHistory() }
+    .confirmationDialog(
+      "Clear recorded run history?", item: $pendingClear, titleVisibility: .visible
+    ) { request in
+      Button("Clear \(request.count) run\(request.count == 1 ? "" : "s")", role: .destructive) {
+        if let selected, request.ids.contains(selected) { self.selected = nil }
+        app.clearRunHistory(request)
+      }
       Button("Cancel", role: .cancel) {}
-    } message: { count in
+    } message: { request in
       Text(
-        "This permanently deletes \(count) recorded run\(count == 1 ? "" : "s") and their cached "
-          + "logs. This can't be undone.")
+        "This permanently deletes \(request.count) recorded run\(request.count == 1 ? "" : "s") "
+          + "and their cached logs from this Mac. Runs that finish after opening this dialog "
+          + "are kept. GitHub's history and logs are unaffected. This can't be undone.")
     }
   }
 }
 
 private struct HistoryRow: View {
   let record: RunRecord
+  @ScaledMetric(relativeTo: .callout) private var rowHeight = 40.0
+
   var body: some View {
     HStack(spacing: 9) {
       OSLogo(os: record.os, size: 13).frame(width: 16).accessibilityLabel(record.os.displayName)
@@ -1182,7 +1185,10 @@ private struct HistoryRow: View {
       Text(durationString(record.duration)).font(.caption2).foregroundStyle(.tertiary)
         .monospacedDigit()
     }
-    .padding(.vertical, 2)
+    // Give NSTableView a stable two-line height as rows arrive or are cleared.
+    // Its automatic estimate can collapse a reused cell to one line, clipping
+    // the timestamp and platform icon (especially after clearing to one row).
+    .frame(height: rowHeight)
   }
 }
 
@@ -1190,6 +1196,7 @@ private struct RunDetailView: View {
   let record: RunRecord
   @EnvironmentObject private var app: AppState
   @State private var logSearch = ""
+  @State private var retryingLog = false
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
@@ -1201,6 +1208,8 @@ private struct RunDetailView: View {
       content
     }
     .task(id: record.id) {
+      retryingLog = true
+      defer { retryingLog = false }
       // GitHub commonly indexes a completed job before its downloadable log.
       // Retry that specific 404/not-ready state for one minute while this detail
       // remains visible; old/expired logs stay a single request.
@@ -1288,11 +1297,15 @@ private struct RunDetailView: View {
       }
     case .notReady(let job):
       VStack(spacing: 8) {
-        ProgressView()
+        if retryingLog { ProgressView() }
         Text("GitHub is preparing this job's log…")
           .font(.caption).foregroundStyle(.secondary)
-        Text("Mactions will retry automatically for one minute.")
-          .font(.caption2).foregroundStyle(.tertiary)
+        Text(
+          retryingLog
+            ? "Mactions will retry automatically for one minute."
+            : "The automatic retries have finished. Use Re-fetch to try again."
+        )
+        .font(.caption2).foregroundStyle(.tertiary)
       }
       .frame(maxWidth: .infinity, maxHeight: .infinity)
       .accessibilityLabel("GitHub is preparing the log for \(job.name)")
@@ -1341,17 +1354,8 @@ private struct LogConsole: View {
   let lines: [String]
   @Binding var search: String
 
-  /// One matched line, identified by its original index in the full log.
-  struct IndexedLine: Identifiable {
-    let id: Int
-    let text: String
-  }
-
-  // Memoized filter results: recomputed ONLY when the search text or the log
-  // changes (onAppear / onChange), never on every body re-render. Without this,
-  // the 2s memory-sample re-render of the parent would re-filter the whole log
-  // each tick — an O(n) main-thread cost that the user explicitly wants avoided.
-  @State private var matches: [IndexedLine] = []
+  @State private var matches: [JobLogSearch.Line] = []
+  @State private var searchTask: Task<Void, Never>?
 
   var body: some View {
     VStack(spacing: 0) {
@@ -1387,17 +1391,30 @@ private struct LogConsole: View {
     }
     .onAppear { recompute() }
     .onChange(of: search) { _ in recompute() }
-    .onChange(of: lines.count) { _ in recompute() }
+    // A refresh can change text without changing the number of lines.
+    .onChange(of: lines) { _ in recompute() }
+    .onDisappear {
+      searchTask?.cancel()
+      searchTask = nil
+    }
   }
 
   private func recompute() {
-    let q = search.trimmingCharacters(in: .whitespaces).lowercased()
-    if q.isEmpty {
-      matches = lines.enumerated().map { IndexedLine(id: $0.offset, text: $0.element) }
-    } else {
-      matches = lines.enumerated().compactMap {
-        $0.element.lowercased().contains(q) ? IndexedLine(id: $0.offset, text: $0.element) : nil
+    searchTask?.cancel()
+    let snapshot = lines
+    let query = search
+    matches = []
+    searchTask = Task {
+      let worker = Task.detached(priority: .userInitiated) {
+        JobLogSearch.matchingLines(in: snapshot, query: query)
       }
+      let result = await withTaskCancellationHandler {
+        await worker.value
+      } onCancel: {
+        worker.cancel()
+      }
+      guard !Task.isCancelled else { return }
+      matches = result
     }
   }
 
@@ -1723,59 +1740,6 @@ extension View {
     } else {
       self
     }
-  }
-
-  /// Confirmation dialog driven by an optional ITEM instead of a Bool — the
-  /// macOS 27 item-binding pattern (`confirmationDialog(_:item:)`, the same
-  /// shape sheets always had). Setting the item presents the dialog with that
-  /// value; dismissing clears it, so the confirm state and its payload can no
-  /// longer disagree (the Bool+separate-payload model needed two @State vars
-  /// kept in sync by hand). Falls back to the isPresented form on macOS 13–26
-  /// by deriving the Bool from the item — same behavior, one state var.
-  ///
-  /// Availability note: the new overload is macOS 27+; the #available branch is
-  /// what keeps the macOS 13 deployment target compiling.
-  @ViewBuilder
-  func itemConfirmationDialog<Item, Buttons: View, Message: View>(
-    _ title: String,
-    item: Binding<Item?>,
-    titleVisibility: Visibility = .automatic,
-    @ViewBuilder buttons: @escaping (Item) -> Buttons,
-    @ViewBuilder message: @escaping (Item) -> Message
-  ) -> some View {
-    if #available(macOS 27.0, *) {
-      self.modifier(
-        ItemBoundConfirmationDialog(
-          title: title, item: item, titleVisibility: titleVisibility,
-          buttons: buttons, message: message))
-    } else {
-      self.confirmationDialog(
-        title,
-        isPresented: Binding(get: { item.wrappedValue != nil }, set: { if !$0 { item.wrappedValue = nil } }),
-        titleVisibility: titleVisibility
-      ) {
-        if let value = item.wrappedValue { buttons(value) }
-      } message: {
-        if let value = item.wrappedValue { message(value) }
-      }
-    }
-  }
-}
-
-/// The macOS 27 item-binding `confirmationDialog` in a ViewModifier so the
-/// `@available(macOS 27.0, *)` overload call lives in one gated place.
-private struct ItemBoundConfirmationDialog<Item, Buttons: View, Message: View>: ViewModifier {
-  let title: String
-  @Binding var item: Item?
-  let titleVisibility: Visibility
-  let buttons: (Item) -> Buttons
-  let message: (Item) -> Message
-
-  func body(content: Content) -> some View {
-    content.confirmationDialog(
-      title, item: $item, titleVisibility: titleVisibility,
-      actions: { value in buttons(value) },
-      message: { value in message(value) })
   }
 }
 

@@ -310,10 +310,10 @@ private struct WindowsSettingsTab: View {
     } header: {
       Text("Windows runner image")
     }
-    .itemConfirmationDialog(
+    .confirmationDialog(
       "Rebuild the Windows base image?", item: $pendingRebuild, titleVisibility: .visible
-    ) { maintenance in
-      Button(rebuildConfirmLabel(for: maintenance), role: .destructive) {
+    ) { _ in
+      Button("Rebuild image", role: .destructive) {
         app.setUpWindowsRunner(force: true)
       }
       Button("Cancel", role: .cancel) {}
@@ -362,18 +362,18 @@ private struct WindowsSettingsTab: View {
     }
   }
 
-  /// Both read the DIALOG's snapshot (not live `app.windowsMaintenance`) so what
-  /// the user confirms is exactly what they were shown when they tapped Rebuild.
-  private func rebuildConfirmLabel(for maintenance: WindowsImage.MaintenanceReason) -> String {
-    if case .provisioningOutdated = maintenance { return "Rebuild (reuses cached ISO)" }
-    return "Rebuild (re-downloads ~8 GB)"
-  }
-
+  /// The script resolves the latest build again when it runs. A maintenance
+  /// snapshot cannot promise cache reuse or a particular download size.
   private func rebuildDialogMessage(for maintenance: WindowsImage.MaintenanceReason) -> String {
+    let reason: String
     if case .provisioningOutdated = maintenance {
-      return "Rebuilds the base VM headless with the updated runner setup recipe — about 30–40 minutes. Reuses the cached Win11 ARM64 ISO (the Windows build is unchanged), so no large re-download. Replaces the existing base image."
+      reason = "Updates the runner setup recipe and replaces the existing base image. "
+    } else {
+      reason = "Replaces the existing base image with the latest available Windows build. "
     }
-    return "Re-downloads the latest Win11 ARM64 ISO (~8 GB) and rebuilds the base VM headless — about 30–40 minutes. This replaces the existing base image."
+    return reason
+      + "This takes about 30–40 minutes. A matching cached ISO is reused; otherwise, "
+      + "the download is about 8 GB."
   }
 }
 

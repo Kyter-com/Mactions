@@ -157,7 +157,7 @@ Friendly by design — no env vars, no hand-copied long tokens.
 
 ```bash
 swift build          # compiles MactionsCore + the app
-swift test           # 244 unit tests (requests, Actions job/run pagination/direct refresh + ETags, device-flow guard, queued-jobs polling, repo lister, scale-from-zero orchestrator, host budget, shared repo control plane + discovery ledger, cleanup, run-scoped agent teardown, Windows VM command shapes + image/preflight logic, Linux container command shapes + budget + setup-progress, RunnerOS labels)
+swift test           # 249 unit tests (requests, Actions job/run pagination/direct refresh + ETags, device-flow guard, queued-jobs polling, repo lister, scale-from-zero orchestrator, host budget, shared repo control plane + discovery ledger, cleanup, run-scoped agent teardown, Windows VM command shapes + image/preflight logic, Linux container command shapes + budget + setup-progress, RunnerOS labels)
 swift run Mactions   # launches the app for dev
 ```
 
@@ -215,7 +215,7 @@ The single persistent, intentional cache is the ~200 MB agent template (so resta
 - **`MactionsCore` has zero external dependencies** and no SwiftUI/AppKit import. Keep it that way — it's what makes the logic testable.
 - **Network calls have pure request-builder counterparts** (`jitConfigRequest`, `deviceCodeRequest`, …) so they can be unit-tested without hitting the network. New endpoints should follow that split.
 - **`RunnerOrchestrator` is `@MainActor`** and notifies the UI via an `onChange` callback, not Combine — the core stays UI-framework-free.
-- **New-OS APIs are availability-gated at the call site with a same-shape fallback** (see the `liquidGlass*` / `itemConfirmationDialog` / `inactiveWindowDimmed` helpers at the bottom of `DashboardView.swift`): the macOS 13 deployment target is not bumped just to use a new API. macOS 27 additions in use: item-binding `confirmationDialog(_:item:)` (via `itemConfirmationDialog` — one optional state carries confirm-state + payload; never pair a Bool with a separate payload), `appearsActive` (via `inactiveWindowDimmed` — custom chrome only, never content), and `@ContentBuilder` on the heaviest view builders. macOS 26 additions: Liquid Glass on the control layer only — never on content, never glass-on-glass.
+- **New-OS APIs are availability-gated when the SDK requires it**, with a same-shape fallback (see the `liquidGlass*` helpers in `DashboardView.swift`). Keep the macOS 13 deployment target. Xcode 27's item-binding `confirmationDialog(_:item:)` is back-deployed to macOS 12: use it directly, with one optional carrying the confirmation payload. Destructive actions must consume that payload (history IDs, repo ID), not a fresh selection or count. `@ContentBuilder` is a back-deployed alias of `ViewBuilder`; do not claim a compile-time speedup without measurement. `appearsActive` is also back-deployed, but `inactiveWindowDimmed` deliberately applies the new styling only on macOS 27. Liquid Glass remains gated to macOS 26+, on the control layer only — never on content, never glass-on-glass.
 - **Swift 6** (`swift-tools-version: 6.0`, `swiftLanguageModes: [.v6]` — strict concurrency on), macOS 13+ target, built with Xcode 27 / Swift 6.4. Keep the build warning-clean. Providers are `@unchecked Sendable` (each `NSLock`-guards its own state); `onExit` is `@Sendable`; `RunnerOrchestrator` + its `Slot` + `AppDelegate` are `@MainActor`.
 - Runner names are prefixed `mactions-<host>-<rand>` so teardown can identify our own runners and never touch anyone else's.
 

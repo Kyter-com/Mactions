@@ -7,6 +7,30 @@ import XCTest
 /// `load`: those read/write the real `~/.mactions/logs/run-history.json`, and a
 /// test must not clobber a developer's actual run history.
 final class RunHistoryTests: XCTestCase {
+  func testConfirmedClearPreservesRunsThatArriveWhileDialogIsOpen() {
+    let old = makeRecord("old")
+    let request = RunHistoryClearRequest(records: [old])
+    let newer = makeRecord("newer")
+    var resolvedOld = old
+    resolvedOld.jobConclusion = .success
+
+    XCTAssertEqual(request.count, 1)
+    XCTAssertEqual(request.remaining(in: [newer, resolvedOld]), [newer])
+  }
+
+  func testConfirmedClearDoesNotDeleteReplacementRowsAfterHistoryLimitEvictsSnapshot() {
+    let request = RunHistoryClearRequest(records: [makeRecord("evicted")])
+    let retained = [makeRecord("newest"), makeRecord("next")]
+    XCTAssertEqual(request.remaining(in: retained), retained)
+    XCTAssertEqual(RunHistoryClearRequest(records: []).remaining(in: retained), retained)
+  }
+
+  private func makeRecord(_ id: String) -> RunRecord {
+    RunRecord(
+      id: id, os: .macOS, repo: "owner/repo", remoteId: nil,
+      startedAt: .distantPast, endedAt: .distantPast, exitStatus: 0, outcome: .completed)
+  }
+
   func testRunRecordCodableRoundTrip() throws {
     // Whole-second timestamps so ISO-8601's second granularity round-trips exactly
     // (Equatable on RunRecord compares the Dates).

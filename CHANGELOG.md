@@ -7,29 +7,33 @@ All notable changes to Mactions are documented here. This project adheres to
 
 ### Improved
 
-- **Updated for the macOS 27 / Xcode 27 toolchain, with the new APIs adopted
-  where they improve something real** (the deployment target stays macOS 13 —
-  everything is availability-gated with the same fallback pattern as the
-  existing Liquid Glass helpers):
-  - **Confirmation dialogs use macOS 27's item-binding API** — one optional
-    state carries both the confirm-state and its payload, replacing the Bool +
-    separate-value pattern, so what the user confirms is exactly what the
-    dialog was armed with. The dialogs also got more honest in the process: the
-    fleet-restart dialog now names the repos whose in-flight jobs a restart
-    would fail on GitHub, the clear-history dialog states how many runs it will
-    delete, and the Windows-rebuild dialog snapshots the maintenance state it
-    was armed with so a background update check can't change the offer
-    mid-presentation.
-  - **Custom chrome now follows the 2027 inactive-window treatment**: the
-    dashboard's status strip dims when the window is not key, via the new
-    `appearsActive` environment value (no-op on older macOS).
-  - **`@ContentBuilder`** (the unified result builder new in Xcode 27) replaces
-    `@ViewBuilder` on the dashboard's two heaviest builders, cutting their
-    type-check time.
-  - **Sparkle bumped to 2.10.0** (current stable).
-  - **Two Swift 6.4 `ImplicitStrongCapture` warnings in `goOnline` are fixed**
-    with an explicit `[self]` capture (behavior unchanged; the build is
-    warning-clean again on the new compiler).
+- **Xcode 27 / macOS 27 support, retaining the macOS 13 deployment target.**
+  Confirmation dialogs use the SDK's item-binding overload, which Apple
+  back-deploys to macOS 12. `@ContentBuilder` adopts the unified builder spelling;
+  it is an alias of `ViewBuilder`, not a measured compile-time optimization.
+  The status strip follows the inactive-window appearance on macOS 27.
+- **Sparkle updated to 2.10.0.**
+- **Clearer destructive actions.** Repository removal names the captured full
+  repository ID. Fleet restart lists affected repositories and explains that
+  newly started jobs are also stopped. Windows rebuild explains that ISO reuse
+  depends on the latest build and the available cache.
+- **More accessible dashboard controls.** Settings and Online/Offline buttons
+  have explicit accessibility labels; truncated status text is available on hover.
+- **Log searches run off the UI thread** and cancel superseded work.
+
+### Fixed
+
+- **Clear History preserves runs that finish while its confirmation is open.**
+  The dialog captures record IDs as well as the count, and removes only those
+  records and their cached logs. New runs and their pending lookups are retained.
+- **History rows reserve room for both text lines**, avoiding clipped timestamps
+  and platform icons when macOS reuses table cells after history changes.
+- **Refreshed logs no longer show stale text when the line count is unchanged.**
+  Switching runs also resets the detail view's search and retry state.
+- **Log-indexing retries no longer leave an indefinite spinner.** After the
+  bounded retry window, the detail view explains how to retry manually.
+- **Swift 6.4 capture warnings fixed** in both app startup and runner provisioning,
+  retaining weak callbacks from orchestrators/providers to their owners.
 
 ## [0.1.11] - 2026-08-02
 

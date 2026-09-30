@@ -102,8 +102,9 @@ struct RepoInspector: View {
       .disabled(app.state != .offline)
       .help(app.state == .offline ? "Remove this repository" : MactionsTheme.Copy.offlineToManageRepos)
       .accessibilityLabel("Remove repository")
-      .itemConfirmationDialog(
-        "Remove \(repoPlan.repo.name)?", item: $pendingRemoveRepo, titleVisibility: .visible
+      .confirmationDialog(
+        "Remove \(pendingRemoveRepo ?? repoPlan.id)?", item: $pendingRemoveRepo,
+        titleVisibility: .visible
       ) { repoID in
         Button("Remove", role: .destructive) { app.removeRepo(id: repoID) }
         Button("Cancel", role: .cancel) {}
