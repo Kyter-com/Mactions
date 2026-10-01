@@ -5,6 +5,8 @@ All notable changes to Mactions are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-30
+
 ### Improved
 
 - **Xcode 27 / macOS 27 support, retaining the macOS 13 deployment target.**
@@ -13,6 +15,7 @@ All notable changes to Mactions are documented here. This project adheres to
   it is an alias of `ViewBuilder`, not a measured compile-time optimization.
   The status strip follows the inactive-window appearance on macOS 27.
 - **Sparkle updated to 2.10.0.**
+- **Release builds select Xcode 27**, matching the SDK required by the app.
 - **Clearer destructive actions.** Repository removal names the captured full
   repository ID. Fleet restart lists affected repositories and explains that
   newly started jobs are also stopped. Windows rebuild explains that ISO reuse
@@ -41,6 +44,8 @@ All notable changes to Mactions are documented here. This project adheres to
   bounded retry window, the detail view explains how to retry manually.
 - **Swift 6.4 capture warnings fixed** in both app startup and runner provisioning,
   retaining weak callbacks from orchestrators/providers to their owners.
+- **Universal release builds avoid an unreachable-code warning** in the
+  Apple Silicon-only Linux runtime probe when compiling the Intel slice.
 
 ## [0.1.11] - 2026-08-02
 
