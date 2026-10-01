@@ -3,6 +3,50 @@
 All notable changes to Mactions are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.2.0] - 2026-09-30
+
+### Improved
+
+- **Xcode 27 / macOS 27 support, retaining the macOS 13 deployment target.**
+  Confirmation dialogs use the SDK's item-binding overload, which Apple
+  back-deploys to macOS 12. `@ContentBuilder` adopts the unified builder spelling;
+  it is an alias of `ViewBuilder`, not a measured compile-time optimization.
+  The status strip follows the inactive-window appearance on macOS 27.
+- **Sparkle updated to 2.10.0.**
+- **Release builds select Xcode 27**, matching the SDK required by the app.
+- **Clearer destructive actions.** Repository removal names the captured full
+  repository ID. Fleet restart lists affected repositories and explains that
+  newly started jobs are also stopped. Windows rebuild explains that ISO reuse
+  depends on the latest build and the available cache.
+- **More accessible dashboard controls.** Settings and Online/Offline buttons
+  have explicit accessibility labels; truncated status text is available on hover.
+- **Log searches run off the UI thread** and cancel superseded work.
+
+### Fixed
+
+- **Wake waits for fleet teardown before bringing runners online again.**
+  Overlapping shutdown requests share one teardown, so late cleanup cannot
+  remove a newly started fleet. Sleep defers a pending restart; Offline,
+  sign-out, and quit cancel it. Sleep/wake and shutdown boundaries are logged.
+- **Dashboard polling stops when its retained window is closed or hidden.**
+  Runner status, job steps, history retries, and memory sampling resume when
+  the window becomes visible again; the fleet continues running in the background.
+- **Clear History preserves runs that finish while its confirmation is open.**
+  The dialog captures record IDs as well as the count, and removes only those
+  records and their cached logs. New runs and their pending lookups are retained.
+- **History rows reserve room for both text lines**, avoiding clipped timestamps
+  and platform icons when macOS reuses table cells after history changes.
+- **Refreshed logs no longer show stale text when the line count is unchanged.**
+  Switching runs also resets the detail view's search and retry state.
+- **Log-indexing retries no longer leave an indefinite spinner.** After the
+  bounded retry window, the detail view explains how to retry manually.
+- **Swift 6.4 capture warnings fixed** in both app startup and runner provisioning,
+  retaining weak callbacks from orchestrators/providers to their owners.
+- **Universal release builds avoid an unreachable-code warning** in the
+  Apple Silicon-only Linux runtime probe when compiling the Intel slice.
+
 ## [0.1.11] - 2026-08-02
 
 ### Fixed

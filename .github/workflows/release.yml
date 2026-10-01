@@ -93,17 +93,17 @@ jobs:
             exit 1
           fi
 
-      - name: Select Xcode 26
+      - name: Select Xcode 27
         run: |
           set -euo pipefail
 
           shopt -s nullglob
-          xcode_26_apps=(/Applications/Xcode_26*.app)
+          xcode_27_apps=(/Applications/Xcode_27*.app)
           shopt -u nullglob
 
           candidates=()
-          for ((idx=${#xcode_26_apps[@]} - 1; idx >= 0; idx--)); do
-            candidates+=("${xcode_26_apps[$idx]}")
+          for ((idx=${#xcode_27_apps[@]} - 1; idx >= 0; idx--)); do
+            candidates+=("${xcode_27_apps[$idx]}")
           done
           candidates+=("/Applications/Xcode.app")
 
@@ -116,14 +116,14 @@ jobs:
 
             version_output="$("$developer/usr/bin/xcodebuild" -version)"
             version_line="${version_output%%$'\n'*}"
-            if [[ "$version_line" =~ ^Xcode[[:space:]]26([.]|$) ]]; then
+            if [[ "$version_line" =~ ^Xcode[[:space:]]27([.]|$) ]]; then
               developer_dir="$developer"
               break
             fi
           done
 
           if [ -z "$developer_dir" ]; then
-            echo "::error::No Xcode 26 installation found on this runner"
+            echo "::error::No Xcode 27 installation found on this runner"
             exit 1
           fi
 

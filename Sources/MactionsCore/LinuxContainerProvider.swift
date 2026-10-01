@@ -275,18 +275,15 @@ public struct LinuxContainerProviderFactory: RunnerProviderFactory {
   public static func detectInstalledCLI(
     operatingSystemVersion: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
   ) -> LinuxContainerCLI? {
-    let fm = FileManager.default
     #if arch(arm64)
-    let isARM64 = true
-    #else
-    let isARM64 = false
-    #endif
-    if isARM64, operatingSystemVersion.majorVersion >= 26 {
+    let fm = FileManager.default
+    if operatingSystemVersion.majorVersion >= 26 {
       for bin in ["/usr/local/bin/container", "/opt/homebrew/bin/container"]
       where fm.isExecutableFile(atPath: bin) {
         return ContainerCLI(executable: bin)
       }
     }
+    #endif
     return nil
   }
 

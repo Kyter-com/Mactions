@@ -15,7 +15,10 @@ struct RepoInspector: View {
   /// The selected repo's id (`owner/name`), or nil when nothing is selected.
   let repoID: String?
 
-  @State private var confirmRemove = false
+  /// The pending remove-repo confirmation — item-binding dialog (macOS 27
+  /// pattern): the item IS the repo to remove, so the destructive action can
+  /// never run against a stale selection.
+  @State private var pendingRemoveRepo: String?
 
   private var repoPlan: RepoPlan? {
     guard let repoID else { return nil }
@@ -88,7 +91,9 @@ struct RepoInspector: View {
       }
       Spacer(minLength: 0)
       Button(role: .destructive) {
-        confirmRemove = true
+        // Key the dialog on the repo ID, not the display name — the macOS 27
+        // item-binding payload IS the thing the action consumes.
+        pendingRemoveRepo = repoPlan.id
       } label: {
         Image(systemName: "trash")
       }
@@ -98,11 +103,12 @@ struct RepoInspector: View {
       .help(app.state == .offline ? "Remove this repository" : MactionsTheme.Copy.offlineToManageRepos)
       .accessibilityLabel("Remove repository")
       .confirmationDialog(
-        "Remove \(repoPlan.repo.name)?", isPresented: $confirmRemove, titleVisibility: .visible
-      ) {
-        Button("Remove", role: .destructive) { app.removeRepo(id: repoPlan.id) }
+        "Remove \(pendingRemoveRepo ?? repoPlan.id)?", item: $pendingRemoveRepo,
+        titleVisibility: .visible
+      ) { repoID in
+        Button("Remove", role: .destructive) { app.removeRepo(id: repoID) }
         Button("Cancel", role: .cancel) {}
-      } message: {
+      } message: { _ in
         Text("This repository and all of its platform configuration will be removed.")
       }
     }

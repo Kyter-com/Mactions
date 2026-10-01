@@ -884,7 +884,7 @@ public final class RunnerOrchestrator {
       // Sendable and `Slot` is @MainActor-isolated (hence Sendable), so the
       // exit-callback hop back to the main actor stays safe.
       let encoded = jit.encodedConfig
-      try await Task.detached {
+      try await Task.detached { [self] in
         try provider.start(jitConfig: encoded) { [weak self] status in
           Task { @MainActor in self?.handleExit(slot, epoch: myEpoch, status: status) }
         }

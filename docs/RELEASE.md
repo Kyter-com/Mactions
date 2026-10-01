@@ -6,7 +6,7 @@ target, signs with Developer ID, notarizes and staples the app and DMG,
 generates a Sparkle appcast, and uploads the release assets to GitHub Releases.
 
 The release Mac must be online in Mactions with this repo selected before a tag
-push or manual dispatch can run. It also needs Xcode 26, Homebrew, and a Developer
+push or manual dispatch can run. It also needs Xcode 27, Homebrew, and a Developer
 ID certificate that `security find-identity -v -p codesigning` reports as valid
 on that Mac.
 
@@ -58,7 +58,10 @@ secret.
 
 ## Releasing
 
-Push a version tag:
+Before tagging, merge the release changes to `main`, including the
+`MARKETING_VERSION` update in `project.yml` and a versioned changelog section.
+Tag the resulting `main` commit so the source, release notes, and published app
+agree:
 
 ```bash
 git tag v0.1.0

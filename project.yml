@@ -22,7 +22,9 @@ options:
 packages:
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
-    from: 2.9.3
+    # Sparkle 2.10 requires macOS 12, below our macOS 13 deployment target.
+    # `from` allows compatible 2.x updates.
+    from: 2.10.0
 
 settings:
   base:
@@ -91,7 +93,7 @@ targets:
         # The Icon Composer icon → real AppIcon (compiled by actool).
         ASSETCATALOG_COMPILER_APPICON_NAME: Mactions
         SWIFT_VERSION: "6.0"
-        MARKETING_VERSION: "0.1.11"
+        MARKETING_VERSION: "0.2.0"
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: xcode/Info.plist

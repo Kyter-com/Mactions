@@ -30,6 +30,8 @@ extension Notification.Name {
 @MainActor
 final class AppState: ObservableObject {
   static let shared = AppState()
+  let lifecycle = FleetLifecycle()
+  private var isQuitting = false
 
   // Config. The whole per-(repo,platform) plan is ONE published value, persisted
   // as JSON under `fleetPlanV2`; `selectedRepos` is derived from it. This replaces
@@ -522,9 +524,10 @@ final class AppState: ObservableObject {
   /// Apply staged per-combo edits to the live fleet: take it offline, then back
   /// online (which re-reads the plan). The one-click form of the manual cycle.
   func restartFleet() {
-    guard state != .offline else { return }
-    Task {
-      await goOfflineAndWait()
+    guard state == .online, !isQuitting else { return }
+    lifecycle.restart { [self] in
+      await tearDownFleet()
+    } resume: { [self] in
       goOnline()
     }
   }
@@ -625,7 +628,7 @@ final class AppState: ObservableObject {
   }
 
   func signOut() {
-    Task { await goOfflineAndWait() }
+    goOffline()
     try? TokenStore.clear()
     resetActionsCaches()
     isSignedIn = false
@@ -672,6 +675,7 @@ final class AppState: ObservableObject {
   }
 
   func goOnline() {
+    guard state == .offline, !isQuitting, lifecycle.allowsStart else { return }
     errorBanner = nil  // a fresh attempt clears any prior blocking error
     guard let token = TokenStore.load() else {
       reportBlockingError("Sign in to GitHub first.")
@@ -716,7 +720,13 @@ final class AppState: ObservableObject {
     state = .starting
     statusMessage = "Preparing runner agent…"
     let repos = selectedRepos
-    Task {
+    // Explicit `[self]`: the whole go-online body reads main-actor state, so the
+    // Task captures self strongly — and Swift 6.4's ImplicitStrongCapture
+    // diagnostic otherwise flags the ownership MISMATCH with the deliberately
+    // weak `[weak self]` orch callbacks below (orch → AppState must not be a
+    // retain cycle). Making the outer capture explicit silences the diagnostic
+    // while keeping both capture intents as written.
+    Task { [self] in
       // Reap a prior crash/force-quit's orphans OFF the main actor — sweepOrphans
       // shells out (pkill + `vmrun stop hard`/`deleteVM` + `rm -rf`), which can
       // block for seconds with leftover clones and would otherwise stall the UI
@@ -1035,11 +1045,31 @@ final class AppState: ObservableObject {
   }
 
   func goOffline() {
+    lifecycle.cancelResume()
+    // Record the user's intent before scheduling teardown, so a sleep
+    // notification in this run-loop turn cannot arm automatic resume.
+    if state != .offline { state = .stopping }
     Task { await goOfflineAndWait() }
   }
 
   func goOfflineAndWait() async {
+    await lifecycle.shutDown { [self] in await tearDownFleet() }
+  }
+
+  func suspendForSleep() {
+    lifecycle.willSleep(wasRunning: state == .online || state == .starting) { [self] in
+      await tearDownFleet()
+    }
+  }
+
+  func prepareForQuit() {
+    isQuitting = true
+    lifecycle.cancelResume()
+  }
+
+  private func tearDownFleet() async {
     guard !orchestrators.isEmpty || state != .offline else { return }
+    ControlPlaneLog.log("fleet.stop.begin")
     fleetEpoch += 1  // invalidate any in-flight goOnline
     discoveryTask?.cancel()
     discoveryTask = nil
@@ -1075,6 +1105,7 @@ final class AppState: ObservableObject {
     errorBanner = nil  // a prior blocking error is moot once we're cleanly offline
     state = .offline
     statusMessage = "Offline."
+    ControlPlaneLog.log("fleet.stop.end")
   }
 
   /// Remove everything Mactions wrote to disk (cached agent + run files).
@@ -2095,14 +2126,17 @@ final class AppState: ObservableObject {
     Task { @MainActor [weak self] in await self?.resolveRecentConclusions() }
   }
 
-  /// Wipe the persisted run history (dashboard "Clear" button).
-  func clearRunHistory() {
-    historyRequestEpoch += 1
-    conclusionResolutionGeneration += 1
-    runHistory = []
-    jobLogs = [:]
-    jobLogRecency = []
-    jobLogRequestGeneration = [:]
+  /// Delete only the history offered by the confirmation, preserving any runs
+  /// that finished while it was open and their in-flight log/conclusion lookups.
+  func clearRunHistory(_ request: RunHistoryClearRequest) {
+    runHistory = request.remaining(in: runHistory)
+    for id in request.ids {
+      jobLogs.removeValue(forKey: id)
+      jobLogRequestGeneration.removeValue(forKey: id)
+    }
+    jobLogRecency.removeAll { request.ids.contains($0) }
+    // Late responses for removed IDs fail isCurrentJobLogRequest / updateRun's
+    // membership guards. A global epoch bump would strand retained log loads.
     persistHistory()
   }
 
@@ -2211,6 +2245,16 @@ final class AppState: ObservableObject {
   var latestMemory: MemorySample? { memorySamples.last }
 
   private var memorySamplingTask: Task<Void, Never>?
+
+  /// The AppKit window is retained after close, so SwiftUI disappearance alone
+  /// cannot own dashboard polling or memory sampling.
+  @Published private(set) var dashboardVisible = false
+
+  func setDashboardVisible(_ visible: Bool) {
+    guard dashboardVisible != visible else { return }
+    dashboardVisible = visible
+    if visible { startMemorySampling() } else { stopMemorySampling() }
+  }
 
   /// Start the live memory sampler. Driven by the dashboard window opening (see
   /// `DashboardWindowController`) rather than SwiftUI view lifecycle: the window is

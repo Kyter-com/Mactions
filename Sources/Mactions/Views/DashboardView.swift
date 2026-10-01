@@ -18,7 +18,11 @@ private let allRepositoriesSelectionID = "__mactions_all_repositories__"
 struct DashboardView: View {
   @EnvironmentObject private var app: AppState
   @State private var tab: Tab? = .runners
-  @State private var confirmRestart = false
+  /// The pending fleet-restart confirmation — the macOS 27 item-binding dialog
+  /// pattern: one optional carries BOTH the confirm-state and its payload (the
+  /// repos whose live runners a confirmed restart would fail on GitHub). No
+  /// Bool + separate payload pair to drift out of sync.
+  @State private var pendingRestartRepos: [String]?
   /// The Runners grid selection — a repo header id (`owner/name`) or a runner
   /// child id (`owner/name#runner`). Lifted here so the Configure panel can bind
   /// to whichever repo is in focus. Selecting a repo opens its config on the
@@ -47,6 +51,8 @@ struct DashboardView: View {
     return selection?.split(separator: "#", maxSplits: 1).first.map(String.init)
   }
 
+  // Xcode 27's unified builder is back-deployed to our macOS 13 target.
+  @ContentBuilder
   var body: some View {
     VStack(spacing: 0) {
       headerBar
@@ -114,6 +120,7 @@ struct DashboardView: View {
         Label("Settings", systemImage: "gearshape")
       }
       .help("GitHub account, Windows/Linux base setup, and defaults (⌘,).")
+      .accessibilityLabel("Settings")
 
       Button {
         app.toggleOnline()
@@ -123,6 +130,7 @@ struct DashboardView: View {
           systemImage: app.state == .offline ? "play.fill" : "stop.fill")
       }
       .glassProminentButton()
+      .accessibilityLabel(app.state == .offline ? "Go online" : "Go offline")
       .keyboardShortcut("o", modifiers: .command)
       .disabled(
         // The empty-combos gate only blocks GOING online — never disable "Go
@@ -226,7 +234,11 @@ struct DashboardView: View {
         .font(.callout).foregroundStyle(.orange)
       Spacer(minLength: MactionsTheme.Spacing.control)
       Button("Restart fleet") {
-        if app.runners.isEmpty { app.restartFleet() } else { confirmRestart = true }
+        if app.runners.isEmpty {
+          app.restartFleet()
+        } else {
+          pendingRestartRepos = Set(app.runners.map(\.repoFullName)).sorted()
+        }
       }
       .controlSize(.small)
       .disabled(app.state == .starting || app.state == .stopping)
@@ -235,15 +247,25 @@ struct DashboardView: View {
     .padding(.vertical, MactionsTheme.Spacing.control)
     .background(Color.orange.opacity(0.12))
     .confirmationDialog(
-      "Restart the fleet now?", isPresented: $confirmRestart, titleVisibility: .visible
-    ) {
+      "Restart the fleet now?", item: $pendingRestartRepos, titleVisibility: .visible
+    ) { _ in
       Button("Restart and cancel running jobs", role: .destructive) { app.restartFleet() }
       Button("Cancel", role: .cancel) {}
-    } message: {
-      Text(
-        "Restarting deregisters the live runners, and GitHub fails any job they are "
-          + "running. Failed jobs are not re-queued — re-run them from GitHub afterward.")
+    } message: { scope in
+      Text(restartDialogMessage(scope))
     }
+  }
+
+  /// The concrete cost of a confirmed restart: which repos' runners get
+  /// deregistered (and thus which in-flight jobs GitHub will fail). The item
+  /// holds the repositories with live runners when the dialog was opened.
+  private func restartDialogMessage(_ scope: [String]) -> String {
+    let names = scope.prefix(3).joined(separator: ", ")
+      + (scope.count > 3 ? ", and \(scope.count - 3) more" : "")
+    return
+      "There are live runners in \(names). Restarting stops the entire fleet, including any "
+      + "jobs that start before you confirm. GitHub fails interrupted jobs; "
+      + "re-run them from GitHub afterward."
   }
 
   /// Shown when a runner substrate needs attention — e.g. a stale Windows base
@@ -410,7 +432,8 @@ private struct RunnersPane: View {
     }
     // Poll which of our runners GitHub reports as executing a job (`busy`) so the
     // activity ring spins only during a real job. Runs while this pane shows.
-    .task {
+    .task(id: app.dashboardVisible) {
+      guard app.dashboardVisible else { return }
       while !Task.isCancelled {
         await app.refreshRunnerBusy()
         try? await Task.sleep(nanoseconds: 6_000_000_000)
@@ -678,7 +701,8 @@ private struct RunnersPane: View {
 
   // MARK: Right — the selected runner's live detail OR the repo's Configure panel
 
-  @ViewBuilder private var rightPanel: some View {
+  @ContentBuilder
+  private var rightPanel: some View {
     // A live runner is selected → show its job/step detail.
     if let id = selection, id.contains("#"),
       let row = app.runners.first(where: { $0.id == id })
@@ -981,7 +1005,8 @@ private struct RunnerDetailView: View {
       }
     }
     // Poll the running job's steps while this runner is selected (off-main).
-    .task(id: row.runner.id) {
+    .task(id: app.dashboardVisible ? row.runner.id : nil) {
+      guard app.dashboardVisible else { return }
       while !Task.isCancelled {
         await app.loadRunnerJob(
           for: row.runner.id, repo: row.repoFullName, startedAt: row.runner.startedAt,
@@ -1027,7 +1052,8 @@ private struct HistoryPane: View {
   @State private var selected: String?
   @State private var search = ""
   @State private var filter: OutcomeFilter = .all
-  @State private var confirmClear = false
+  /// Capture IDs as well as the count so newly finished runs survive Clear.
+  @State private var pendingClear: RunHistoryClearRequest?
 
   enum OutcomeFilter: String, CaseIterable, Identifiable {
     case all = "All"
@@ -1062,7 +1088,7 @@ private struct HistoryPane: View {
           TextField("Filter runs…", text: $search).textFieldStyle(.plain).font(.callout)
           if !app.runHistory.isEmpty {
             Button {
-              confirmClear = true
+              pendingClear = RunHistoryClearRequest(records: app.runHistory)
             } label: {
               Image(systemName: "trash")
             }
@@ -1098,6 +1124,7 @@ private struct HistoryPane: View {
       // filtered out doesn't show detail for a row that isn't in the list.
       if let record = filtered.first(where: { $0.id == selected }) {
         RunDetailView(record: record)
+          .id(record.id)
       } else {
         DashboardEmptyState(
           systemImage: "sidebar.right", title: "Select a run",
@@ -1109,7 +1136,8 @@ private struct HistoryPane: View {
     // this pane is visible, only for recent unsettled rows, and for at most one
     // minute. A new history row changes the task id and starts a fresh bounded
     // settlement window.
-    .task(id: app.runHistory.first?.id) {
+    .task(id: app.dashboardVisible ? app.runHistory.first?.id : nil) {
+      guard app.dashboardVisible else { return }
       for attempt in 0..<12 {
         await app.resolveRecentConclusions()
         let shouldRetry = app.runHistory.prefix(12).contains { record in
@@ -1126,19 +1154,26 @@ private struct HistoryPane: View {
     }
     // Clearing history is irreversible and a single small-icon tap — confirm it.
     .confirmationDialog(
-      "Clear all run history?", isPresented: $confirmClear, titleVisibility: .visible
-    ) {
-      Button("Clear", role: .destructive) { app.clearRunHistory() }
+      "Clear recorded run history?", item: $pendingClear, titleVisibility: .visible
+    ) { request in
+      Button("Clear \(request.count) run\(request.count == 1 ? "" : "s")", role: .destructive) {
+        if let selected, request.ids.contains(selected) { self.selected = nil }
+        app.clearRunHistory(request)
+      }
       Button("Cancel", role: .cancel) {}
-    } message: {
+    } message: { request in
       Text(
-        "This permanently deletes all recorded runs and their cached logs. This can't be undone.")
+        "This permanently deletes \(request.count) recorded run\(request.count == 1 ? "" : "s") "
+          + "and their cached logs from this Mac. Runs that finish after opening this dialog "
+          + "are kept. GitHub's history and logs are unaffected. This can't be undone.")
     }
   }
 }
 
 private struct HistoryRow: View {
   let record: RunRecord
+  @ScaledMetric(relativeTo: .callout) private var rowHeight = 40.0
+
   var body: some View {
     HStack(spacing: 9) {
       OSLogo(os: record.os, size: 13).frame(width: 16).accessibilityLabel(record.os.displayName)
@@ -1153,7 +1188,10 @@ private struct HistoryRow: View {
       Text(durationString(record.duration)).font(.caption2).foregroundStyle(.tertiary)
         .monospacedDigit()
     }
-    .padding(.vertical, 2)
+    // Give NSTableView a stable two-line height as rows arrive or are cleared.
+    // Its automatic estimate can collapse a reused cell to one line, clipping
+    // the timestamp and platform icon (especially after clearing to one row).
+    .frame(height: rowHeight)
   }
 }
 
@@ -1161,6 +1199,8 @@ private struct RunDetailView: View {
   let record: RunRecord
   @EnvironmentObject private var app: AppState
   @State private var logSearch = ""
+  @State private var retryingLog = false
+  @State private var retryGeneration = 0
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
@@ -1171,7 +1211,14 @@ private struct RunDetailView: View {
       Divider()
       content
     }
-    .task(id: record.id) {
+    .task(id: app.dashboardVisible ? record.id : nil) {
+      guard app.dashboardVisible, !Task.isCancelled else { return }
+      retryGeneration += 1
+      let generation = retryGeneration
+      retryingLog = true
+      defer {
+        if retryGeneration == generation { retryingLog = false }
+      }
       // GitHub commonly indexes a completed job before its downloadable log.
       // Retry that specific 404/not-ready state for one minute while this detail
       // remains visible; old/expired logs stay a single request.
@@ -1259,11 +1306,15 @@ private struct RunDetailView: View {
       }
     case .notReady(let job):
       VStack(spacing: 8) {
-        ProgressView()
+        if retryingLog { ProgressView() }
         Text("GitHub is preparing this job's log…")
           .font(.caption).foregroundStyle(.secondary)
-        Text("Mactions will retry automatically for one minute.")
-          .font(.caption2).foregroundStyle(.tertiary)
+        Text(
+          retryingLog
+            ? "Mactions will retry automatically for one minute."
+            : "The automatic retries have finished. Use Re-fetch to try again."
+        )
+        .font(.caption2).foregroundStyle(.tertiary)
       }
       .frame(maxWidth: .infinity, maxHeight: .infinity)
       .accessibilityLabel("GitHub is preparing the log for \(job.name)")
@@ -1312,17 +1363,8 @@ private struct LogConsole: View {
   let lines: [String]
   @Binding var search: String
 
-  /// One matched line, identified by its original index in the full log.
-  struct IndexedLine: Identifiable {
-    let id: Int
-    let text: String
-  }
-
-  // Memoized filter results: recomputed ONLY when the search text or the log
-  // changes (onAppear / onChange), never on every body re-render. Without this,
-  // the 2s memory-sample re-render of the parent would re-filter the whole log
-  // each tick — an O(n) main-thread cost that the user explicitly wants avoided.
-  @State private var matches: [IndexedLine] = []
+  @State private var matches: [JobLogSearch.Line] = []
+  @State private var searchTask: Task<Void, Never>?
 
   var body: some View {
     VStack(spacing: 0) {
@@ -1358,17 +1400,30 @@ private struct LogConsole: View {
     }
     .onAppear { recompute() }
     .onChange(of: search) { _ in recompute() }
-    .onChange(of: lines.count) { _ in recompute() }
+    // A refresh can change text without changing the number of lines.
+    .onChange(of: lines) { _ in recompute() }
+    .onDisappear {
+      searchTask?.cancel()
+      searchTask = nil
+    }
   }
 
   private func recompute() {
-    let q = search.trimmingCharacters(in: .whitespaces).lowercased()
-    if q.isEmpty {
-      matches = lines.enumerated().map { IndexedLine(id: $0.offset, text: $0.element) }
-    } else {
-      matches = lines.enumerated().compactMap {
-        $0.element.lowercased().contains(q) ? IndexedLine(id: $0.offset, text: $0.element) : nil
+    searchTask?.cancel()
+    let snapshot = lines
+    let query = search
+    matches = []
+    searchTask = Task {
+      let worker = Task.detached(priority: .userInitiated) {
+        JobLogSearch.matchingLines(in: snapshot, query: query)
       }
+      let result = await withTaskCancellationHandler {
+        await worker.value
+      } onCancel: {
+        worker.cancel()
+      }
+      guard !Task.isCancelled else { return }
+      matches = result
     }
   }
 
@@ -1681,5 +1736,32 @@ extension View {
     } else {
       self.buttonStyle(.bordered)
     }
+  }
+
+  /// macOS 27: dim custom chrome when the window is INACTIVE — native windows
+  /// dim their icons/text on the 2027 releases, and custom surfaces can follow
+  /// via `appearsActive`. Below macOS 27 this is a no-op (no change to the old
+  /// look). Apply to app-drawn chrome only, never to content.
+  @ViewBuilder
+  func inactiveWindowDimmed() -> some View {
+    if #available(macOS 27.0, *) {
+      self.modifier(InactiveWindowDim())
+    } else {
+      self
+    }
+  }
+}
+
+/// macOS 27's inactive-window treatment for custom chrome: dim icon/text
+/// opacity when the window loses key, via the new `appearsActive` environment
+/// value. The struct exists so the `@Environment` read lives inside an
+/// `@available(macOS 27.0, *)` type (per the repo's availability-gating
+/// convention, even though the SDK back-deploys the env value).
+@available(macOS 27.0, *)
+private struct InactiveWindowDim: ViewModifier {
+  @Environment(\.appearsActive) private var appearsActive
+
+  func body(content: Content) -> some View {
+    content.opacity(appearsActive ? 1 : 0.55)
   }
 }

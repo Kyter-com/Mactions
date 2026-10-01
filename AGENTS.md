@@ -74,6 +74,8 @@ scripts/                                       (driven by AppState + provider)
 
 **Lifecycle:** the app is a regular windowed macOS app. Closing the dashboard leaves the app and fleet running; quitting is the "go offline" signal. `AppDelegate.applicationShouldTerminate` returns `.terminateLater`, runs `goOfflineAndWait()`, then replies — with a 6s hard timeout so a hung network call can't wedge quit. Ephemeral runners + GitHub's offline sweep are the backstop for force-quit/crash.
 
+`FleetLifecycle` coalesces concurrent shutdown requests and orders restart/sleep/wake: resume waits for teardown, another sleep defers it, and explicit Offline/sign-out/quit cancel it. `goOnline()` only starts from `.offline` while awake and not quitting. Sleep/wake and shutdown boundaries are recorded in the control-plane log. Dashboard polling and memory sampling are separately gated by AppKit window visibility, since the window and SwiftUI hierarchy are retained after close.
+
 ## Providers
 
 `RunnerProvider` is the substrate one runner executes on.
@@ -157,7 +159,7 @@ Friendly by design — no env vars, no hand-copied long tokens.
 
 ```bash
 swift build          # compiles MactionsCore + the app
-swift test           # 244 unit tests (requests, Actions job/run pagination/direct refresh + ETags, device-flow guard, queued-jobs polling, repo lister, scale-from-zero orchestrator, host budget, shared repo control plane + discovery ledger, cleanup, run-scoped agent teardown, Windows VM command shapes + image/preflight logic, Linux container command shapes + budget + setup-progress, RunnerOS labels)
+swift test           # 258 unit tests (requests, Actions job/run pagination/direct refresh + ETags, device-flow guard, queued-jobs polling, repo lister, scale-from-zero orchestrator, sleep/wake/restart ordering, host budget, shared repo control plane + discovery ledger, cleanup, run-scoped agent teardown, Windows VM command shapes + image/preflight logic, Linux container command shapes + budget + setup-progress, RunnerOS labels)
 swift run Mactions   # launches the app for dev
 ```
 
@@ -215,7 +217,8 @@ The single persistent, intentional cache is the ~200 MB agent template (so resta
 - **`MactionsCore` has zero external dependencies** and no SwiftUI/AppKit import. Keep it that way — it's what makes the logic testable.
 - **Network calls have pure request-builder counterparts** (`jitConfigRequest`, `deviceCodeRequest`, …) so they can be unit-tested without hitting the network. New endpoints should follow that split.
 - **`RunnerOrchestrator` is `@MainActor`** and notifies the UI via an `onChange` callback, not Combine — the core stays UI-framework-free.
-- **Swift 6** (`swift-tools-version: 6.0`, `swiftLanguageModes: [.v6]` — strict concurrency on), macOS 13+ target. Keep the build warning-clean. Providers are `@unchecked Sendable` (each `NSLock`-guards its own state); `onExit` is `@Sendable`; `RunnerOrchestrator` + its `Slot` + `AppDelegate` are `@MainActor`.
+- **New-OS APIs are availability-gated when the SDK requires it**, with a same-shape fallback (see the `liquidGlass*` helpers in `DashboardView.swift`). Keep the macOS 13 deployment target. Xcode 27's item-binding `confirmationDialog(_:item:)` is back-deployed to macOS 12: use it directly, with one optional carrying the confirmation payload. Destructive actions must consume that payload (history IDs, repo ID), not a fresh selection or count. `@ContentBuilder` is a back-deployed alias of `ViewBuilder`; do not claim a compile-time speedup without measurement. `appearsActive` is also back-deployed, but `inactiveWindowDimmed` deliberately applies the new styling only on macOS 27. Liquid Glass remains gated to macOS 26+, on the control layer only — never on content, never glass-on-glass.
+- **Swift 6** (`swift-tools-version: 6.0`, `swiftLanguageModes: [.v6]` — strict concurrency on), macOS 13+ target, built with Xcode 27 / Swift 6.4. Keep the build warning-clean. Providers are `@unchecked Sendable` (each `NSLock`-guards its own state); `onExit` is `@Sendable`; `RunnerOrchestrator` + its `Slot` + `AppDelegate` are `@MainActor`.
 - Runner names are prefixed `mactions-<host>-<rand>` so teardown can identify our own runners and never touch anyone else's.
 
 ## Multiple machines

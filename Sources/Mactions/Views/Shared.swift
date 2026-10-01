@@ -397,6 +397,7 @@ struct StatusStrip: View {
   var body: some View {
     HStack(spacing: MactionsTheme.Spacing.control) {
       Text(message).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+        .help(message)
       Spacer(minLength: MactionsTheme.Spacing.control)
       if let liveNote {
         HStack(spacing: 4) {
@@ -404,6 +405,7 @@ struct StatusStrip: View {
             Image(systemName: "exclamationmark.triangle.fill").font(.caption2)
           }
           Text(liveNote.text).font(.caption).monospacedDigit().lineLimit(1)
+            .help(liveNote.text)
         }
         .foregroundStyle(liveNote.isWarning ? Color.orange : Color.secondary)
       }
@@ -411,6 +413,7 @@ struct StatusStrip: View {
         HStack(spacing: 4) {
           Image(systemName: "exclamationmark.triangle.fill").font(.caption2)
           Text(capNote).font(.caption).lineLimit(1)
+            .help(capNote)
         }
         .foregroundStyle(.orange)
       }
@@ -418,5 +421,6 @@ struct StatusStrip: View {
     .padding(.horizontal, MactionsTheme.Spacing.section)
     .padding(.vertical, MactionsTheme.Spacing.tight)
     .frame(maxWidth: .infinity)
+    .inactiveWindowDimmed()
   }
 }
