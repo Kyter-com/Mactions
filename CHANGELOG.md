@@ -11,6 +11,10 @@ All notable changes to Mactions are documented here. This project adheres to
   a short-lived container from the runner image tests whether a VM can reach
   github.com, and the dashboard says what it found, including when a VPN on the
   Mac is the likely cause. A passing check resumes launches.
+- **Network changes are acted on at once.** Joining Wi-Fi, or a VPN
+  connecting or dropping, brings a paused platform's next check forward and,
+  once the network works, polls repositories again right away instead of up to
+  a minute later.
 
 ### Fixed
 

@@ -317,6 +317,10 @@ final class AppState: ObservableObject {
   /// quiet scan can be a race with a job that's mid-pickup).
   private var discoveryQuietScans: [String: Int] = [:]
   private var discoveryTask: Task<Void, Never>?
+  /// The all-repos loop's wait between scans; a network change cuts it short
+  /// (`networkPathChanged`) so a scan that failed while the network was down
+  /// isn't followed by a full minute of nothing once it is back.
+  private let discoveryWait = KickableWait()
   /// One shared control plane per repo (explicit AND discovered), kept for the
   /// online session: same-repo combos + the discovery probe collapse into one
   /// queued-jobs fetch per tick window, and the underlying client's ETag store
@@ -1100,6 +1104,19 @@ final class AppState: ObservableObject {
     launchGate?.resumeNow(os)
   }
 
+  /// The Mac's network path changed (see `NetworkPathWatcher`): Wi-Fi joined
+  /// or lost, a VPN connecting or dropping. A paused OS checks again now
+  /// instead of at its backoff time, and once the network is usable every
+  /// fleet reconciles and the all-repos scan runs now rather than at their
+  /// next ticks.
+  func networkPathChanged(usable: Bool) {
+    guard state == .online || state == .starting else { return }
+    launchGate?.networkChanged()
+    guard usable else { return }
+    nudgeFleets(os: nil)
+    if discoveryTask != nil { discoveryWait.kick() }
+  }
+
   /// Run every matching fleet's reconcile now instead of at its next tick:
   /// `os == nil` nudges all of them.
   private func nudgeFleets(os: RunnerOS?) {
@@ -1178,6 +1195,7 @@ final class AppState: ObservableObject {
     // edited while online are STAGED (noteDefaultsEdit → restart bar), not
     // half-applied to a live scan.
     let planSnapshot = plan
+    discoveryWait.reset()
     discoveryTask = Task { [weak self] in
       while !Task.isCancelled {
         // Bound each scan with a watchdog. A scan makes serial network calls
@@ -1204,7 +1222,9 @@ final class AppState: ObservableObject {
           }
           group.cancelAll()
         }
-        try? await Task.sleep(nanoseconds: 60_000_000_000)
+        // A minute between scans, cut short when the network changes.
+        guard let wait = self?.discoveryWait else { return }
+        await wait.wait(seconds: 60)
       }
     }
   }

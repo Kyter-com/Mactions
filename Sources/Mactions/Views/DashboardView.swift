@@ -323,8 +323,8 @@ struct DashboardView: View {
     }
     let time = next.formatted(date: .omitted, time: .shortened)
     return pause.checksByProbe
-      ? "Checks the network again at \(time)."
-      : "Tries one runner again at \(time)."
+      ? "Checks the network again at \(time), or sooner if the Mac's network changes."
+      : "Tries one runner again at \(time), or sooner if the Mac's network changes."
   }
 
   private var statusColor: Color {

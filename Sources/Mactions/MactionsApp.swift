@@ -85,6 +85,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       object: nil)
     nc.addObserver(
       self, selector: #selector(systemDidWake), name: NSWorkspace.didWakeNotification, object: nil)
+
+    // Network changes reach the fleet too (Wi-Fi joined or lost, a VPN
+    // connecting or dropping): a paused OS checks again at once, and when the
+    // network is usable the fleets and the all-repos scan run now.
+    let watcher = NetworkPathWatcher.shared
+    watcher.onChange = { snapshot in
+      let state = AppState.shared
+      ControlPlaneLog.log(
+        "host.network_change", ["path": snapshot.summary, "fleetState": state.state.rawValue])
+      state.networkPathChanged(usable: snapshot.usable)
+    }
+    watcher.start()
   }
 
   @objc private func systemWillSleep(_ notification: Notification) {
