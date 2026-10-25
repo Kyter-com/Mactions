@@ -27,6 +27,9 @@ All notable changes to Mactions are documented here. This project adheres to
 - **All-repositories scans finish on slow connections.** Repositories are
   polled four at a time with a 90-second limit; over plane Wi-Fi a 50-repository
   scan went from 168 seconds to under a minute.
+- **A hung container daemon can't stall Mactions.** Apple container status,
+  list, inspect and delete commands now give up after 30 seconds, so going
+  online, teardown and Linux capacity no longer wait on them forever.
 
 ## [0.2.0] - 2026-09-30
 
