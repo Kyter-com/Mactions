@@ -73,6 +73,10 @@ struct DashboardView: View {
         actionNoticeBar(rebuild)
         Divider()
       }
+      ForEach(app.launchPauses, id: \.os) { pause in
+        launchPauseBar(pause)
+        Divider()
+      }
       NavigationSplitView {
         List(Tab.allCases, selection: $tab) { item in
           Label(item.rawValue, systemImage: item.systemImage).tag(item)
@@ -284,6 +288,43 @@ struct DashboardView: View {
     .padding(.horizontal, MactionsTheme.Spacing.section)
     .padding(.vertical, MactionsTheme.Spacing.control)
     .background(Color.orange.opacity(0.12))
+  }
+
+  /// An OS whose runner launches the `LaunchGate` paused after repeated
+  /// failures to reach GitHub: why, when it checks again, and a way to try now
+  /// (for when the user knows the cause is gone, or doubts the check).
+  private func launchPauseBar(_ pause: LaunchGate.Pause) -> some View {
+    HStack(alignment: .top, spacing: MactionsTheme.Spacing.tight) {
+      Image(systemName: "pause.circle").foregroundStyle(.orange)
+      VStack(alignment: .leading, spacing: 2) {
+        Text("\(pause.os.displayName) runner launches paused")
+          .font(.callout.weight(.semibold)).foregroundStyle(.orange)
+        Text(pause.reason).font(.callout).fixedSize(horizontal: false, vertical: true)
+        Text(launchPauseNextCheck(pause)).font(.caption).foregroundStyle(.secondary)
+      }
+      Spacer(minLength: MactionsTheme.Spacing.control)
+      Button("Try now") { app.resumeLaunches(pause.os) }
+        .controlSize(.small)
+        .help("Launch runners again now. If the next one also fails, launches pause again.")
+    }
+    .padding(.horizontal, MactionsTheme.Spacing.section)
+    .padding(.vertical, MactionsTheme.Spacing.control)
+    .background(Color.orange.opacity(0.12))
+  }
+
+  private func launchPauseNextCheck(_ pause: LaunchGate.Pause) -> String {
+    if pause.checking {
+      return pause.checksByProbe ? "Checking the network now…" : "Trying one runner now…"
+    }
+    // A check runs when a queued job needs a runner, so a due check waits for
+    // one.
+    guard let next = pause.nextCheckAt, next > Date() else {
+      return "Checks again the next time a job needs a runner."
+    }
+    let time = next.formatted(date: .omitted, time: .shortened)
+    return pause.checksByProbe
+      ? "Checks the network again at \(time)."
+      : "Tries one runner again at \(time)."
   }
 
   private var statusColor: Color {
@@ -672,6 +713,9 @@ private struct RunnersPane: View {
         // the status strip carries the reason.
         return "not armed"
       }
+      if let os = app.repoLaunchPaused[repoName] {
+        return "\(queued) queued · \(os.displayName) launches paused"
+      }
       if app.repoLaunchFailure[repoName] != nil {
         return "\(queued) queued · runner failing to launch"
       }
@@ -690,7 +734,7 @@ private struct RunnersPane: View {
   private func badgeColor(_ group: RepoGroup) -> Color {
     let repoName = group.repo.fullName
     guard app.state == .online, group.runners.isEmpty else { return .secondary }
-    if app.repoLaunchFailure[repoName] != nil
+    if app.repoLaunchFailure[repoName] != nil || app.repoLaunchPaused[repoName] != nil
       || app.repoWaitingForCapacity.contains(repoName)
       || app.repoPollFailing.contains(repoName)
     {

@@ -228,6 +228,11 @@ final class AppState: ObservableObject {
   /// Repos whose runners are repeatedly dying during launch (dead daemon, bad
   /// base image): repo → the orchestrator's last launch error.
   @Published var repoLaunchFailure: [String: String] = [:]
+  /// OSes whose launches the host-wide `LaunchGate` paused because their
+  /// runners kept failing to reach GitHub: the dashboard's "paused" bars.
+  @Published var launchPauses: [LaunchGate.Pause] = []
+  /// Repos with queued demand that a paused OS is holding: repo → that OS.
+  @Published var repoLaunchPaused: [String: RunnerOS] = [:]
   /// Names of OUR runners GitHub reports as `busy` (executing a job right now).
   /// Polled by the Runners pane so the activity ring spins only during a real job,
   /// not for an idle-but-online runner. Empty when offline.
@@ -300,6 +305,10 @@ final class AppState: ObservableObject {
   /// The live shared capacity ledger every orchestrator (explicit + discovered)
   /// draws on. One per online generation; cleared with the fleet.
   private var fleetBudget: HostBudget?
+  /// The host-wide launch circuit breaker every orchestrator (explicit +
+  /// discovered) asks before launching. One per online generation, so a fresh
+  /// go-online starts with a clean slate; cleared with the fleet.
+  private var launchGate: LaunchGate?
   /// Orchestrator keys created by all-repos DISCOVERY (seeded from the plan's
   /// defaults) rather than the explicit plan — reaped when their repo's queue
   /// goes quiet. Same key space as `orchestrators`.
@@ -874,6 +883,14 @@ final class AppState: ObservableObject {
           .macOS: maxMacOS, .windows: maxWindowsVMs, .linux: maxLinux,
         ])
         fleetBudget = budget
+        // When an OS's runners keep failing to reach GitHub (on 2026-10-24 a
+        // VPN cut the VMs off while the Mac itself stayed online), the gate
+        // pauses that OS's launches host-wide instead of letting every combo
+        // relaunch into the same broken network each reap cycle.
+        let gate = LaunchGate()
+        gate.onChange = { [weak self] in self?.scheduleSync() }
+        gate.onResume = { [weak self] os in self?.nudgeFleets(os: os) }
+        launchGate = gate
         fleetFactories = [:]
         if let factory, maxMacOS > 0 { fleetFactories[.macOS] = factory }
         // A factory whose budget is 0 must NOT arm discovery: it would create
@@ -898,7 +915,8 @@ final class AppState: ObservableObject {
           let fleet = FleetConfig(
             owner: repo.owner, repo: repo.name, labels: labels, maxRunners: count)
           let orch = RunnerOrchestrator(
-            controlPlane: plane, factory: factory, config: fleet, os: os, budget: budget)
+            controlPlane: plane, factory: factory, config: fleet, os: os, budget: budget,
+            launchGate: gate)
           orch.onChange = { [weak self] in self?.scheduleSync() }
           orch.onRunFinished = { [weak self] record in self?.recordRun(record) }
           let key = "\(repo.fullName)#\(os.rawValue)"
@@ -1067,6 +1085,20 @@ final class AppState: ObservableObject {
     lifecycle.cancelResume()
   }
 
+  /// The dashboard's "Try now" on a paused OS: launch again at once. One more
+  /// failure pauses it again (see `LaunchGate.resumeNow`).
+  func resumeLaunches(_ os: RunnerOS) {
+    launchGate?.resumeNow(os)
+  }
+
+  /// Run every matching fleet's reconcile now instead of at its next tick:
+  /// `os == nil` nudges all of them.
+  private func nudgeFleets(os: RunnerOS?) {
+    for (key, orch) in orchestrators where os == nil || fleetOS[key] == os {
+      orch.nudge()
+    }
+  }
+
   private func tearDownFleet() async {
     guard !orchestrators.isEmpty || state != .offline else { return }
     ControlPlaneLog.log("fleet.stop.begin")
@@ -1088,6 +1120,7 @@ final class AppState: ObservableObject {
     fleetRepo.removeAll()
     fleetFactories.removeAll()
     fleetBudget = nil
+    launchGate = nil
     discoveredKeys.removeAll()
     discoveryQuietScans.removeAll()
     fleetControlPlanes.removeAll()
@@ -1101,6 +1134,8 @@ final class AppState: ObservableObject {
     repoPollFailing = []
     repoWaitingForCapacity = []
     repoLaunchFailure = [:]
+    launchPauses = []
+    repoLaunchPaused = [:]
     pendingRestart = false  // nothing live to be out of sync with
     errorBanner = nil  // a prior blocking error is moot once we're cleanly offline
     state = .offline
@@ -1230,7 +1265,8 @@ final class AppState: ObservableObject {
           owner: repo.owner, repo: repo.name, labels: seedConfig.labels,
           maxRunners: seedConfig.count)
         let orch = RunnerOrchestrator(
-          controlPlane: plane, factory: factory, config: fleet, os: os, budget: budget)
+          controlPlane: plane, factory: factory, config: fleet, os: os, budget: budget,
+          launchGate: launchGate)
         orch.onChange = { [weak self] in self?.scheduleSync() }
         orch.onRunFinished = { [weak self] record in self?.recordRun(record) }
         orchestrators[key] = orch
@@ -2728,6 +2764,7 @@ final class AppState: ObservableObject {
     var pollFailing: Set<String> = []
     var waitingCapacity: Set<String> = []
     var launchFailures: [String: String] = [:]
+    var launchPaused: [String: RunnerOS] = [:]
     for (key, orch) in orchestrators {
       let os = fleetOS[key] ?? .macOS
       // Map back to the bare repo via fleetRepo (the OS is conveyed by the row's
@@ -2739,6 +2776,7 @@ final class AppState: ObservableObject {
       demand[repoName, default: 0] += orch.demand.queuedMatching
       if orch.demand.lastPollFailed { pollFailing.insert(repoName) }
       if orch.demand.waitingForCapacity { waitingCapacity.insert(repoName) }
+      if orch.demand.launchPaused { launchPaused[repoName] = os }
       if orch.launchFailing, let error = orch.lastError {
         launchFailures[repoName] = error
       }
@@ -2772,6 +2810,9 @@ final class AppState: ObservableObject {
     if pollFailing != repoPollFailing { repoPollFailing = pollFailing }
     if waitingCapacity != repoWaitingForCapacity { repoWaitingForCapacity = waitingCapacity }
     if launchFailures != repoLaunchFailure { repoLaunchFailure = launchFailures }
+    if launchPaused != repoLaunchPaused { repoLaunchPaused = launchPaused }
+    let pauses = launchGate?.pauses ?? []
+    if pauses != launchPauses { launchPauses = pauses }
     // When the rows/repos backing the two virtualized Lists actually change,
     // nudge the dashboard to relayout (the render-recovery guard against a
     // blank-frame List — see DashboardWindowController). Posted only on a real

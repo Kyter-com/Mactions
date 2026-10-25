@@ -48,6 +48,7 @@ MactionsCore (library, pure Foundation)        Mactions (executable, SwiftUI/App
   LinuxContainer* provider + budget + image + setup-progress (container-per-job)
   Orchestrator    start/stop/scale-from-zero (+ run-finished events)  OSLogo  custom-SF-Symbol tiles (+ SVGSymbol glyph fallback)
   HostBudget      live shared Windows/Linux capacity ledger (acquired per provision)
+  LaunchGate      host-wide, per-OS launch circuit breaker (pause after repeated launch failures)
   RunHistory      RunRecord + on-disk run-history store (~/.mactions/logs)
   MemorySampler   host (host_statistics64) + per-process RSS (ps) → Memory tab
   WindowsPreflight prereq detect (Fusion + converters + xorriso) + brew installer
@@ -68,6 +69,7 @@ scripts/                                       (driven by AppState + provider)
 1. Each reconcile tick (30s active / 60s idle-at-zero) reads GitHub's runner list (busy/idle health), then polls the repo's **queued jobs**: job-level status across runs in BOTH `queued` and `in_progress` states (run-level status flaps; an in_progress run can carry queued matrix legs), freshness-filtered on `max(created_at, updated_at)` (re-runs keep the original `created_at`). ETag conditional requests make the idle poll free against the rate limit (304s aren't billed).
 2. Demand = queued jobs whose labels ⊆ this combo's labels (GitHub's cumulative `runs-on` rule, case-insensitive). Target = `min(busy + matchingQueued, maxRunners)`, where `maxRunners` (the per-combo count, 1–5) is a **ceiling**, not a floor. A **failed poll HOLDS the fleet** — never scale on missing info.
 3. Scale-up: mint `generateJITConfig` → `RunnerProvider.start` per shortfall, each drawing on the live shared `HostBudget` (Windows RAM / Linux RAM+CPU, host-wide, refunded on every exit). The agent registers, runs **one** job, deregisters, exits; `onExit` → re-reconcile (demand-gated — no blind replace).
+   - **Launch gate** (`LaunchGate`, one per online generation, shared like `HostBudget`). Each launch asks it first. Two consecutive launch failures of an OS anywhere on the host — a runner that exits during launch, a provider start that throws, or a runner reaped for never reaching GitHub — with no new runner of that OS reaching GitHub in between, pause that OS for every combo: nothing is minted or launched, and the repo badge reads "N queued · Linux launches paused". A paused OS gets one **trial** runner per backoff (Linux/macOS 1→2→4→5 min, Windows 5→10→20 min); the trial or any runner of that OS reaching GitHub resumes it, and a dashboard bar says why and when it tries again, with **Try now**. Why: on 2026-10-24 a full-tunnel VPN cut the Linux VMs off while the Mac stayed online, and one combo relaunched a runner every ~2.5 min (33 launches, 17 never-online reaps in 45 min), each a fresh JIT registration and VM boot. Only a runner's *first* sighting online counts as success: a long-lived runner staying online says nothing about whether a new one can connect.
 4. Scale-down: surplus confirmed-idle runners (job taken elsewhere / cancelled) are trimmed after a two-snapshot grace, **deregister-first** (GitHub refuses to delete a busy runner — the server-side race guard), then stopped; trims/reaps never land in run history (`reaped` flag).
 5. `stop()` deregisters **this orchestrator's own runners** (never a machine-prefix sweep — sibling combos keep running under all-repos discovery), then tears down providers. Crash ghosts are reaped by the go-online sweep + GitHub's 1-day auto-prune.
 6. Optional **all-repos discovery** (`FleetPlan.allRepos`): while online, AppState scans the ~50 most-recently-pushed admin repos each minute and lazily creates (then quiet-reaps) orchestrators seeded from the default platforms.
@@ -159,7 +161,7 @@ Friendly by design — no env vars, no hand-copied long tokens.
 
 ```bash
 swift build          # compiles MactionsCore + the app
-swift test           # 268 unit tests (requests, Actions job/run pagination/direct refresh + ETags, device-flow guard, queued-jobs polling, repo lister, scale-from-zero orchestrator, sleep/wake/restart ordering, host budget, shared repo control plane + discovery ledger, cleanup, run-scoped agent teardown, time-limited shell commands, test-only control-plane log, Windows VM command shapes + image/preflight logic, Linux container command shapes + budget + setup-progress, RunnerOS labels)
+swift test           # 301 unit tests (requests, Actions job/run pagination/direct refresh + ETags, device-flow guard, queued-jobs polling, repo lister, scale-from-zero orchestrator, launch gate, sleep/wake/restart ordering, host budget, shared repo control plane + discovery ledger, cleanup, run-scoped agent teardown, time-limited shell commands, test-only control-plane log, Windows VM command shapes + image/preflight logic, Linux container command shapes + budget + setup-progress, RunnerOS labels)
 swift run Mactions   # launches the app for dev
 ```
 

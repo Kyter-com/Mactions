@@ -5,6 +5,15 @@ All notable changes to Mactions are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Runners that can't reach GitHub are no longer relaunched in a loop.**
+  After two launches of a platform fail in a row (a runner exits during launch,
+  can't start, or never connects), Mactions pauses that platform for every
+  repository and tries again on a growing backoff. A bar shows the reason and
+  the next check, with a Try now button, and the repository badge reads
+  "N queued · Linux launches paused".
+
 ## [0.2.0] - 2026-09-30
 
 ### Improved

@@ -142,6 +142,12 @@ public final class RunnerOrchestrator {
   /// (macOS agent processes, tests). Acquired per provision, released on every
   /// slot exit/reap — see `HostBudget`.
   private let budget: HostBudget?
+  /// Host-wide launch circuit breaker, SHARED across every combo like `budget`:
+  /// asked before each launch, told about every launch failure and every new
+  /// runner that reaches GitHub. It stops a combo whose runners cannot reach
+  /// GitHub from relaunching into the same broken network every reap cycle.
+  /// `nil` = never paused (tests, and callers that opt out).
+  private let launchGate: LaunchGate?
   private let machinePrefix: String
   private let reconcileInterval: UInt64
   /// Tick pace while idle AT ZERO (no slots, empty queue): poll less often —
@@ -210,14 +216,21 @@ public final class RunnerOrchestrator {
     /// "N queued" is waiting on capacity, not starting. Cleared when capacity
     /// is acquired or demand drains.
     public var waitingForCapacity = false
+    /// Launches for this combo's OS are paused host-wide (`LaunchGate`) while
+    /// demand remains: "N queued" is waiting on a network check, not starting.
+    /// Cleared when a launch is allowed again, the pause lifts, or demand
+    /// drains.
+    public var launchPaused = false
   }
 
   public private(set) var state: FleetState = .offline
   public private(set) var lastError: String?
   public private(set) var demand = DemandSnapshot()
-  /// Consecutive launch failures (handleExit's launch-failure branch) with no
-  /// runner reaching GitHub in between — ≥2 means the substrate is likely
-  /// broken (dead daemon, bad base image) and "starting…" would be a lie.
+  /// Consecutive launch failures with no runner reaching GitHub in between: a
+  /// runner that exited during launch (either ordering), a provider start that
+  /// threw, or a never-confirmed reap. ≥2 means the substrate or its network is
+  /// likely broken (dead daemon, bad base image, no egress) and "starting…"
+  /// would be a lie. The host-wide `launchGate` counts the same failures.
   private var consecutiveLaunchFailures = 0
   public var launchFailing: Bool { consecutiveLaunchFailures >= 2 }
   /// When `listRunners` first started failing (cleared on the next success). A
@@ -297,6 +310,10 @@ public final class RunnerOrchestrator {
     /// Set once and never reset on a transient offline blip — the same JIT
     /// registration spans the blip, so the idle clock must not restart.
     var onlineSince: Date?
+    /// Launched as the `LaunchGate`'s single trial while the OS was paused, so
+    /// its outcome answers that trial (a runner launched before the pause that
+    /// fails late must not count as the trial failing).
+    var isGateTrial = false
     init(
       name: String, remoteId: Int?, phase: ManagedRunner.Phase, provider: RunnerProvider,
       startedAt: Date
@@ -353,6 +370,7 @@ public final class RunnerOrchestrator {
     config: FleetConfig,
     os: RunnerOS = .macOS,
     budget: HostBudget? = nil,
+    launchGate: LaunchGate? = nil,
     machinePrefix: String = machineRunnerPrefix(),
     reconcileInterval: UInt64 = 30_000_000_000,
     idleReconcileInterval: UInt64 = 60_000_000_000,
@@ -369,6 +387,7 @@ public final class RunnerOrchestrator {
     self.config = config
     self.os = os
     self.budget = budget
+    self.launchGate = launchGate
     self.machinePrefix = machinePrefix
     self.reconcileInterval = reconcileInterval
     self.idleReconcileInterval = idleReconcileInterval
@@ -507,12 +526,18 @@ public final class RunnerOrchestrator {
     // for); while demand persists the flag carries over until an acquire
     // succeeds, so "waiting for capacity" survives the tick boundary.
     let stillWaiting = demand > 0 && self.demand.waitingForCapacity
+    // A launch pause carries over the same way, but only while the gate still
+    // holds the OS: a combo whose shortfall closed without asking the gate
+    // again must not keep claiming "paused" after the pause lifted.
+    let stillPaused =
+      demand > 0 && self.demand.launchPaused && launchGate?.pause(for: os) != nil
     let demandChanged =
       demand != self.demand.queuedMatching || self.demand.lastPollFailed
       || self.demand.waitingForCapacity != stillWaiting
+      || self.demand.launchPaused != stillPaused
     self.demand = DemandSnapshot(
       queuedMatching: demand, lastPolledAt: Date(), lastPollFailed: false,
-      waitingForCapacity: stillWaiting)
+      waitingForCapacity: stillWaiting, launchPaused: stillPaused)
     if demandChanged { notify() }  // lastPolledAt alone isn't worth a UI churn
 
     // 3. Converge.
@@ -570,12 +595,54 @@ public final class RunnerOrchestrator {
 
   private func scaleUp(target: @MainActor () -> Int, epoch myEpoch: Int) async {
     while slots.count < target() {
-      let ok = await provisionOne(epoch: myEpoch)
+      // Ask the host-wide launch gate first, and only when a runner is
+      // actually needed: a paused OS's check (a network probe, or one trial
+      // launch) is started from here.
+      let trial: Bool
+      switch launchGate?.decision(for: os) ?? .allowed {
+      case .allowed:
+        trial = false
+      case .trial:
+        trial = true
+      case .paused:
+        setLaunchPaused(true)
+        return
+      }
+      setLaunchPaused(false)
+      let ok = await provisionOne(epoch: myEpoch, trial: trial)
+      // A trial that never launched (budget denied, JIT mint failed) tested
+      // nothing: hand it back so the next tick can try. One that launched and
+      // died was already reported as the trial's failure. While a trial is out,
+      // the gate answers `.paused`, so a trial is one runner whatever the
+      // shortfall.
+      if trial, !ok { launchGate?.releaseTrial(os) }
       // Bail if we were stopped mid-flight, or on a transient failure (the
       // periodic loop / next exit retries — we never spin).
       guard epoch == myEpoch, state == .starting || state == .online else { return }
       if !ok { break }
     }
+  }
+
+  private func setLaunchPaused(_ paused: Bool) {
+    guard demand.launchPaused != paused else { return }
+    demand.launchPaused = paused
+    if paused {
+      ControlPlaneLog.log(
+        "provision.launch_paused",
+        [
+          "repo": "\(config.owner)/\(config.repo)", "os": os.rawValue,
+          "queued": String(demand.queuedMatching),
+        ])
+    }
+    notify()
+  }
+
+  /// Run a reconcile pass now instead of at the next tick — e.g. when the
+  /// launch gate lifts a pause, or the host network changes. A no-op unless
+  /// online; a pass already running absorbs it.
+  public func nudge() {
+    guard state == .online else { return }
+    Task { await reconcile() }
   }
 
   /// Scale-down: trim surplus runners the queue no longer justifies (their job
@@ -715,6 +782,11 @@ public final class RunnerOrchestrator {
           lastError =
             "Runner \(slot.name) registered but never reached GitHub within "
             + "\(Int(neverConfirmedReapInterval))s — reaping (check network/egress)."
+          launchGate?.recordLaunchFailure(
+            os,
+            reason: "\(os.displayName) runners registered but never reached GitHub "
+              + "within \(Int(neverConfirmedReapInterval))s.",
+            trial: slot.isGateTrial)
           stale.append((slot, remoteRunner, "never_confirmed_online"))
           continue
         }
@@ -744,6 +816,10 @@ public final class RunnerOrchestrator {
       slot.confirmedOnline = true  // a later quick exit is a run, not a launch failure
       if slot.onlineSince == nil {
         slot.onlineSince = now  // idle-refresh clock: from registration, not launch
+        // A NEW runner reached GitHub: launches work. Only the first sighting
+        // counts — a long-lived runner staying online says nothing about
+        // whether a runner launched now could connect.
+        launchGate?.recordLaunchSuccess(os)
         ControlPlaneLog.log(
           "runner.online",
           [
@@ -836,7 +912,7 @@ public final class RunnerOrchestrator {
   /// Provision exactly one runner. Returns false on failure. The slot is only
   /// recorded **after** the agent actually launches, so a failed start can't
   /// leave a phantom "online" slot.
-  private func provisionOne(epoch myEpoch: Int) async -> Bool {
+  private func provisionOne(epoch myEpoch: Int, trial: Bool = false) async -> Bool {
     // Draw on the SHARED host capacity first (Windows VMs / Linux containers
     // are budgeted host-wide): at the ceiling we skip — not an error; capacity
     // frees when any combo's runner exits and the next tick retries. Flag the
@@ -876,6 +952,7 @@ public final class RunnerOrchestrator {
       let slot = Slot(
         name: jit.runnerName, remoteId: jit.runnerId, phase: .online, provider: provider,
         startedAt: Date())
+      slot.isGateTrial = trial
       // `provider.start` BLOCKS — it clones the ~200 MB agent (cp), shells out to
       // `security`, or clones a whole VM. Run it OFF the main actor so the UI
       // doesn't beach-ball while the fleet spins up (the orchestrator is
@@ -908,6 +985,10 @@ public final class RunnerOrchestrator {
       // branch handles that ordering.
       if let status = slot.earlyExitStatus {
         lastError = "Runner \(jit.runnerName) exited during launch (status \(status))."
+        consecutiveLaunchFailures += 1
+        launchGate?.recordLaunchFailure(
+          os, reason: "\(os.displayName) runners exited during launch (status \(status)).",
+          trial: trial)
         try? await controlPlane.deleteRunner(id: jit.runnerId)
         notify()
         return false
@@ -924,6 +1005,17 @@ public final class RunnerOrchestrator {
       notify()
       return true
     } catch {
+      if mintedJIT != nil {
+        // The JIT config was minted, so the throw came from the provider's
+        // start: the substrate could not launch the runner. That is a launch
+        // failure (a JIT mint error is GitHub's, and tested nothing).
+        consecutiveLaunchFailures += 1
+        launchGate?.recordLaunchFailure(
+          os,
+          reason: "\(os.displayName) runners couldn't start: "
+            + String(String(describing: error).prefix(160)),
+          trial: trial)
+      }
       if let jit = mintedJIT {
         try? await controlPlane.deleteRunner(id: jit.runnerId)
         ControlPlaneLog.log(
@@ -1001,6 +1093,9 @@ public final class RunnerOrchestrator {
     if launchFailure {
       consecutiveLaunchFailures += 1
       lastError = "Runner \(slot.name) exited during launch (status \(status))."
+      launchGate?.recordLaunchFailure(
+        os, reason: "\(os.displayName) runners exited during launch (status \(status)).",
+        trial: slot.isGateTrial)
       releaseBudget(slot)
       if let index = slots.firstIndex(where: { $0 === slot }) {
         slots.remove(at: index)
