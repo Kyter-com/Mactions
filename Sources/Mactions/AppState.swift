@@ -890,6 +890,15 @@ final class AppState: ObservableObject {
         let gate = LaunchGate()
         gate.onChange = { [weak self] in self?.scheduleSync() }
         gate.onResume = { [weak self] os in self?.nudgeFleets(os: os) }
+        // Linux can be checked without launching a runner: one throwaway
+        // container from the runner image tests the VM network and says what
+        // is wrong (a VM network the VPN cut off, DNS only, …). It runs off the
+        // main actor; the gate starts it only while Linux is paused.
+        if linuxFactory != nil, let lxCLI = linuxCLI {
+          gate.setProbe(
+            { await Task.detached { LinuxNetworkProbe.run(cli: lxCLI, image: linuxImg) }.value },
+            for: .linux)
+        }
         launchGate = gate
         fleetFactories = [:]
         if let factory, maxMacOS > 0 { fleetFactories[.macOS] = factory }

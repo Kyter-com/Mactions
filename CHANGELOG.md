@@ -5,6 +5,13 @@ All notable changes to Mactions are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Improved
+
+- **Linux checks its VM network instead of guessing.** While Linux is paused,
+  a short-lived container from the runner image tests whether a VM can reach
+  github.com, and the dashboard says what it found, including when a VPN on the
+  Mac is the likely cause. A passing check resumes launches.
+
 ### Fixed
 
 - **Runners that can't reach GitHub are no longer relaunched in a loop.**

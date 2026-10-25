@@ -34,6 +34,10 @@ public protocol LinuxContainerCLI: Sendable {
   /// agent's `run.sh`. The JIT blob is delivered via `jitEnvName` (env), NOT the
   /// arg list. `--rm` + no volumes/binds == clean slate per job.
   func runArgs(name: String, image: String, label: String, cpus: Int, memoryGB: Int) -> [String]
+  /// Run ONE small, short-lived container in the foreground that runs `script`
+  /// with bash and exits: the `LaunchGate`'s Linux network check
+  /// (`LinuxNetworkProbe`). No JIT, no env, `--rm`.
+  func probeArgs(name: String, image: String, script: String) -> [String]
   /// Stop a running container (graceful, bounded).
   func stopArgs(name: String) -> [String]
   /// Force-remove a container by name/id (belt-and-suspenders teardown + sweep).
@@ -116,6 +120,13 @@ public struct ContainerCLI: LinuxContainerCLI {
       "-e", "AGENT_TOOLSDIRECTORY=/home/runner/_work/_tool",
       image,
       "/home/runner/run.sh",
+    ]
+  }
+  /// 1 CPU and 512 MB: the check runs `getent` and two bash TCP connects.
+  public func probeArgs(name: String, image: String, script: String) -> [String] {
+    [
+      "run", "--rm", "--name", name, "--cpus", "1", "--memory", "512m",
+      image, "/bin/bash", "-c", script,
     ]
   }
   public func stopArgs(name: String) -> [String] { ["stop", "--time", "30", name] }
