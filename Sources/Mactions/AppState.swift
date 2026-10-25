@@ -1217,7 +1217,9 @@ final class AppState: ObservableObject {
             return false  // watchdog fired first
           }
           let scanFinished = await group.next() ?? true
-          if !scanFinished {
+          // Going offline cancels both children, and the sleep then returns
+          // first: that is a cancellation, not a hung scan.
+          if !scanFinished, !Task.isCancelled {
             ControlPlaneLog.log("discovery.scan.watchdog_timeout", ["budgetSec": "180"])
           }
           group.cancelAll()
@@ -1231,6 +1233,7 @@ final class AppState: ObservableObject {
 
   private func discoveryScan(token: String, plan: FleetPlan, epoch myEpoch: Int) async {
     guard fleetEpoch == myEpoch, state == .online else { return }
+    let scanStarted = Date()
     // Refresh the admin-repo list at most every 10 min — the lister sorts by
     // recent push, so the head of the list is the active tail of the account.
     if availableRepos.isEmpty
@@ -1247,30 +1250,45 @@ final class AppState: ObservableObject {
     // implies fresh activity, so the active tail is where demand appears, and
     // the bound keeps worst-case quota predictable (idle 304s are free anyway).
     let candidates = Array(availableRepos.filter { !explicit.contains($0.fullName) }.prefix(50))
-    var matchedKeys: Set<String> = []
-    // Repos whose queue poll FAILED this scan: unknown, not quiet — their
-    // discovered orchestrators must hold (the same failed-poll-HOLD rule the
-    // orchestrator's own loop follows), not march toward the quiet reap.
-    var unknownRepos: Set<String> = []
+    // Each repo's SHARED control plane (created here for never-seen repos): the
+    // probe and any orchestrators it spawns reuse one queued-jobs fetch per
+    // tick window, and its ETag store makes idle re-polls free.
+    var targets: [QueuedJobsPollTarget] = []
     for repo in candidates {
-      guard fleetEpoch == myEpoch, state == .online, !Task.isCancelled else { return }
-      // The repo's SHARED control plane (created here for never-seen repos):
-      // the probe and any orchestrators it spawns reuse one queued-jobs fetch
-      // per tick window, and its ETag store makes idle re-polls free.
       let plane =
         fleetControlPlanes[repo.fullName]
         ?? SharedRepoControlPlane(
           inner: GitHubClient(owner: repo.owner, repo: repo.name, token: token))
       fleetControlPlanes[repo.fullName] = plane
-      let queued: [[String]]
-      do {
-        queued = try await plane.listQueuedJobLabels()
-      } catch {
-        unknownRepos.insert(repo.fullName)
+      targets.append(QueuedJobsPollTarget(name: repo.fullName, plane: plane))
+    }
+    let repoByName = Dictionary(
+      candidates.map { ($0.fullName, $0) }, uniquingKeysWith: { first, _ in first })
+    // Four polls at a time, most recently pushed first, each answer handled
+    // as it arrives, and never more than 90 s of waiting: serial polls on slow
+    // Wi-Fi took 140-200 s, and the 180 s watchdog then cut the scan off
+    // before its reap pass.
+    let polling = startPollingQueuedJobs(targets, concurrency: 4, timeout: 90)
+    defer { polling.cancel() }
+    var matchedKeys: Set<String> = []
+    // Repos whose queue poll FAILED or did not answer in time this scan:
+    // unknown, not quiet — their discovered orchestrators must hold (the same
+    // failed-poll-HOLD rule the orchestrator's own loop follows), not march
+    // toward the quiet reap.
+    var unknownRepos: Set<String> = []
+    var answered: Set<String> = []
+    var failedPolls = 0
+    for await answer in polling.answers {
+      guard fleetEpoch == myEpoch, state == .online, !Task.isCancelled else { return }
+      answered.insert(answer.name)
+      guard case .queued(let queued) = answer.poll else {
+        unknownRepos.insert(answer.name)
+        failedPolls += 1
         continue
       }
-      guard !queued.isEmpty else { continue }
-      guard fleetEpoch == myEpoch, state == .online else { return }
+      guard !queued.isEmpty, let repo = repoByName[answer.name],
+        let plane = fleetControlPlanes[repo.fullName]
+      else { continue }
       for os in plan.discoveryMatches(for: queued) {
         let key = "\(repo.fullName)#\(os.rawValue)"
         matchedKeys.insert(key)
@@ -1323,6 +1341,10 @@ final class AppState: ObservableObject {
         }
       }
     }
+    guard fleetEpoch == myEpoch, state == .online, !Task.isCancelled else { return }
+    // No answer before the deadline: unknown as well.
+    let unfinished = candidates.filter { !answered.contains($0.fullName) }
+    for repo in unfinished { unknownRepos.insert(repo.fullName) }
     // Reap discovered orchestrators whose repo went quiet — the decision per
     // key is the pure, unit-tested `discoveryReapDecision`: failed polls HOLD,
     // demand (this scan's match, the orchestrator's OWN last poll — which also
@@ -1367,8 +1389,10 @@ final class AppState: ObservableObject {
       [
         "candidates": String(candidates.count),
         "matched": String(matchedKeys.count),
-        "pollFailed": String(unknownRepos.count),
+        "pollFailed": String(failedPolls),
+        "unfinished": String(unfinished.count),
         "orchestrators": String(orchestrators.count),
+        "durationMs": String(Int(Date().timeIntervalSince(scanStarted) * 1000)),
       ])
   }
 

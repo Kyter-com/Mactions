@@ -24,6 +24,9 @@ All notable changes to Mactions are documented here. This project adheres to
   repository and tries again on a growing backoff. A bar shows the reason and
   the next check, with a Try now button, and the repository badge reads
   "N queued · Linux launches paused".
+- **All-repositories scans finish on slow connections.** Repositories are
+  polled four at a time with a 90-second limit; over plane Wi-Fi a 50-repository
+  scan went from 168 seconds to under a minute.
 
 ## [0.2.0] - 2026-09-30
 
