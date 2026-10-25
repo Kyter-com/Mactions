@@ -15,6 +15,8 @@ All notable changes to Mactions are documented here. This project adheres to
   connecting or dropping, brings a paused platform's next check forward and,
   once the network works, polls repositories again right away instead of up to
   a minute later.
+- **Jobs cut off by sleep, Offline, a restart or Quit show in History as
+  Interrupted**, with the reason, so you know which jobs to re-run.
 
 ### Fixed
 

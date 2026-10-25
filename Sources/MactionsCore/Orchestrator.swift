@@ -239,6 +239,10 @@ public final class RunnerOrchestrator {
   /// when the outage is an egress failure those new runners can never connect —
   /// the snowball. Used by the `health == nil` backstop in `reconcile`.
   private var listRunnersFailingSince: Date?
+  /// Runners GitHub reported busy (running a job) at the last successful
+  /// runner-list read. `stop()` records those as interrupted runs: their job
+  /// can't finish once the runner is gone.
+  private var lastBusyNames: Set<String> = []
   /// Fired (on the main actor) whenever `state`/`runners` change.
   public var onChange: (() -> Void)?
   /// Fired (on the main actor) once for each runner that finishes — a clean
@@ -422,7 +426,14 @@ public final class RunnerOrchestrator {
     notify()
   }
 
-  public func stop() async {
+  /// Take the fleet offline. A runner that is running a job has that job cut
+  /// off; it is recorded as a run with `interruption` (why the fleet is
+  /// stopping), so the job shows in History as interrupted instead of
+  /// vanishing (on 2026-10-24 a lid close killed a runner 30 s into its job,
+  /// and only GitHub showed it). "Running a job" is what GitHub said: busy at
+  /// the last runner-list read, or a deregistration it refuses as busy now
+  /// (which catches a job picked up since that read).
+  public func stop(interruption: RunRecord.Interruption = .offline) async {
     guard state != .offline else { return }
     epoch += 1  // invalidate any in-flight provision / pending recycle
     stopReconcileLoop()
@@ -431,6 +442,13 @@ public final class RunnerOrchestrator {
     let current = slots
     slots = []
     notify()
+    // Recorded first: a quit deadline may cut the teardown below short.
+    var recorded: Set<String> = []
+    for slot in current where lastBusyNames.contains(slot.name) {
+      recordInterrupted(slot, interruption)
+      recorded.insert(slot.name)
+    }
+    lastBusyNames = []
     // Deregister FIRST (fast API calls), BEFORE the local teardown below — a
     // Windows VM can take >10s to power off + delete, and the quit/sleep handlers
     // bound this whole call with a deadline. If a slow teardown ran first and the
@@ -447,7 +465,13 @@ public final class RunnerOrchestrator {
     // about) are covered by the go-online prefix sweep + GitHub's 1-day
     // auto-prune of disconnected ephemeral runners.
     for slot in current {
-      if let id = slot.remoteId { try? await controlPlane.deleteRunner(id: id) }
+      guard let id = slot.remoteId else { continue }
+      do {
+        try await controlPlane.deleteRunner(id: id)
+      } catch where isBusyRunnerRefusal(error) {
+        // Busy right now: its job is being cut off by this stop.
+        if recorded.insert(slot.name).inserted { recordInterrupted(slot, interruption) }
+      } catch {}
     }
     // Now reclaim the local VMs/containers/processes (the registrations are
     // already gone, so a leftover here is just disk — swept on next go-online).
@@ -472,6 +496,14 @@ public final class RunnerOrchestrator {
     }
     state = .offline
     notify()
+  }
+
+  private func recordInterrupted(_ slot: Slot, _ interruption: RunRecord.Interruption) {
+    onRunFinished?(
+      RunRecord(
+        id: slot.name, os: os, repo: "\(config.owner)/\(config.repo)",
+        remoteId: slot.remoteId, startedAt: slot.startedAt, endedAt: Date(),
+        exitStatus: nil, outcome: .failed, interruption: interruption))
   }
 
   /// What `pruneUnusableSlots` learned from GitHub's runner list, for the
@@ -855,6 +887,7 @@ public final class RunnerOrchestrator {
         health.idle.insert(slot.name)
       }
     }
+    lastBusyNames = health.busy
 
     // Sustained-unhealthy slots are DEAD agents: local teardown first, then a
     // best-effort deregister (there is no live job to race).

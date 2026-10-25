@@ -177,6 +177,14 @@ public protocol RunnerControlPlane: Sendable {
   func listQueuedJobLabels() async throws -> [[String]]
 }
 
+/// GitHub refuses to delete a runner that is running a job, with HTTP 422
+/// (seen 2026-10-24 when deleting a busy runner by hand). Any other failure (no
+/// answer, a 404 for a runner already gone) says nothing about a job.
+public func isBusyRunnerRefusal(_ error: Error) -> Bool {
+  if case GitHubClient.ClientError.http(422, _) = error { return true }
+  return false
+}
+
 /// Talks to `api.github.com` for a single `owner/repo`. Repo-level runners,
 /// authenticated with the stored token (needs repo-admin / `repo` scope).
 public struct GitHubClient: RunnerControlPlane {

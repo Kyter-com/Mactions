@@ -1225,8 +1225,7 @@ private struct HistoryRow: View {
         .accessibilityLabel(record.statusLabel)
       VStack(alignment: .leading, spacing: 1) {
         Text(record.repo).font(.callout).lineLimit(1).truncationMode(.middle)
-        Text(record.startedAt.formatted(date: .abbreviated, time: .shortened))
-          .font(.caption2).foregroundStyle(.secondary)
+        Text(subtitle).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
       }
       Spacer(minLength: 0)
       Text(durationString(record.duration)).font(.caption2).foregroundStyle(.tertiary)
@@ -1236,6 +1235,12 @@ private struct HistoryRow: View {
     // Its automatic estimate can collapse a reused cell to one line, clipping
     // the timestamp and platform icon (especially after clearing to one row).
     .frame(height: rowHeight)
+  }
+
+  private var subtitle: String {
+    let started = record.startedAt.formatted(date: .abbreviated, time: .shortened)
+    guard let interruption = record.interruption else { return started }
+    return "\(started) · \(interruption.shortNote)"
   }
 }
 
@@ -1252,6 +1257,15 @@ private struct RunDetailView: View {
         os: record.os, title: record.repo, subtitle: record.id,
         trailing: AnyView(OutcomeBadge(record: record)))
       meta
+      if let interruption = record.interruption {
+        // Mactions cut this job off; GitHub fails it once the runner stops
+        // answering, so it needs a re-run (the GitHub link above opens it).
+        Banner(
+          interruption.note + " Re-run the job on GitHub.", severity: .warning,
+          icon: interruption == .sleep ? "moon.zzz" : "stop.circle"
+        )
+        .padding(.horizontal, 16).padding(.bottom, 10)
+      }
       Divider()
       content
     }

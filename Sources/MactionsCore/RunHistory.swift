@@ -10,7 +10,9 @@ import Foundation
 /// the duration includes its wait. `outcome` is a coarse classification of the
 /// exit (see `RunnerOrchestrator.handleExit`): a clean ephemeral exit while
 /// online is `.completed`, a non-zero exit while online is `.failed`. Runners
-/// reaped by go-offline/teardown are intentionally NOT recorded (see handleExit).
+/// reaped by go-offline/teardown are intentionally NOT recorded (see handleExit),
+/// except one that was running a job: that job was cut off, so it is recorded
+/// with its `interruption` (see `RunnerOrchestrator.stop`).
 public struct RunRecord: Codable, Sendable, Identifiable, Equatable {
   public enum Outcome: String, Codable, Sendable {
     case completed  // exited 0 on its own while the fleet was online
@@ -53,6 +55,36 @@ public struct RunRecord: Codable, Sendable, Identifiable, Equatable {
     }
   }
 
+  /// Why Mactions itself ended a runner that GitHub last reported busy with a
+  /// job. That job can't finish: GitHub fails it once the runner stops
+  /// answering, and the user needs to re-run it.
+  public enum Interruption: String, Codable, Sendable {
+    case sleep  // the Mac went to sleep (lid closed)
+    case offline  // the user took the fleet offline (or signed out)
+    case restart  // the fleet restarted to apply settings
+    case quit  // Mactions quit
+
+    /// For the run's detail: what stopped the job, as a sentence.
+    public var note: String {
+      switch self {
+      case .sleep: return "Stopped mid-job when the Mac went to sleep."
+      case .offline: return "Stopped mid-job when Mactions went offline."
+      case .restart: return "Stopped mid-job when the fleet restarted."
+      case .quit: return "Stopped mid-job when Mactions quit."
+      }
+    }
+
+    /// For the History row, after the start time.
+    public var shortNote: String {
+      switch self {
+      case .sleep: return "interrupted by sleep"
+      case .offline: return "interrupted by going offline"
+      case .restart: return "interrupted by a restart"
+      case .quit: return "interrupted by quitting"
+      }
+    }
+  }
+
   /// Coarse status the UI buckets on (badge/circle color + the Passed/Failed
   /// filter). Derived from `jobConclusion` when resolved, else an honest fallback.
   public enum ResolvedStatus: Sendable, Equatable {
@@ -81,11 +113,16 @@ public struct RunRecord: Codable, Sendable, Identifiable, Equatable {
   /// direct O(1) lookups after an app restart instead of repeatedly searching a
   /// repo's moving workflow-run window. Optional for legacy history JSON.
   public var githubJobId: Int?
+  /// Set when Mactions stopped this runner while it was running a job. `nil`
+  /// for runs that ended on their own, including every record written before
+  /// the field existed (and older app versions ignore the key).
+  public var interruption: Interruption?
 
   public init(
     id: String, os: RunnerOS, repo: String, remoteId: Int?,
     startedAt: Date, endedAt: Date, exitStatus: Int32?, outcome: Outcome,
-    jobConclusion: JobConclusion? = nil, githubJobId: Int? = nil
+    jobConclusion: JobConclusion? = nil, githubJobId: Int? = nil,
+    interruption: Interruption? = nil
   ) {
     self.id = id
     self.os = os
@@ -97,6 +134,7 @@ public struct RunRecord: Codable, Sendable, Identifiable, Equatable {
     self.outcome = outcome
     self.jobConclusion = jobConclusion
     self.githubJobId = githubJobId
+    self.interruption = interruption
   }
 
   /// Runner lifetime in seconds (came-up → exited). See the note on `startedAt`.
@@ -122,6 +160,7 @@ public struct RunRecord: Codable, Sendable, Identifiable, Equatable {
   /// Precise human label for the History status badge.
   public var statusLabel: String {
     guard let c = jobConclusion else {
+      if interruption != nil { return "Interrupted" }
       return outcome == .completed ? "Completed" : "Failed"
     }
     switch c {

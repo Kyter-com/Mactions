@@ -539,7 +539,7 @@ final class AppState: ObservableObject {
   func restartFleet() {
     guard state == .online, !isQuitting else { return }
     lifecycle.restart { [self] in
-      await tearDownFleet()
+      await tearDownFleet(interruption: .restart)
     } resume: { [self] in
       goOnline()
     }
@@ -1084,12 +1084,14 @@ final class AppState: ObservableObject {
   }
 
   func goOfflineAndWait() async {
-    await lifecycle.shutDown { [self] in await tearDownFleet() }
+    await lifecycle.shutDown { [self] in
+      await tearDownFleet(interruption: isQuitting ? .quit : .offline)
+    }
   }
 
   func suspendForSleep() {
     lifecycle.willSleep(wasRunning: state == .online || state == .starting) { [self] in
-      await tearDownFleet()
+      await tearDownFleet(interruption: .sleep)
     }
   }
 
@@ -1125,7 +1127,9 @@ final class AppState: ObservableObject {
     }
   }
 
-  private func tearDownFleet() async {
+  /// `interruption` is why the fleet is stopping: a job it cuts off is
+  /// recorded in History with that reason.
+  private func tearDownFleet(interruption: RunRecord.Interruption) async {
     guard !orchestrators.isEmpty || state != .offline else { return }
     ControlPlaneLog.log("fleet.stop.begin")
     fleetEpoch += 1  // invalidate any in-flight goOnline
@@ -1138,7 +1142,7 @@ final class AppState: ObservableObject {
     // teardown could overrun quit's 6 s deadline. Everything stays
     // main-actor-isolated; only the network waits overlap.
     let stops = orchestrators.values.map { orch in
-      Task { @MainActor in await orch.stop() }
+      Task { @MainActor in await orch.stop(interruption: interruption) }
     }
     for stop in stops { await stop.value }
     orchestrators.removeAll()
@@ -1167,6 +1171,9 @@ final class AppState: ObservableObject {
     state = .offline
     statusMessage = "Offline."
     ControlPlaneLog.log("fleet.stop.end")
+    // Let the history write for any interrupted job land before a quit
+    // replies (the file write takes milliseconds; quit caps teardown at 6 s).
+    await lastHistorySave.value
   }
 
   /// Remove everything Mactions wrote to disk (cached agent + run files).
