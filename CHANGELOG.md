@@ -32,6 +32,9 @@ All notable changes to Mactions are documented here. This project adheres to
 - **A hung container daemon can't stall Mactions.** Apple container status,
   list, inspect and delete commands now give up after 30 seconds, so going
   online, teardown and Linux capacity no longer wait on them forever.
+- **Setting up Linux no longer blocks the window** while it checks the
+  runtime, and a daemon that doesn't respond fails setup with a message instead
+  of spinning forever.
 
 ## [0.2.0] - 2026-09-30
 

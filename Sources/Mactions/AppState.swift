@@ -2028,35 +2028,46 @@ final class AppState: ObservableObject {
       return
     }
     let image = linuxRunnerImage
-    // FAST PATH (non-forced): image already present + daemon up → flip ready
-    // directly, so a stray re-tap doesn't re-pull. A forced "update image"
-    // deliberately re-pulls.
-    if !force, LinuxContainerProviderFactory.ready(image: image, cli: cli) {
-      applyLinuxAvailability(.ready)
-      saveConfig()
-      linuxSetupFailure = nil
-      statusMessage = "Linux runner image '\(image)' is ready (\(cli.displayName))."
-      return
-    }
     linuxSetupBusy = true
     linuxSetupStep = .verifyDaemon
     linuxSetupDetail = nil
     linuxSetupFailure = nil
-    statusMessage = "Setting up the Linux runner…"
+    // Quick `container` verbs get the provider's time limit; `system start`
+    // took 6 s live, so it gets more. A wedged daemon then fails setup with a
+    // message instead of leaving it "Setting up…" for good.
+    let quick = LinuxContainerProvider.commandTimeout
     Task {
+      // FAST PATH (non-forced): image already present + daemon up → flip ready
+      // directly, so a stray re-tap doesn't re-pull. A forced "update image"
+      // deliberately re-pulls. Off the main actor: it runs two `container`
+      // commands, and on the main actor a wedged daemon froze the window.
+      if !force {
+        let ready = await Task.detached {
+          LinuxContainerProviderFactory.ready(image: image, cli: cli)
+        }.value
+        if ready {
+          applyLinuxAvailability(.ready)
+          saveConfig()
+          linuxSetupFailure = nil
+          statusMessage = "Linux runner image '\(image)' is ready (\(cli.displayName))."
+          endLinuxSetup()
+          return
+        }
+      }
+      statusMessage = "Setting up the Linux runner…"
       // 1) Ensure the daemon is up; start it if down via `container system start`.
       //    Off the main actor; these can block briefly.
       var daemonUp = await Task.detached {
-        (try? Shell.run(cli.executable, cli.daemonStatusArgs()))?.ok ?? false
+        (try? Shell.run(cli.executable, cli.daemonStatusArgs(), timeout: quick))?.ok ?? false
       }.value
       if !daemonUp {
         linuxSetupDetail = "Starting the container daemon…"
         let startArgs = cli.daemonStartArgs()
         await Task.detached {
-          _ = try? Shell.run(cli.executable, startArgs)
+          _ = try? Shell.run(cli.executable, startArgs, timeout: 120)
         }.value
         daemonUp = await Task.detached {
-          (try? Shell.run(cli.executable, cli.daemonStatusArgs()))?.ok ?? false
+          (try? Shell.run(cli.executable, cli.daemonStatusArgs(), timeout: quick))?.ok ?? false
         }.value
       }
       guard daemonUp else {
@@ -2083,7 +2094,8 @@ final class AppState: ObservableObject {
       // enough to restore Linux readiness.
       if !force {
         let imagePresent = await Task.detached { [cli, image] in
-          (try? Shell.run(cli.executable, cli.imageInspectArgs(image: image)))?.ok ?? false
+          (try? Shell.run(cli.executable, cli.imageInspectArgs(image: image), timeout: quick))?.ok
+            ?? false
         }.value
         if imagePresent {
           LinuxRunnerImage.recordImageRef(image)

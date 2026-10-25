@@ -29,7 +29,7 @@ Proof-of-concept. Honest accounting:
   - **Memory** is a **live** gauge + sparkline + per-bucket RSS (Windows VMs / local runners / app), via `MemorySampler` (Mach `host_statistics64` + `ps`), sampled **only while the window is open**; Linux VM usage is included in the host total but is not yet attributed to a separate bucket.
   - **Windowed, still fleet-safe** — the dashboard opens on launch and closing the window never quits or takes runners offline. **Liquid Glass** (macOS 26+, `#available`-guarded, material fallback) on the control layer (chips in a `GlassEffectContainer`, search fields, buttons) — never on content, never glass-on-glass.
   - **OS-logo tiles** render from **custom SF Symbol** templates staged as a `.symbolset` (`Sources/Mactions/Media.xcassets`). `swift build` doesn't run `actool`, so `OSLogo` prefers the compiled symbol when present and falls back to drawing the identical `Regular-S` glyph via a tiny SVG-path parser (`SVGSymbol`); it upgrades to true SF Symbols once packaged as a real `.app`.
-  - **Performance contract:** all slow work (GitHub fetches, `ps`, VMX reads, log parsing) runs off the main actor (nonisolated async / detached); the views only read published state, so the Mac UI never stutters.
+  - **Performance contract:** all slow work (GitHub fetches, `ps`, VMX reads, log parsing, `container` commands) runs off the main actor (nonisolated async / detached), and shell commands that can hang carry a time limit; the views only read published state, so the Mac UI never stutters.
 - 🟢 **Windows provider** (`WindowsVMProvider`): **PROVEN END TO END on VMware Fusion (2026-06-01).** Fusion is the sole backend, the base build is automated, every job uses a linked clone, and recipe v14 verifies guest outcomes before teardown; see [Windows support](#windows-support).
 - 🟢 **Linux provider** (`LinuxContainerProvider`): **PROVEN END TO END (2026-06-08).** Each job runs the official arm64 Actions runner image through Apple `container` inside its own lightweight VM, with the writable layer destroyed by `--rm`; see [Linux support](#linux-support).
 
@@ -169,6 +169,8 @@ swift run Mactions   # launches the app for dev
 ```
 
 `swift run` is fine for development; the Xcode app target provides the real AppIcon and release packaging path.
+
+If the window freezes, capture the main thread before restarting: `sample Mactions 10 -file ~/Desktop/mactions-sample.txt`. Then read the control-plane log, `~/.mactions/logs/control-plane.jsonl`, or the same events in the unified log: `/usr/bin/log show --style compact --predicate 'subsystem == "com.kyter.mactions"' --last 2h` (spell out `/usr/bin/log`: in zsh, `log` is a builtin that prints nothing useful).
 
 ### Exporting the real app icon
 
