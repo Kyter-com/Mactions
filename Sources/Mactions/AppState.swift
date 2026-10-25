@@ -309,6 +309,11 @@ final class AppState: ObservableObject {
   /// discovered) asks before launching. One per online generation, so a fresh
   /// go-online starts with a clean slate; cleared with the fleet.
   private var launchGate: LaunchGate?
+  /// The idle container that keeps the Linux network's bridge up while Linux
+  /// runners are armed, so a Windows VM can't be given the same bridge and
+  /// delete it under a running Linux job when it powers off (see
+  /// `LinuxNetworkAnchor`). One per online generation; stopped with the fleet.
+  private var networkAnchor: LinuxNetworkAnchor?
   /// Orchestrator keys created by all-repos DISCOVERY (seeded from the plan's
   /// defaults) rather than the explicit plan — reaped when their repo's queue
   /// goes quiet. Same key space as `orchestrators`.
@@ -878,6 +883,20 @@ final class AppState: ObservableObject {
             physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
             activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount)
 
+        // Bring the Linux network's bridge up, and keep it up, BEFORE any
+        // orchestrator can boot a Windows VM. A VM that boots while no container
+        // runs can be given the bridge number the Linux network reuses; the next
+        // Linux runner then shares that bridge, and the VM's power-off deletes it
+        // under the running job (two jobs lost on 2026-10-25). Started here,
+        // after go-online's orphan sweep, so the sweep can't remove it. A start
+        // that fails or times out retries on its own; Linux arms either way.
+        if linuxFactory != nil, maxLinux > 0, let lxCLI = linuxCLI {
+          let anchor = LinuxNetworkAnchor(cli: lxCLI, image: linuxImg)
+          networkAnchor = anchor  // set first, so a go-offline meanwhile stops it
+          _ = await Task.detached { anchor.start() }.value
+          guard fleetEpoch == myEpoch else { return }  // went offline: teardown stopped it
+        }
+
         // The live SHARED capacity ledger every combo draws on at provision
         // time. Replaces the old static per-combo grants: scale-from-zero makes
         // demand bursty and concurrent, so capacity is spent when a runner is
@@ -1145,6 +1164,11 @@ final class AppState: ObservableObject {
       Task { @MainActor in await orch.stop(interruption: interruption) }
     }
     for stop in stops { await stop.value }
+    // After the fleets, so the bridge stays up until every runner is gone.
+    if let anchor = networkAnchor {
+      networkAnchor = nil
+      await Task.detached { anchor.stop() }.value
+    }
     orchestrators.removeAll()
     fleetOS.removeAll()
     fleetRepo.removeAll()

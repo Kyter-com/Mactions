@@ -20,6 +20,12 @@ All notable changes to Mactions are documented here. This project adheres to
 
 ### Fixed
 
+- **Linux jobs no longer lose their network when a Windows VM shuts down.**
+  When a Windows VM started while no Linux job was running, the next Linux job
+  shared the VM's network bridge, and the VM's shutdown removed it in the
+  middle of the job. While Linux runners are on, Mactions now keeps one small
+  idle container running (`mactions-network-anchor`, about 340 MB) so the Linux
+  network always has its own bridge.
 - **Runners that can't reach GitHub are no longer relaunched in a loop.**
   After two launches of a platform fail in a row (a runner exits during launch,
   can't start, or never connects), Mactions pauses that platform for every

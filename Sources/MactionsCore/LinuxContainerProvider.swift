@@ -38,6 +38,10 @@ public protocol LinuxContainerCLI: Sendable {
   /// with bash and exits: the `LaunchGate`'s Linux network check
   /// (`LinuxNetworkProbe`). No JIT, no env, `--rm`.
   func probeArgs(name: String, image: String, script: String) -> [String]
+  /// Run the network anchor in the foreground: one idle container that keeps
+  /// the container network's bridge up while Linux runners are armed
+  /// (`LinuxNetworkAnchor`). No JIT, no env, `--rm`.
+  func anchorArgs(name: String, image: String) -> [String]
   /// Stop a running container (graceful, bounded).
   func stopArgs(name: String) -> [String]
   /// Force-remove a container by name/id (belt-and-suspenders teardown + sweep).
@@ -127,6 +131,14 @@ public struct ContainerCLI: LinuxContainerCLI {
     [
       "run", "--rm", "--name", name, "--cpus", "1", "--memory", "512m",
       image, "/bin/bash", "-c", script,
+    ]
+  }
+  /// 1 CPU and 200 MB, the least `container` 1.0.0 accepts ("minimum memory
+  /// amount allowed is 200 MiB"): the anchor only sleeps.
+  public func anchorArgs(name: String, image: String) -> [String] {
+    [
+      "run", "--rm", "--name", name, "--cpus", "1", "--memory", "200m",
+      image, "/bin/sleep", "infinity",
     ]
   }
   public func stopArgs(name: String) -> [String] { ["stop", "--time", "30", name] }
