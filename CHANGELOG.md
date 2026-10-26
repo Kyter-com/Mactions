@@ -5,6 +5,8 @@ All notable changes to Mactions are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-25
+
 ### Improved
 
 - **Linux checks its VM network instead of guessing.** While Linux is paused,
