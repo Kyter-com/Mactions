@@ -34,6 +34,14 @@ public protocol LinuxContainerCLI: Sendable {
   /// agent's `run.sh`. The JIT blob is delivered via `jitEnvName` (env), NOT the
   /// arg list. `--rm` + no volumes/binds == clean slate per job.
   func runArgs(name: String, image: String, label: String, cpus: Int, memoryGB: Int) -> [String]
+  /// Run ONE small, short-lived container in the foreground that runs `script`
+  /// with bash and exits: the `LaunchGate`'s Linux network check
+  /// (`LinuxNetworkProbe`). No JIT, no env, `--rm`.
+  func probeArgs(name: String, image: String, script: String) -> [String]
+  /// Run the network anchor in the foreground: one idle container that keeps
+  /// the container network's bridge up while Linux runners are armed
+  /// (`LinuxNetworkAnchor`). No JIT, no env, `--rm`.
+  func anchorArgs(name: String, image: String) -> [String]
   /// Stop a running container (graceful, bounded).
   func stopArgs(name: String) -> [String]
   /// Force-remove a container by name/id (belt-and-suspenders teardown + sweep).
@@ -118,6 +126,21 @@ public struct ContainerCLI: LinuxContainerCLI {
       "/home/runner/run.sh",
     ]
   }
+  /// 1 CPU and 512 MB: the check runs `getent` and two bash TCP connects.
+  public func probeArgs(name: String, image: String, script: String) -> [String] {
+    [
+      "run", "--rm", "--name", name, "--cpus", "1", "--memory", "512m",
+      image, "/bin/bash", "-c", script,
+    ]
+  }
+  /// 1 CPU and 200 MB, the least `container` 1.0.0 accepts ("minimum memory
+  /// amount allowed is 200 MiB"): the anchor only sleeps.
+  public func anchorArgs(name: String, image: String) -> [String] {
+    [
+      "run", "--rm", "--name", name, "--cpus", "1", "--memory", "200m",
+      image, "/bin/sleep", "infinity",
+    ]
+  }
   public func stopArgs(name: String) -> [String] { ["stop", "--time", "30", name] }
   public func rmArgs(name: String) -> [String] { ["delete", "--force", name] }
   public func inspectArgs(name: String) -> [String] { ["inspect", name] }
@@ -165,12 +188,22 @@ public struct ContainerCLI: LinuxContainerCLI {
 /// shutdown). Clean for TRUSTED/private repos; untrusted code needs full VM
 /// isolation — same caveat as `LocalProcessProvider`.
 public final class LinuxContainerProvider: RunnerProvider, @unchecked Sendable {
+  /// How long a quick `container` verb (status, list, image inspect, delete)
+  /// may run before Mactions gives up on it. Measured live on 2026-10-24
+  /// (container 1.0.0): status 0.01–0.9 s, image inspect 0.6 s, list 0.07 s,
+  /// force-delete of a running container 0.16 s. The limit only matters when
+  /// the daemon hangs, and then it keeps go-online, teardown and the host
+  /// budget (released once a reaped runner's stop returns) from waiting
+  /// forever.
+  public static let commandTimeout: TimeInterval = 30
+
   public let id: String
   private let image: String
   private let cli: LinuxContainerCLI
   private let label: String
   private let cpus: Int
   private let memoryGB: Int
+  private let commandTimeout: TimeInterval
   private var process: Process?
   private var cleaned = false
   private let lock = NSLock()
@@ -184,7 +217,8 @@ public final class LinuxContainerProvider: RunnerProvider, @unchecked Sendable {
   public init(
     id: String, image: String, cli: LinuxContainerCLI,
     label: String = "mactions", cpus: Int = LinuxContainerBudget.defaultCPUsPerContainer,
-    memoryGB: Int = LinuxContainerBudget.defaultMemoryGBPerContainer
+    memoryGB: Int = LinuxContainerBudget.defaultMemoryGBPerContainer,
+    commandTimeout: TimeInterval = LinuxContainerProvider.commandTimeout
   ) {
     self.id = id
     self.image = image
@@ -192,6 +226,7 @@ public final class LinuxContainerProvider: RunnerProvider, @unchecked Sendable {
     self.label = label
     self.cpus = cpus
     self.memoryGB = memoryGB
+    self.commandTimeout = commandTimeout
   }
 
   public var isRunning: Bool {
@@ -247,7 +282,7 @@ public final class LinuxContainerProvider: RunnerProvider, @unchecked Sendable {
     if cleaned { lock.unlock(); return }
     cleaned = true
     lock.unlock()
-    _ = try? Shell.run(cli.executable, cli.rmArgs(name: containerName))
+    _ = try? Shell.run(cli.executable, cli.rmArgs(name: containerName), timeout: commandTimeout)
   }
 }
 
@@ -296,11 +331,20 @@ public struct LinuxContainerProviderFactory: RunnerProviderFactory {
 
   /// Same probe as `ready`, but keeps the user-facing reason so the UI can tell
   /// "start Apple container" apart from "re-pull the runner image".
-  public static func readiness(image: String, cli: LinuxContainerCLI) -> LinuxContainerReadiness {
-    guard let info = try? Shell.run(cli.executable, cli.daemonStatusArgs()), info.ok else {
+  /// A daemon that doesn't answer within `timeout` counts as unavailable.
+  public static func readiness(
+    image: String, cli: LinuxContainerCLI,
+    timeout: TimeInterval = LinuxContainerProvider.commandTimeout
+  ) -> LinuxContainerReadiness {
+    guard let info = try? Shell.run(cli.executable, cli.daemonStatusArgs(), timeout: timeout),
+      info.ok
+    else {
       return .daemonUnavailable
     }
-    guard let img = try? Shell.run(cli.executable, cli.imageInspectArgs(image: image)), img.ok else {
+    guard
+      let img = try? Shell.run(cli.executable, cli.imageInspectArgs(image: image), timeout: timeout),
+      img.ok
+    else {
       return .imageMissing
     }
     return .ready

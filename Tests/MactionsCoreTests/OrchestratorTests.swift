@@ -15,6 +15,7 @@ final class FakeControlPlane: RunnerControlPlane, @unchecked Sendable {
   private var _failQueuedPoll = false
   private var _failListRunners = false
   private var _failDeletes: Set<Int> = []
+  private var _busyDeletes: Set<Int> = []
   private var _failJIT = false
   private var _createOfflineRunnerOnFailedJIT = false
   private var _deleteAttempts: [Int] = []
@@ -54,6 +55,12 @@ final class FakeControlPlane: RunnerControlPlane, @unchecked Sendable {
   var failDeletes: Set<Int> {
     get { synchronized { _failDeletes } }
     set { synchronized { _failDeletes = newValue } }
+  }
+  /// Runner ids whose delete GitHub refuses as busy (HTTP 422, a runner
+  /// running a job), as opposed to `failDeletes`' generic failure.
+  var busyDeletes: Set<Int> {
+    get { synchronized { _busyDeletes } }
+    set { synchronized { _busyDeletes = newValue } }
   }
   /// Simulate GitHub returning an error from generate-jitconfig.
   var failJIT: Bool {
@@ -103,6 +110,9 @@ final class FakeControlPlane: RunnerControlPlane, @unchecked Sendable {
       return _deleteDelayNanos
     }
     if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+    if synchronized({ _busyDeletes.contains(id) }) {
+      throw GitHubClient.ClientError.http(422, "runner is still running a job")
+    }
     if synchronized({ _failDeletes.contains(id) }) { throw Failure() }
     synchronized { _deleted.append(id) }
   }

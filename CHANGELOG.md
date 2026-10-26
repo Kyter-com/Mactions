@@ -5,6 +5,43 @@ All notable changes to Mactions are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Improved
+
+- **Linux checks its VM network instead of guessing.** While Linux is paused,
+  a short-lived container from the runner image tests whether a VM can reach
+  github.com, and the dashboard says what it found, including when a VPN on the
+  Mac is the likely cause. A passing check resumes launches.
+- **Network changes are acted on at once.** Joining Wi-Fi, or a VPN
+  connecting or dropping, brings a paused platform's next check forward and,
+  once the network works, polls repositories again right away instead of up to
+  a minute later.
+- **Jobs cut off by sleep, Offline, a restart or Quit show in History as
+  Interrupted**, with the reason, so you know which jobs to re-run.
+
+### Fixed
+
+- **Linux jobs no longer lose their network when a Windows VM shuts down.**
+  When a Windows VM started while no Linux job was running, the next Linux job
+  shared the VM's network bridge, and the VM's shutdown removed it in the
+  middle of the job. While Linux runners are on, Mactions now keeps one small
+  idle container running (`mactions-network-anchor`, about 340 MB) so the Linux
+  network always has its own bridge.
+- **Runners that can't reach GitHub are no longer relaunched in a loop.**
+  After two launches of a platform fail in a row (a runner exits during launch,
+  can't start, or never connects), Mactions pauses that platform for every
+  repository and tries again on a growing backoff. A bar shows the reason and
+  the next check, with a Try now button, and the repository badge reads
+  "N queued · Linux launches paused".
+- **All-repositories scans finish on slow connections.** Repositories are
+  polled four at a time with a 90-second limit; over plane Wi-Fi a 50-repository
+  scan went from 168 seconds to under a minute.
+- **A hung container daemon can't stall Mactions.** Apple container status,
+  list, inspect and delete commands now give up after 30 seconds, so going
+  online, teardown and Linux capacity no longer wait on them forever.
+- **Setting up Linux no longer blocks the window** while it checks the
+  runtime, and a daemon that doesn't respond fails setup with a message instead
+  of spinning forever.
+
 ## [0.2.0] - 2026-09-30
 
 ### Improved

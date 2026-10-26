@@ -14,22 +14,47 @@ public enum Shell {
 
   public enum ShellError: Error, CustomStringConvertible {
     case nonZeroExit(command: String, status: Int32, stderr: String)
+    case timedOut(command: String, seconds: TimeInterval)
     public var description: String {
       switch self {
       case let .nonZeroExit(command, status, stderr):
         return "`\(command)` exited \(status): \(stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
+      case let .timedOut(command, seconds):
+        return "`\(command)` did not finish within \(Int(seconds.rounded())) s and was stopped"
       }
     }
   }
 
+  /// How long a timed-out command gets between SIGTERM and SIGKILL.
+  static let terminationGrace: TimeInterval = 2
+  /// How long a bounded run waits for the output pipes to close once the
+  /// command itself has exited. A grandchild that inherited stdout/stderr (a
+  /// daemon it started, a backgrounded job) can hold them open long after the
+  /// command is gone, and a blocking read-to-EOF would then wait out the
+  /// grandchild's whole lifetime.
+  static let drainGrace: TimeInterval = 1
+
   /// Run a command to completion and capture its output.
+  ///
+  /// `timeout` bounds the whole run: past it the command gets SIGTERM, then
+  /// SIGKILL after `terminationGrace`, and the call throws
+  /// `ShellError.timedOut` instead of returning a partial result. Use it for a
+  /// command whose hang would stall something that must not stall (a network
+  /// check, a teardown that sleep/wake ordering waits on). `nil` keeps the
+  /// unbounded behavior every existing caller was written against.
   @discardableResult
   public static func run(
     _ executable: String,
     _ arguments: [String],
     currentDirectory: URL? = nil,
-    environment: [String: String]? = nil
+    environment: [String: String]? = nil,
+    timeout: TimeInterval? = nil
   ) throws -> Result {
+    if let timeout {
+      return try runBounded(
+        executable, arguments, currentDirectory: currentDirectory, environment: environment,
+        timeout: timeout)
+    }
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executable)
     process.arguments = arguments
@@ -51,6 +76,64 @@ public enum Shell {
       status: process.terminationStatus,
       stdout: String(data: outData, encoding: .utf8) ?? "",
       stderr: String(data: errData, encoding: .utf8) ?? ""
+    )
+  }
+
+  /// The `timeout` path of `run`. Output is drained through readability
+  /// handlers rather than a blocking read, so neither a command that never
+  /// exits nor a grandchild holding a pipe open can hold the caller past
+  /// `timeout + terminationGrace + drainGrace`.
+  private static func runBounded(
+    _ executable: String,
+    _ arguments: [String],
+    currentDirectory: URL?,
+    environment: [String: String]?,
+    timeout: TimeInterval
+  ) throws -> Result {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    if let currentDirectory { process.currentDirectoryURL = currentDirectory }
+    if let environment { process.environment = environment }
+
+    let out = Pipe()
+    let err = Pipe()
+    process.standardOutput = out
+    process.standardError = err
+    let drain = PipeDrain()
+    drain.attach(out.fileHandleForReading, stream: .out)
+    drain.attach(err.fileHandleForReading, stream: .err)
+    let exited = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in exited.signal() }
+
+    do {
+      try process.run()
+    } catch {
+      drain.detach()
+      throw error
+    }
+
+    var timedOut = false
+    if exited.wait(timeout: .now() + timeout) == .timedOut {
+      timedOut = true
+      process.terminate()
+      if exited.wait(timeout: .now() + terminationGrace) == .timedOut {
+        kill(process.processIdentifier, SIGKILL)
+        // Bounded too: a process stuck in uninterruptible I/O ignores even
+        // SIGKILL until the I/O returns, and the caller must not wait on it.
+        _ = exited.wait(timeout: .now() + terminationGrace)
+      }
+    }
+    drain.waitForEnd(timeout: drainGrace)
+    drain.detach()
+    if timedOut {
+      throw ShellError.timedOut(
+        command: ([executable] + arguments).joined(separator: " "), seconds: timeout)
+    }
+    return Result(
+      status: process.terminationStatus,
+      stdout: drain.text(.out),
+      stderr: drain.text(.err)
     )
   }
 
@@ -122,9 +205,12 @@ public enum Shell {
     _ executable: String,
     _ arguments: [String],
     currentDirectory: URL? = nil,
-    environment: [String: String]? = nil
+    environment: [String: String]? = nil,
+    timeout: TimeInterval? = nil
   ) throws -> Result {
-    let result = try run(executable, arguments, currentDirectory: currentDirectory, environment: environment)
+    let result = try run(
+      executable, arguments, currentDirectory: currentDirectory, environment: environment,
+      timeout: timeout)
     guard result.ok else {
       throw ShellError.nonZeroExit(
         command: ([executable] + arguments).joined(separator: " "),
@@ -141,6 +227,68 @@ public enum Shell {
     let candidates =
       ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].map { "\($0)/\(name)" }
     return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+  }
+}
+
+/// Collects a bounded run's stdout/stderr through `readabilityHandler`s. A
+/// blocking `readDataToEndOfFile` cannot be given up on, and `run(timeout:)`
+/// must be able to stop waiting for EOF when a grandchild keeps a pipe open.
+/// `@unchecked Sendable`: the buffers and the open-stream set are guarded by
+/// one `NSLock`; the handlers run on Foundation's background queue.
+final class PipeDrain: @unchecked Sendable {
+  enum Stream { case out, err }
+
+  private let lock = NSLock()
+  private var outData = Data()
+  private var errData = Data()
+  private var open: Set<Stream> = []
+  private var handles: [FileHandle] = []
+  private let ended = DispatchSemaphore(value: 0)
+
+  func attach(_ handle: FileHandle, stream: Stream) {
+    lock.lock()
+    open.insert(stream)
+    handles.append(handle)
+    lock.unlock()
+    handle.readabilityHandler = { [weak self] readable in
+      self?.consume(readable.availableData, stream: stream, handle: readable)
+    }
+  }
+
+  private func consume(_ chunk: Data, stream: Stream, handle: FileHandle) {
+    guard !chunk.isEmpty else {
+      // EOF: every writer (the command and anything that inherited the pipe)
+      // has closed it.
+      handle.readabilityHandler = nil
+      lock.lock()
+      let closedNow = open.remove(stream) != nil
+      let allClosed = open.isEmpty
+      lock.unlock()
+      if closedNow, allClosed { ended.signal() }
+      return
+    }
+    lock.lock()
+    if stream == .out { outData.append(chunk) } else { errData.append(chunk) }
+    lock.unlock()
+  }
+
+  /// Wait up to `timeout` for both pipes to reach EOF.
+  func waitForEnd(timeout: TimeInterval) {
+    _ = ended.wait(timeout: .now() + timeout)
+  }
+
+  /// Stop reading. Bytes a lingering grandchild writes afterwards are dropped.
+  func detach() {
+    lock.lock()
+    let attached = handles
+    lock.unlock()
+    for handle in attached { handle.readabilityHandler = nil }
+  }
+
+  func text(_ stream: Stream) -> String {
+    lock.lock()
+    defer { lock.unlock() }
+    return String(data: stream == .out ? outData : errData, encoding: .utf8) ?? ""
   }
 }
 

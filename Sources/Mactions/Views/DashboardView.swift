@@ -73,6 +73,10 @@ struct DashboardView: View {
         actionNoticeBar(rebuild)
         Divider()
       }
+      ForEach(app.launchPauses, id: \.os) { pause in
+        launchPauseBar(pause)
+        Divider()
+      }
       NavigationSplitView {
         List(Tab.allCases, selection: $tab) { item in
           Label(item.rawValue, systemImage: item.systemImage).tag(item)
@@ -284,6 +288,43 @@ struct DashboardView: View {
     .padding(.horizontal, MactionsTheme.Spacing.section)
     .padding(.vertical, MactionsTheme.Spacing.control)
     .background(Color.orange.opacity(0.12))
+  }
+
+  /// An OS whose runner launches the `LaunchGate` paused after repeated
+  /// failures to reach GitHub: why, when it checks again, and a way to try now
+  /// (for when the user knows the cause is gone, or doubts the check).
+  private func launchPauseBar(_ pause: LaunchGate.Pause) -> some View {
+    HStack(alignment: .top, spacing: MactionsTheme.Spacing.tight) {
+      Image(systemName: "pause.circle").foregroundStyle(.orange)
+      VStack(alignment: .leading, spacing: 2) {
+        Text("\(pause.os.displayName) runner launches paused")
+          .font(.callout.weight(.semibold)).foregroundStyle(.orange)
+        Text(pause.reason).font(.callout).fixedSize(horizontal: false, vertical: true)
+        Text(launchPauseNextCheck(pause)).font(.caption).foregroundStyle(.secondary)
+      }
+      Spacer(minLength: MactionsTheme.Spacing.control)
+      Button("Try now") { app.resumeLaunches(pause.os) }
+        .controlSize(.small)
+        .help("Launch runners again now. If the next one also fails, launches pause again.")
+    }
+    .padding(.horizontal, MactionsTheme.Spacing.section)
+    .padding(.vertical, MactionsTheme.Spacing.control)
+    .background(Color.orange.opacity(0.12))
+  }
+
+  private func launchPauseNextCheck(_ pause: LaunchGate.Pause) -> String {
+    if pause.checking {
+      return pause.checksByProbe ? "Checking the network now…" : "Trying one runner now…"
+    }
+    // A check runs when a queued job needs a runner, so a due check waits for
+    // one.
+    guard let next = pause.nextCheckAt, next > Date() else {
+      return "Checks again the next time a job needs a runner."
+    }
+    let time = next.formatted(date: .omitted, time: .shortened)
+    return pause.checksByProbe
+      ? "Checks the network again at \(time), or sooner if the Mac's network changes."
+      : "Tries one runner again at \(time), or sooner if the Mac's network changes."
   }
 
   private var statusColor: Color {
@@ -672,6 +713,9 @@ private struct RunnersPane: View {
         // the status strip carries the reason.
         return "not armed"
       }
+      if let os = app.repoLaunchPaused[repoName] {
+        return "\(queued) queued · \(os.displayName) launches paused"
+      }
       if app.repoLaunchFailure[repoName] != nil {
         return "\(queued) queued · runner failing to launch"
       }
@@ -690,7 +734,7 @@ private struct RunnersPane: View {
   private func badgeColor(_ group: RepoGroup) -> Color {
     let repoName = group.repo.fullName
     guard app.state == .online, group.runners.isEmpty else { return .secondary }
-    if app.repoLaunchFailure[repoName] != nil
+    if app.repoLaunchFailure[repoName] != nil || app.repoLaunchPaused[repoName] != nil
       || app.repoWaitingForCapacity.contains(repoName)
       || app.repoPollFailing.contains(repoName)
     {
@@ -1181,8 +1225,7 @@ private struct HistoryRow: View {
         .accessibilityLabel(record.statusLabel)
       VStack(alignment: .leading, spacing: 1) {
         Text(record.repo).font(.callout).lineLimit(1).truncationMode(.middle)
-        Text(record.startedAt.formatted(date: .abbreviated, time: .shortened))
-          .font(.caption2).foregroundStyle(.secondary)
+        Text(subtitle).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
       }
       Spacer(minLength: 0)
       Text(durationString(record.duration)).font(.caption2).foregroundStyle(.tertiary)
@@ -1192,6 +1235,12 @@ private struct HistoryRow: View {
     // Its automatic estimate can collapse a reused cell to one line, clipping
     // the timestamp and platform icon (especially after clearing to one row).
     .frame(height: rowHeight)
+  }
+
+  private var subtitle: String {
+    let started = record.startedAt.formatted(date: .abbreviated, time: .shortened)
+    guard let interruption = record.interruption else { return started }
+    return "\(started) · \(interruption.shortNote)"
   }
 }
 
@@ -1208,6 +1257,15 @@ private struct RunDetailView: View {
         os: record.os, title: record.repo, subtitle: record.id,
         trailing: AnyView(OutcomeBadge(record: record)))
       meta
+      if let interruption = record.interruption {
+        // Mactions cut this job off; GitHub fails it once the runner stops
+        // answering, so it needs a re-run (the GitHub link above opens it).
+        Banner(
+          interruption.note + " Re-run the job on GitHub.", severity: .warning,
+          icon: interruption == .sleep ? "moon.zzz" : "stop.circle"
+        )
+        .padding(.horizontal, 16).padding(.bottom, 10)
+      }
       Divider()
       content
     }

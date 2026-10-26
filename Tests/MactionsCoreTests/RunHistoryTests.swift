@@ -112,6 +112,51 @@ final class RunHistoryTests: XCTestCase {
     XCTAssertEqual(decoded.first?.statusLabel, "Completed")
   }
 
+  /// A job Mactions cut off (sleep, offline, restart, quit) round-trips its
+  /// reason; records written before the field decode without one; and older
+  /// app versions reading new history ignore the extra key (Codable skips
+  /// unknown keys), so the change needs no migration either way.
+  func testInterruptionRoundTripsAndLegacyRecordsDecodeWithoutOne() throws {
+    let start = Date(timeIntervalSince1970: 1_700_000_000)
+    let record = RunRecord(
+      id: "mactions-host-zz", os: .linux, repo: "o/r", remoteId: 7,
+      startedAt: start, endedAt: start.addingTimeInterval(60), exitStatus: nil, outcome: .failed,
+      interruption: .sleep)
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let data = try encoder.encode([record])
+    XCTAssertTrue(String(decoding: data, as: UTF8.self).contains(#""interruption":"sleep""#))
+    XCTAssertEqual(try decoder.decode([RunRecord].self, from: data), [record])
+
+    let legacy = """
+      [{"id":"mactions-host-legacy","os":"windows","repo":"o/r","remoteId":1,
+        "startedAt":"2024-01-01T00:00:00Z","endedAt":"2024-01-01T00:01:00Z",
+        "exitStatus":0,"outcome":"completed"}]
+      """.data(using: .utf8)!
+    XCTAssertNil(try decoder.decode([RunRecord].self, from: legacy).first?.interruption)
+  }
+
+  func testAnInterruptedRunReadsInterruptedUntilGitHubSaysOtherwise() {
+    var record = RunRecord(
+      id: "r", os: .macOS, repo: "o/r", remoteId: nil, startedAt: .distantPast,
+      endedAt: .distantPast, exitStatus: nil, outcome: .failed, interruption: .sleep)
+    XCTAssertEqual(record.statusLabel, "Interrupted")
+    XCTAssertEqual(record.resolvedStatus, .failed)
+    record.jobConclusion = .cancelled  // what GitHub concluded for the cut-off job
+    XCTAssertEqual(record.statusLabel, "Cancelled")
+    XCTAssertEqual(record.interruption, .sleep, "the reason stays with the row")
+  }
+
+  func testInterruptionRawValuesAreStable() {
+    // Persisted, so the raw values must not drift across versions.
+    XCTAssertEqual(RunRecord.Interruption.sleep.rawValue, "sleep")
+    XCTAssertEqual(RunRecord.Interruption.offline.rawValue, "offline")
+    XCTAssertEqual(RunRecord.Interruption.restart.rawValue, "restart")
+    XCTAssertEqual(RunRecord.Interruption.quit.rawValue, "quit")
+  }
+
   func testJobConclusionRawValuesAreStable() {
     // Persisted, so the raw values must not drift across versions.
     XCTAssertEqual(RunRecord.JobConclusion.success.rawValue, "success")

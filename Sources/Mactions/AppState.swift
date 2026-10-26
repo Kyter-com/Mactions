@@ -228,6 +228,11 @@ final class AppState: ObservableObject {
   /// Repos whose runners are repeatedly dying during launch (dead daemon, bad
   /// base image): repo → the orchestrator's last launch error.
   @Published var repoLaunchFailure: [String: String] = [:]
+  /// OSes whose launches the host-wide `LaunchGate` paused because their
+  /// runners kept failing to reach GitHub: the dashboard's "paused" bars.
+  @Published var launchPauses: [LaunchGate.Pause] = []
+  /// Repos with queued demand that a paused OS is holding: repo → that OS.
+  @Published var repoLaunchPaused: [String: RunnerOS] = [:]
   /// Names of OUR runners GitHub reports as `busy` (executing a job right now).
   /// Polled by the Runners pane so the activity ring spins only during a real job,
   /// not for an idle-but-online runner. Empty when offline.
@@ -300,6 +305,15 @@ final class AppState: ObservableObject {
   /// The live shared capacity ledger every orchestrator (explicit + discovered)
   /// draws on. One per online generation; cleared with the fleet.
   private var fleetBudget: HostBudget?
+  /// The host-wide launch circuit breaker every orchestrator (explicit +
+  /// discovered) asks before launching. One per online generation, so a fresh
+  /// go-online starts with a clean slate; cleared with the fleet.
+  private var launchGate: LaunchGate?
+  /// The idle container that keeps the Linux network's bridge up while Linux
+  /// runners are armed, so a Windows VM can't be given the same bridge and
+  /// delete it under a running Linux job when it powers off (see
+  /// `LinuxNetworkAnchor`). One per online generation; stopped with the fleet.
+  private var networkAnchor: LinuxNetworkAnchor?
   /// Orchestrator keys created by all-repos DISCOVERY (seeded from the plan's
   /// defaults) rather than the explicit plan — reaped when their repo's queue
   /// goes quiet. Same key space as `orchestrators`.
@@ -308,6 +322,10 @@ final class AppState: ObservableObject {
   /// quiet scan can be a race with a job that's mid-pickup).
   private var discoveryQuietScans: [String: Int] = [:]
   private var discoveryTask: Task<Void, Never>?
+  /// The all-repos loop's wait between scans; a network change cuts it short
+  /// (`networkPathChanged`) so a scan that failed while the network was down
+  /// isn't followed by a full minute of nothing once it is back.
+  private let discoveryWait = KickableWait()
   /// One shared control plane per repo (explicit AND discovered), kept for the
   /// online session: same-repo combos + the discovery probe collapse into one
   /// queued-jobs fetch per tick window, and the underlying client's ETag store
@@ -526,7 +544,7 @@ final class AppState: ObservableObject {
   func restartFleet() {
     guard state == .online, !isQuitting else { return }
     lifecycle.restart { [self] in
-      await tearDownFleet()
+      await tearDownFleet(interruption: .restart)
     } resume: { [self] in
       goOnline()
     }
@@ -865,6 +883,20 @@ final class AppState: ObservableObject {
             physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
             activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount)
 
+        // Bring the Linux network's bridge up, and keep it up, BEFORE any
+        // orchestrator can boot a Windows VM. A VM that boots while no container
+        // runs can be given the bridge number the Linux network reuses; the next
+        // Linux runner then shares that bridge, and the VM's power-off deletes it
+        // under the running job (two jobs lost on 2026-10-25). Started here,
+        // after go-online's orphan sweep, so the sweep can't remove it. A start
+        // that fails or times out retries on its own; Linux arms either way.
+        if linuxFactory != nil, maxLinux > 0, let lxCLI = linuxCLI {
+          let anchor = LinuxNetworkAnchor(cli: lxCLI, image: linuxImg)
+          networkAnchor = anchor  // set first, so a go-offline meanwhile stops it
+          _ = await Task.detached { anchor.start() }.value
+          guard fleetEpoch == myEpoch else { return }  // went offline: teardown stopped it
+        }
+
         // The live SHARED capacity ledger every combo draws on at provision
         // time. Replaces the old static per-combo grants: scale-from-zero makes
         // demand bursty and concurrent, so capacity is spent when a runner is
@@ -874,6 +906,23 @@ final class AppState: ObservableObject {
           .macOS: maxMacOS, .windows: maxWindowsVMs, .linux: maxLinux,
         ])
         fleetBudget = budget
+        // When an OS's runners keep failing to reach GitHub (on 2026-10-24 a
+        // VPN cut the VMs off while the Mac itself stayed online), the gate
+        // pauses that OS's launches host-wide instead of letting every combo
+        // relaunch into the same broken network each reap cycle.
+        let gate = LaunchGate()
+        gate.onChange = { [weak self] in self?.scheduleSync() }
+        gate.onResume = { [weak self] os in self?.nudgeFleets(os: os) }
+        // Linux can be checked without launching a runner: one throwaway
+        // container from the runner image tests the VM network and says what
+        // is wrong (a VM network the VPN cut off, DNS only, …). It runs off the
+        // main actor; the gate starts it only while Linux is paused.
+        if linuxFactory != nil, let lxCLI = linuxCLI {
+          gate.setProbe(
+            { await Task.detached { LinuxNetworkProbe.run(cli: lxCLI, image: linuxImg) }.value },
+            for: .linux)
+        }
+        launchGate = gate
         fleetFactories = [:]
         if let factory, maxMacOS > 0 { fleetFactories[.macOS] = factory }
         // A factory whose budget is 0 must NOT arm discovery: it would create
@@ -898,7 +947,8 @@ final class AppState: ObservableObject {
           let fleet = FleetConfig(
             owner: repo.owner, repo: repo.name, labels: labels, maxRunners: count)
           let orch = RunnerOrchestrator(
-            controlPlane: plane, factory: factory, config: fleet, os: os, budget: budget)
+            controlPlane: plane, factory: factory, config: fleet, os: os, budget: budget,
+            launchGate: gate)
           orch.onChange = { [weak self] in self?.scheduleSync() }
           orch.onRunFinished = { [weak self] record in self?.recordRun(record) }
           let key = "\(repo.fullName)#\(os.rawValue)"
@@ -1033,7 +1083,15 @@ final class AppState: ObservableObject {
         }
         startDiscoveryIfNeeded(token: token, epoch: myEpoch)
       } catch {
-        guard fleetEpoch == myEpoch else { return }
+        guard fleetEpoch == myEpoch else { return }  // went offline: teardown stopped the anchor
+        // This path goes straight to `.offline` without `tearDownFleet`, so
+        // stop the anchor here: nothing else will, and its container would
+        // otherwise outlive the offline fleet (the next go-online's sweep
+        // reaps it, but "offline" must mean offline).
+        if let anchor = networkAnchor {
+          networkAnchor = nil
+          await Task.detached { anchor.stop() }.value
+        }
         reportBlockingError("Failed to start: \(error.localizedDescription)")
         state = .offline
         // Back offline (nothing live) — keep the invariant that a restart bar
@@ -1053,12 +1111,14 @@ final class AppState: ObservableObject {
   }
 
   func goOfflineAndWait() async {
-    await lifecycle.shutDown { [self] in await tearDownFleet() }
+    await lifecycle.shutDown { [self] in
+      await tearDownFleet(interruption: isQuitting ? .quit : .offline)
+    }
   }
 
   func suspendForSleep() {
     lifecycle.willSleep(wasRunning: state == .online || state == .starting) { [self] in
-      await tearDownFleet()
+      await tearDownFleet(interruption: .sleep)
     }
   }
 
@@ -1067,7 +1127,36 @@ final class AppState: ObservableObject {
     lifecycle.cancelResume()
   }
 
-  private func tearDownFleet() async {
+  /// The dashboard's "Try now" on a paused OS: launch again at once. One more
+  /// failure pauses it again (see `LaunchGate.resumeNow`).
+  func resumeLaunches(_ os: RunnerOS) {
+    launchGate?.resumeNow(os)
+  }
+
+  /// The Mac's network path changed (see `NetworkPathWatcher`): Wi-Fi joined
+  /// or lost, a VPN connecting or dropping. A paused OS checks again now
+  /// instead of at its backoff time, and once the network is usable every
+  /// fleet reconciles and the all-repos scan runs now rather than at their
+  /// next ticks.
+  func networkPathChanged(usable: Bool) {
+    guard state == .online || state == .starting else { return }
+    launchGate?.networkChanged()
+    guard usable else { return }
+    nudgeFleets(os: nil)
+    if discoveryTask != nil { discoveryWait.kick() }
+  }
+
+  /// Run every matching fleet's reconcile now instead of at its next tick:
+  /// `os == nil` nudges all of them.
+  private func nudgeFleets(os: RunnerOS?) {
+    for (key, orch) in orchestrators where os == nil || fleetOS[key] == os {
+      orch.nudge()
+    }
+  }
+
+  /// `interruption` is why the fleet is stopping: a job it cuts off is
+  /// recorded in History with that reason.
+  private func tearDownFleet(interruption: RunRecord.Interruption) async {
     guard !orchestrators.isEmpty || state != .offline else { return }
     ControlPlaneLog.log("fleet.stop.begin")
     fleetEpoch += 1  // invalidate any in-flight goOnline
@@ -1080,14 +1169,20 @@ final class AppState: ObservableObject {
     // teardown could overrun quit's 6 s deadline. Everything stays
     // main-actor-isolated; only the network waits overlap.
     let stops = orchestrators.values.map { orch in
-      Task { @MainActor in await orch.stop() }
+      Task { @MainActor in await orch.stop(interruption: interruption) }
     }
     for stop in stops { await stop.value }
+    // After the fleets, so the bridge stays up until every runner is gone.
+    if let anchor = networkAnchor {
+      networkAnchor = nil
+      await Task.detached { anchor.stop() }.value
+    }
     orchestrators.removeAll()
     fleetOS.removeAll()
     fleetRepo.removeAll()
     fleetFactories.removeAll()
     fleetBudget = nil
+    launchGate = nil
     discoveredKeys.removeAll()
     discoveryQuietScans.removeAll()
     fleetControlPlanes.removeAll()
@@ -1101,11 +1196,16 @@ final class AppState: ObservableObject {
     repoPollFailing = []
     repoWaitingForCapacity = []
     repoLaunchFailure = [:]
+    launchPauses = []
+    repoLaunchPaused = [:]
     pendingRestart = false  // nothing live to be out of sync with
     errorBanner = nil  // a prior blocking error is moot once we're cleanly offline
     state = .offline
     statusMessage = "Offline."
     ControlPlaneLog.log("fleet.stop.end")
+    // Let the history write for any interrupted job land before a quit
+    // replies (the file write takes milliseconds; quit caps teardown at 6 s).
+    await lastHistorySave.value
   }
 
   /// Remove everything Mactions wrote to disk (cached agent + run files).
@@ -1134,6 +1234,7 @@ final class AppState: ObservableObject {
     // edited while online are STAGED (noteDefaultsEdit → restart bar), not
     // half-applied to a live scan.
     let planSnapshot = plan
+    discoveryWait.reset()
     discoveryTask = Task { [weak self] in
       while !Task.isCancelled {
         // Bound each scan with a watchdog. A scan makes serial network calls
@@ -1155,18 +1256,23 @@ final class AppState: ObservableObject {
             return false  // watchdog fired first
           }
           let scanFinished = await group.next() ?? true
-          if !scanFinished {
+          // Going offline cancels both children, and the sleep then returns
+          // first: that is a cancellation, not a hung scan.
+          if !scanFinished, !Task.isCancelled {
             ControlPlaneLog.log("discovery.scan.watchdog_timeout", ["budgetSec": "180"])
           }
           group.cancelAll()
         }
-        try? await Task.sleep(nanoseconds: 60_000_000_000)
+        // A minute between scans, cut short when the network changes.
+        guard let wait = self?.discoveryWait else { return }
+        await wait.wait(seconds: 60)
       }
     }
   }
 
   private func discoveryScan(token: String, plan: FleetPlan, epoch myEpoch: Int) async {
     guard fleetEpoch == myEpoch, state == .online else { return }
+    let scanStarted = Date()
     // Refresh the admin-repo list at most every 10 min — the lister sorts by
     // recent push, so the head of the list is the active tail of the account.
     if availableRepos.isEmpty
@@ -1183,30 +1289,45 @@ final class AppState: ObservableObject {
     // implies fresh activity, so the active tail is where demand appears, and
     // the bound keeps worst-case quota predictable (idle 304s are free anyway).
     let candidates = Array(availableRepos.filter { !explicit.contains($0.fullName) }.prefix(50))
-    var matchedKeys: Set<String> = []
-    // Repos whose queue poll FAILED this scan: unknown, not quiet — their
-    // discovered orchestrators must hold (the same failed-poll-HOLD rule the
-    // orchestrator's own loop follows), not march toward the quiet reap.
-    var unknownRepos: Set<String> = []
+    // Each repo's SHARED control plane (created here for never-seen repos): the
+    // probe and any orchestrators it spawns reuse one queued-jobs fetch per
+    // tick window, and its ETag store makes idle re-polls free.
+    var targets: [QueuedJobsPollTarget] = []
     for repo in candidates {
-      guard fleetEpoch == myEpoch, state == .online, !Task.isCancelled else { return }
-      // The repo's SHARED control plane (created here for never-seen repos):
-      // the probe and any orchestrators it spawns reuse one queued-jobs fetch
-      // per tick window, and its ETag store makes idle re-polls free.
       let plane =
         fleetControlPlanes[repo.fullName]
         ?? SharedRepoControlPlane(
           inner: GitHubClient(owner: repo.owner, repo: repo.name, token: token))
       fleetControlPlanes[repo.fullName] = plane
-      let queued: [[String]]
-      do {
-        queued = try await plane.listQueuedJobLabels()
-      } catch {
-        unknownRepos.insert(repo.fullName)
+      targets.append(QueuedJobsPollTarget(name: repo.fullName, plane: plane))
+    }
+    let repoByName = Dictionary(
+      candidates.map { ($0.fullName, $0) }, uniquingKeysWith: { first, _ in first })
+    // Four polls at a time, most recently pushed first, each answer handled
+    // as it arrives, and never more than 90 s of waiting: serial polls on slow
+    // Wi-Fi took 140-200 s, and the 180 s watchdog then cut the scan off
+    // before its reap pass.
+    let polling = startPollingQueuedJobs(targets, concurrency: 4, timeout: 90)
+    defer { polling.cancel() }
+    var matchedKeys: Set<String> = []
+    // Repos whose queue poll FAILED or did not answer in time this scan:
+    // unknown, not quiet — their discovered orchestrators must hold (the same
+    // failed-poll-HOLD rule the orchestrator's own loop follows), not march
+    // toward the quiet reap.
+    var unknownRepos: Set<String> = []
+    var answered: Set<String> = []
+    var failedPolls = 0
+    for await answer in polling.answers {
+      guard fleetEpoch == myEpoch, state == .online, !Task.isCancelled else { return }
+      answered.insert(answer.name)
+      guard case .queued(let queued) = answer.poll else {
+        unknownRepos.insert(answer.name)
+        failedPolls += 1
         continue
       }
-      guard !queued.isEmpty else { continue }
-      guard fleetEpoch == myEpoch, state == .online else { return }
+      guard !queued.isEmpty, let repo = repoByName[answer.name],
+        let plane = fleetControlPlanes[repo.fullName]
+      else { continue }
       for os in plan.discoveryMatches(for: queued) {
         let key = "\(repo.fullName)#\(os.rawValue)"
         matchedKeys.insert(key)
@@ -1230,7 +1351,8 @@ final class AppState: ObservableObject {
           owner: repo.owner, repo: repo.name, labels: seedConfig.labels,
           maxRunners: seedConfig.count)
         let orch = RunnerOrchestrator(
-          controlPlane: plane, factory: factory, config: fleet, os: os, budget: budget)
+          controlPlane: plane, factory: factory, config: fleet, os: os, budget: budget,
+          launchGate: launchGate)
         orch.onChange = { [weak self] in self?.scheduleSync() }
         orch.onRunFinished = { [weak self] record in self?.recordRun(record) }
         orchestrators[key] = orch
@@ -1258,6 +1380,10 @@ final class AppState: ObservableObject {
         }
       }
     }
+    guard fleetEpoch == myEpoch, state == .online, !Task.isCancelled else { return }
+    // No answer before the deadline: unknown as well.
+    let unfinished = candidates.filter { !answered.contains($0.fullName) }
+    for repo in unfinished { unknownRepos.insert(repo.fullName) }
     // Reap discovered orchestrators whose repo went quiet — the decision per
     // key is the pure, unit-tested `discoveryReapDecision`: failed polls HOLD,
     // demand (this scan's match, the orchestrator's OWN last poll — which also
@@ -1302,8 +1428,10 @@ final class AppState: ObservableObject {
       [
         "candidates": String(candidates.count),
         "matched": String(matchedKeys.count),
-        "pollFailed": String(unknownRepos.count),
+        "pollFailed": String(failedPolls),
+        "unfinished": String(unfinished.count),
         "orchestrators": String(orchestrators.count),
+        "durationMs": String(Int(Date().timeIntervalSince(scanStarted) * 1000)),
       ])
   }
 
@@ -1932,35 +2060,46 @@ final class AppState: ObservableObject {
       return
     }
     let image = linuxRunnerImage
-    // FAST PATH (non-forced): image already present + daemon up → flip ready
-    // directly, so a stray re-tap doesn't re-pull. A forced "update image"
-    // deliberately re-pulls.
-    if !force, LinuxContainerProviderFactory.ready(image: image, cli: cli) {
-      applyLinuxAvailability(.ready)
-      saveConfig()
-      linuxSetupFailure = nil
-      statusMessage = "Linux runner image '\(image)' is ready (\(cli.displayName))."
-      return
-    }
     linuxSetupBusy = true
     linuxSetupStep = .verifyDaemon
     linuxSetupDetail = nil
     linuxSetupFailure = nil
-    statusMessage = "Setting up the Linux runner…"
+    // Quick `container` verbs get the provider's time limit; `system start`
+    // took 6 s live, so it gets more. A wedged daemon then fails setup with a
+    // message instead of leaving it "Setting up…" for good.
+    let quick = LinuxContainerProvider.commandTimeout
     Task {
+      // FAST PATH (non-forced): image already present + daemon up → flip ready
+      // directly, so a stray re-tap doesn't re-pull. A forced "update image"
+      // deliberately re-pulls. Off the main actor: it runs two `container`
+      // commands, and on the main actor a wedged daemon froze the window.
+      if !force {
+        let ready = await Task.detached {
+          LinuxContainerProviderFactory.ready(image: image, cli: cli)
+        }.value
+        if ready {
+          applyLinuxAvailability(.ready)
+          saveConfig()
+          linuxSetupFailure = nil
+          statusMessage = "Linux runner image '\(image)' is ready (\(cli.displayName))."
+          endLinuxSetup()
+          return
+        }
+      }
+      statusMessage = "Setting up the Linux runner…"
       // 1) Ensure the daemon is up; start it if down via `container system start`.
       //    Off the main actor; these can block briefly.
       var daemonUp = await Task.detached {
-        (try? Shell.run(cli.executable, cli.daemonStatusArgs()))?.ok ?? false
+        (try? Shell.run(cli.executable, cli.daemonStatusArgs(), timeout: quick))?.ok ?? false
       }.value
       if !daemonUp {
         linuxSetupDetail = "Starting the container daemon…"
         let startArgs = cli.daemonStartArgs()
         await Task.detached {
-          _ = try? Shell.run(cli.executable, startArgs)
+          _ = try? Shell.run(cli.executable, startArgs, timeout: 120)
         }.value
         daemonUp = await Task.detached {
-          (try? Shell.run(cli.executable, cli.daemonStatusArgs()))?.ok ?? false
+          (try? Shell.run(cli.executable, cli.daemonStatusArgs(), timeout: quick))?.ok ?? false
         }.value
       }
       guard daemonUp else {
@@ -1987,7 +2126,8 @@ final class AppState: ObservableObject {
       // enough to restore Linux readiness.
       if !force {
         let imagePresent = await Task.detached { [cli, image] in
-          (try? Shell.run(cli.executable, cli.imageInspectArgs(image: image)))?.ok ?? false
+          (try? Shell.run(cli.executable, cli.imageInspectArgs(image: image), timeout: quick))?.ok
+            ?? false
         }.value
         if imagePresent {
           LinuxRunnerImage.recordImageRef(image)
@@ -2728,6 +2868,7 @@ final class AppState: ObservableObject {
     var pollFailing: Set<String> = []
     var waitingCapacity: Set<String> = []
     var launchFailures: [String: String] = [:]
+    var launchPaused: [String: RunnerOS] = [:]
     for (key, orch) in orchestrators {
       let os = fleetOS[key] ?? .macOS
       // Map back to the bare repo via fleetRepo (the OS is conveyed by the row's
@@ -2739,6 +2880,7 @@ final class AppState: ObservableObject {
       demand[repoName, default: 0] += orch.demand.queuedMatching
       if orch.demand.lastPollFailed { pollFailing.insert(repoName) }
       if orch.demand.waitingForCapacity { waitingCapacity.insert(repoName) }
+      if orch.demand.launchPaused { launchPaused[repoName] = os }
       if orch.launchFailing, let error = orch.lastError {
         launchFailures[repoName] = error
       }
@@ -2772,6 +2914,9 @@ final class AppState: ObservableObject {
     if pollFailing != repoPollFailing { repoPollFailing = pollFailing }
     if waitingCapacity != repoWaitingForCapacity { repoWaitingForCapacity = waitingCapacity }
     if launchFailures != repoLaunchFailure { repoLaunchFailure = launchFailures }
+    if launchPaused != repoLaunchPaused { repoLaunchPaused = launchPaused }
+    let pauses = launchGate?.pauses ?? []
+    if pauses != launchPauses { launchPauses = pauses }
     // When the rows/repos backing the two virtualized Lists actually change,
     // nudge the dashboard to relayout (the render-recovery guard against a
     // blank-frame List — see DashboardWindowController). Posted only on a real

@@ -179,12 +179,24 @@ public enum HostCleanup {
   /// down (we never START a daemon just to clean up).
   public static func purgeStrayLinuxContainers() {
     guard let cli = LinuxContainerProviderFactory.detectInstalledCLI() else { return }
+    purgeStrayLinuxContainers(cli: cli)
+  }
+
+  /// Every call is time-limited: this runs inside go-online's sweep, so a hung
+  /// daemon would otherwise hold "Preparing runner agent…" forever.
+  static func purgeStrayLinuxContainers(
+    cli: LinuxContainerCLI, timeout: TimeInterval = LinuxContainerProvider.commandTimeout
+  ) {
     // Don't spin up a daemon during a cleanup sweep — only reap if it's already up.
-    guard let info = try? Shell.run(cli.executable, cli.daemonStatusArgs()), info.ok else { return }
-    guard let list = try? Shell.run(cli.executable, cli.sweepListArgs()), list.ok else { return }
+    guard let info = try? Shell.run(cli.executable, cli.daemonStatusArgs(), timeout: timeout),
+      info.ok
+    else { return }
+    guard let list = try? Shell.run(cli.executable, cli.sweepListArgs(), timeout: timeout),
+      list.ok
+    else { return }
     // The CLI scopes refs to our own containers by the `mactions-` name prefix.
     for ref in cli.sweepRefs(from: list.stdout) {
-      _ = try? Shell.run(cli.executable, cli.rmArgs(name: ref))
+      _ = try? Shell.run(cli.executable, cli.rmArgs(name: ref), timeout: timeout)
     }
   }
 

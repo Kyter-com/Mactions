@@ -28,8 +28,21 @@ public enum ControlPlaneLog {
   /// Rotate to `…jsonl.1` (keeping one prior file) once the live file exceeds this.
   private static let maxBytes = 8 * 1024 * 1024
 
+  /// Unit tests drive orchestrators through thousands of events. Written to
+  /// the user's real log they rotate real history away (on 2026-10-24 a test
+  /// stuck in a loop wrote 87,040 lines in four seconds and pushed out the
+  /// evening's incident), and in the unified log they mix with the app's own
+  /// entries under its subsystem. So under XCTest the file goes to a
+  /// temporary directory and the unified log is skipped.
+  static let isRunningTests = NSClassFromString("XCTestCase") != nil
+
   public static func fileURL() -> URL {
-    HostCleanup.logsRoot().appendingPathComponent("control-plane.jsonl", isDirectory: false)
+    if isRunningTests {
+      return FileManager.default.temporaryDirectory
+        .appendingPathComponent("mactions-tests", isDirectory: true)
+        .appendingPathComponent("control-plane.jsonl", isDirectory: false)
+    }
+    return HostCleanup.logsRoot().appendingPathComponent("control-plane.jsonl", isDirectory: false)
   }
 
   /// Record one control-plane event. `fields` is small, string-valued context
@@ -40,7 +53,7 @@ public enum ControlPlaneLog {
       fields.isEmpty
       ? event
       : event + " " + fields.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: " ")
-    logger.log("\(rendered, privacy: .public)")
+    if !isRunningTests { logger.log("\(rendered, privacy: .public)") }
 
     let at = Date()
     queue.async {
@@ -52,6 +65,11 @@ public enum ControlPlaneLog {
       else { return }
       appendLine(data)
     }
+  }
+
+  /// Wait for queued file writes to land (tests).
+  static func flush() {
+    queue.sync {}
   }
 
   // MARK: - serial-queue only
