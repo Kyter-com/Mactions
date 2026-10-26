@@ -1083,7 +1083,15 @@ final class AppState: ObservableObject {
         }
         startDiscoveryIfNeeded(token: token, epoch: myEpoch)
       } catch {
-        guard fleetEpoch == myEpoch else { return }
+        guard fleetEpoch == myEpoch else { return }  // went offline: teardown stopped the anchor
+        // This path goes straight to `.offline` without `tearDownFleet`, so
+        // stop the anchor here: nothing else will, and its container would
+        // otherwise outlive the offline fleet (the next go-online's sweep
+        // reaps it, but "offline" must mean offline).
+        if let anchor = networkAnchor {
+          networkAnchor = nil
+          await Task.detached { anchor.stop() }.value
+        }
         reportBlockingError("Failed to start: \(error.localizedDescription)")
         state = .offline
         // Back offline (nothing live) — keep the invariant that a restart bar

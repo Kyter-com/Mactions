@@ -119,6 +119,7 @@ public final class LinuxNetworkAnchor: @unchecked Sendable {
     removeContainer()
     guard let launch = launch() else { return false }
     let up = waitUntilRunning(launch)
+    if !up { abandonStuckLaunch(launch) }
     ControlPlaneLog.log(
       up ? "linux.anchor.started" : "linux.anchor.not_running",
       ["seconds": String(format: "%.1f", Date().timeIntervalSince(started))])
@@ -205,6 +206,22 @@ public final class LinuxNetworkAnchor: @unchecked Sendable {
       Thread.sleep(forTimeInterval: pollInterval)
     }
     return false
+  }
+
+  /// The wait gave up but the `run` client is still alive (the daemon never
+  /// reported the container running): end it, so its exit runs the normal
+  /// restart backoff instead of holding the slot forever with no retry
+  /// scheduled. A launch that already exited, was replaced, or was stopped
+  /// needs nothing — its exit already scheduled (or cancelled) the retry.
+  private func abandonStuckLaunch(_ launch: Launch) {
+    lock.lock()
+    let current = !stopped && launchID == launch.id
+    lock.unlock()
+    guard current, launch.process.isRunning else { return }
+    // The client is only an attachment: delete the container by name too, so
+    // the exit fires even if terminating the client doesn't end it.
+    launch.process.terminate()
+    removeContainer()
   }
 
   private func exited(launchID id: Int, status: Int32) {

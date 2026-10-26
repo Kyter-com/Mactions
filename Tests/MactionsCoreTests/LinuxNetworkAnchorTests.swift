@@ -100,6 +100,18 @@ final class LinuxNetworkAnchorTests: XCTestCase {
     XCTAssertLessThan(Date().timeIntervalSince(started), 4)
   }
 
+  func testAnAnchorThatNeverReportsRunningIsRetriedNotLeftStuck() throws {
+    // `inspect` never says running (a wedged daemon, say), but the `run`
+    // client stays alive: the wait gives up, and the stuck launch must be
+    // ended so the restart backoff starts a fresh one. Left alone, the first
+    // launch would hold the slot forever with nothing scheduled to retry.
+    let fake = try FakeContainer(inspectBody: "echo '{\"status\":{\"state\":\"stopped\"}}'")
+    let anchor = makeAnchor(fake, startTimeout: 0.3)
+    defer { anchor.stop() }
+    XCTAssertFalse(anchor.start())
+    XCTAssertTrue(eventually { fake.runCount() >= 2 }, "calls: \(fake.calls())")
+  }
+
   func testStopBeforeStartMeansItNeverLaunches() throws {
     // Going offline while go-online is still on its way to the anchor.
     let fake = try FakeContainer()
