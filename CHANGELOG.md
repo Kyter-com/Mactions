@@ -5,6 +5,8 @@ All notable changes to Mactions are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-02
+
 ### Improved
 
 - **The status line says what is holding macOS jobs back, and stays
