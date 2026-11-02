@@ -244,7 +244,8 @@ struct RepoInspector: View {
       // start when matching jobs queue and retire when the queue empties.
       Text(
         os == .macOS
-          ? "Runners start on demand when jobs queue — up to this many at once."
+          ? "Runners start on demand when jobs queue — up to this many at once, further capped "
+            + "by this Mac's RAM/CPU and free disk."
           : "Runners start on demand when jobs queue — up to this many throwaway "
             + "\(os == .windows ? "VMs" : "containers") at once, further capped by "
             + "this Mac's \(os == .windows ? "RAM" : "RAM/CPU").")
@@ -451,10 +452,18 @@ struct AllRepositoriesInspector: View {
   }
 
   private var macOSCapacitySentence: String {
-    let max = app.capacity.macOSMaxConcurrentRunners
-    return max == 0
-      ? "CPU/RAM/storage budget cannot safely admit a macOS job"
-      : "this Mac can admit \(max) macOS runner\(max == 1 ? "" : "s") host-wide"
+    let budget = app.macOSBudget
+    if budget.hardwareMaxConcurrentRunners == 0 {
+      return "this Mac's \(budget.limitedBy == .cpu ? "CPU" : "RAM") can't safely run a macOS job"
+    }
+    let freeGB = budget.availableStorageGB ?? 0
+    let max = budget.maxConcurrentRunners
+    if max == 0 {
+      return "none can start until \(budget.storageGBForNextRunner) GB of disk is free "
+        + "(\(freeGB) GB now)"
+    }
+    let admits = "this Mac can admit \(max) macOS runner\(max == 1 ? "" : "s") host-wide"
+    return budget.limitedBy == .storage ? "\(admits), limited by free disk (\(freeGB) GB)" : admits
   }
 
   private var linuxCapacitySentence: String {

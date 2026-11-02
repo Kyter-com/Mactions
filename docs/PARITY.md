@@ -62,7 +62,10 @@ prebuilt-x64 jobs.
   macOS/Linux; verified to work with JIT runners). Ask if you need them.
 - **Concurrency** is host-bounded, not plan-bounded: Windows VMs are capped by
   host RAM (`(GB − 6) / 8` → one VM on a 16 GB Mac), Linux containers by
-  `(GB − 4) / 6` and `cores / 2`. A 10-shard matrix runs mostly serially.
+  `(GB − 4) / 6` and `cores / 2`, macOS jobs by `(GB − 4) / 4`, `cores / 2`
+  and free disk (the first needs 40 GB free, each concurrent one 20 GB more).
+  With too little free disk, macOS jobs stay queued and start once space is
+  freed; the check runs every 30 s. A 10-shard matrix runs mostly serially.
 
 ## Runner identity / env contract (all three OSes — at parity)
 

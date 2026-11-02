@@ -38,4 +38,24 @@ final class HostBudgetTests: XCTestCase {
     XCTAssertEqual(budget.limit(for: .windows), 3)
     XCTAssertNil(budget.limit(for: .macOS))
   }
+
+  /// macOS's limit follows free disk while online: a raise admits at once,
+  /// and a cut below what is in use revokes nothing; it only stops new
+  /// admissions until enough runners exit.
+  func testLimitMovesWhileRunnersAreLive() {
+    let budget = HostBudget(limits: [.macOS: 0])
+    XCTAssertFalse(budget.tryAcquire(.macOS), "0 = waiting for disk space")
+
+    budget.setLimit(2, for: .macOS)
+    XCTAssertTrue(budget.tryAcquire(.macOS))
+    XCTAssertTrue(budget.tryAcquire(.macOS))
+
+    budget.setLimit(1, for: .macOS)
+    XCTAssertEqual(budget.limit(for: .macOS), 1)
+    XCTAssertEqual(budget.inUse(.macOS), 2, "a cut revokes nothing")
+    budget.release(.macOS)
+    XCTAssertFalse(budget.tryAcquire(.macOS), "still at the lowered ceiling")
+    budget.release(.macOS)
+    XCTAssertTrue(budget.tryAcquire(.macOS))
+  }
 }

@@ -5,6 +5,27 @@ All notable changes to Mactions are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Improved
+
+- **The status line says what is holding macOS jobs back, and stays
+  current.** Instead of "CPU/RAM/storage budget can't safely run a macOS job",
+  it reads, for example, "macOS waiting for disk space — 22 GB free, a macOS
+  job needs 40 GB", and the numbers follow free space as it changes. Free disk
+  is counted in decimal GB, as Finder shows it.
+
+### Fixed
+
+- **macOS jobs start once you free disk space, without restarting the
+  fleet.** The macOS limit was worked out once when going online, so freeing
+  space changed nothing until you went Offline and Online again. Free disk is
+  now checked every 30 seconds and the limit follows it; until there is room,
+  queued macOS jobs show "waiting for capacity". A lower limit never stops a
+  running job, and each running job keeps 20 GB in hand, so a burst of queued
+  jobs can't fill the disk.
+- **The dashboard no longer checks free disk on every redraw.** The check took
+  10–30 ms on the main thread, and the All repositories panel ran it six times
+  per redraw. It now runs in the background.
+
 ## [0.2.1] - 2026-10-25
 
 ### Improved

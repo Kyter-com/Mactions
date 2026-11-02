@@ -174,7 +174,10 @@ final class AppState: ObservableObject {
 
   // Fleet runtime.
   @Published var state: FleetState = .offline {
-    didSet { updateSleepAssertion() }
+    didSet {
+      updateSleepAssertion()
+      updateStorageSampling()
+    }
   }
 
   /// Held while the fleet is anything but `.offline` so the Mac cannot IDLE-sleep
@@ -799,19 +802,18 @@ final class AppState: ObservableObject {
           windowsCombos.reduce(windowsDiscoveryRequested) { $0 + $1.config.count }
         let linuxRequested =
           linuxCombos.reduce(linuxDiscoveryRequested) { $0 + $1.config.count }
-        let maxMacOS =
-          wantsMac
-          ? MacOSLocalBudget.maxConcurrentRunners(
-            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
-            activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount,
-            availableStorageBytes: Self.availableStorageBytes(for: HostCleanup.mactionsRoot()))
-          : 0
+        // A fresh free-disk reading for the macOS budget, off the main actor;
+        // the storage loop keeps it current from here (`refreshMacOSBudget`).
+        await sampleAvailableStorage()
+        guard fleetEpoch == myEpoch else { return }
         // Only fetch the macOS agent template when a macOS combo is actually
-        // wanted and this host has admission budget — a Windows/Linux-only plan
-        // needs no local agent, and a 0-cap macOS plan should say so rather than
-        // arming runners that can never start.
+        // wanted and this Mac's RAM and cores can run one — a Windows/Linux-only
+        // plan needs no local agent, and a Mac too small for any macOS job
+        // should say so rather than arming runners that can never start. Too
+        // little free disk still arms them: they wait for disk space, and the
+        // live budget lets them start once it is freed.
         let factory: LocalProcessProviderFactory?
-        if wantsMac && maxMacOS > 0 {
+        if wantsMac && macOSBudget.hardwareMaxConcurrentRunners > 0 {
           let template = try await RunnerInstaller.ensureInstalled(token: token)
           guard fleetEpoch == myEpoch else { return }  // went offline during download
           factory = LocalProcessProviderFactory(
@@ -901,9 +903,12 @@ final class AppState: ObservableObject {
         // time. Replaces the old static per-combo grants: scale-from-zero makes
         // demand bursty and concurrent, so capacity is spent when a runner is
         // actually provisioned and refunded when it exits — N combos can no
-        // longer pre-claim the whole budget while idle.
+        // longer pre-claim the whole budget while idle. macOS's limit is read
+        // here, not before the awaits above: a disk reading may have landed
+        // since, and from now on `refreshMacOSBudget` moves it.
         let budget = HostBudget(limits: [
-          .macOS: maxMacOS, .windows: maxWindowsVMs, .linux: maxLinux,
+          .macOS: wantsMac ? macOSBudget.maxConcurrentRunners : 0,
+          .windows: maxWindowsVMs, .linux: maxLinux,
         ])
         fleetBudget = budget
         // When an OS's runners keep failing to reach GitHub (on 2026-10-24 a
@@ -924,10 +929,15 @@ final class AppState: ObservableObject {
         }
         launchGate = gate
         fleetFactories = [:]
-        if let factory, maxMacOS > 0 { fleetFactories[.macOS] = factory }
-        // A factory whose budget is 0 must NOT arm discovery: it would create
-        // orchestrators whose every provision is budget-denied — queued jobs
-        // would match, spin up nothing, and wait silently.
+        // macOS arms even at a 0 budget when only free disk is short: that
+        // budget follows free disk while online, so its queued jobs wait (the
+        // repo reads "waiting for capacity", the status line says why) and
+        // start once space is freed.
+        if let factory { fleetFactories[.macOS] = factory }
+        // A Windows or Linux factory whose budget is 0 must NOT arm discovery:
+        // RAM and cores don't change, so it would create orchestrators whose
+        // every provision is budget-denied — queued jobs would match, spin up
+        // nothing, and wait silently.
         if let windowsFactory, maxWindowsVMs > 0 { fleetFactories[.windows] = windowsFactory }
         if let linuxFactory, maxLinux > 0 { fleetFactories[.linux] = linuxFactory }
 
@@ -1004,83 +1014,66 @@ final class AppState: ObservableObject {
           : armedCount < configuredCount
             ? "\(armedCount) of \(configuredCount) repos"
             : "\(configuredCount) repo\(configuredCount == 1 ? "" : "s")"
-        statusMessage = "Online — watching \(scopeText) for queued jobs; runners start on demand."
+        let lead = "Online — watching \(scopeText) for queued jobs; runners start on demand."
         // If the host budget caps concurrency below what the plan could ask
         // for, say so up front (a silent cap reads as a bug when a burst of
-        // jobs only gets some runners). Denominator = Σ per-combo caps.
-        if wantsMac, maxMacOS < macOSRequested {
-          let why =
-            maxMacOS == 0
-            ? "CPU/RAM/storage budget can't safely run a macOS job"
-            : "CPU/RAM/storage budget allows \(maxMacOS) at once"
-          statusMessage =
-            (statusMessage ?? "")
-            + " macOS capped at \(maxMacOS)/\(macOSRequested) (\(why))."
-        }
+        // jobs only gets some runners). Denominator = Σ per-combo caps. The
+        // macOS part goes between `lead` and `tail` (`onlineStatusText`): it
+        // follows free disk, so it is rebuilt while online.
+        var tail = ""
         if windowsFactory != nil, maxWindowsVMs < windowsRequested {
           let why =
             maxWindowsVMs == 0
             ? "this Mac's RAM can't safely run a \(perVMGB) GB Windows VM"
             : "RAM budget allows \(maxWindowsVMs) at once"
-          statusMessage =
-            (statusMessage ?? "")
-            + " Windows capped at \(maxWindowsVMs)/\(windowsRequested) (\(why))."
+          tail += " Windows capped at \(maxWindowsVMs)/\(windowsRequested) (\(why))."
         }
         if linuxFactory != nil, maxLinux < linuxRequested {
           let why =
             maxLinux == 0
             ? "this Mac can't safely run a Linux container"
             : "capacity allows \(maxLinux) at once"
-          statusMessage =
-            (statusMessage ?? "")
-            + " Linux capped at \(maxLinux)/\(linuxRequested) (\(why))."
+          tail += " Linux capped at \(maxLinux)/\(linuxRequested) (\(why))."
         }
         // All-repos discovery wants a platform that can't arm (not set up, or
         // budget 0) → say so. Without this, a queued Windows job in a
         // discovered repo would just silently never start — explicit combos
-        // get the messages below, discovery-only demand got nothing.
+        // get the messages below, discovery-only demand got nothing. (macOS's
+        // own part covers it.)
         if plan.isAllRepos {
-          for os: RunnerOS in [.macOS, .windows, .linux]
-          where discoveryPlatforms.contains(os.rawValue) && fleetFactories[os] == nil {
-            let why: String
-            switch os {
-            case .macOS:
-              why = "CPU/RAM/storage budget can't safely run a macOS job"
-            case .windows:
-              why =
-                windowsFactory == nil
-                ? (windowsImageReady
-                  ? "install VMware Fusion (Settings → Windows)"
-                  : "build the base image (Settings → Windows)")
-                : "this Mac's RAM can't safely run a Windows VM"
-            case .linux:
-              why =
-                linuxFactory == nil
-                ? linuxSkipStatusReason
-                : "this Mac can't safely run a Linux container"
-            }
-            statusMessage =
-              (statusMessage ?? "") + " All-repos \(os.displayName) discovery off — \(why)."
+          if discoveryPlatforms.contains(RunnerOS.windows.rawValue), fleetFactories[.windows] == nil {
+            let why =
+              windowsFactory == nil
+              ? (windowsImageReady
+                ? "install VMware Fusion (Settings → Windows)"
+                : "build the base image (Settings → Windows)")
+              : "this Mac's RAM can't safely run a Windows VM"
+            tail += " All-repos Windows discovery off — \(why)."
           }
-        }
-        if !macOSCombos.isEmpty, factory == nil {
-          statusMessage =
-            (statusMessage ?? "")
-            + " macOS skipped — CPU/RAM/storage budget can't safely run a macOS job."
+          if discoveryPlatforms.contains(RunnerOS.linux.rawValue), fleetFactories[.linux] == nil {
+            let why =
+              linuxFactory == nil
+              ? linuxSkipStatusReason
+              : "this Mac can't safely run a Linux container"
+            tail += " All-repos Linux discovery off — \(why)."
+          }
         }
         // A Windows combo was enabled but no base image / Fusion → say so instead
         // of silently skipping it.
         if !windowsCombos.isEmpty, windowsFactory == nil {
-          statusMessage =
-            (statusMessage ?? "")
-            + (windowsImageReady
-              ? " Windows skipped — install VMware Fusion (Settings → Windows)."
-              : " Windows skipped — build the base image (Settings → Windows).")
+          tail +=
+            windowsImageReady
+            ? " Windows skipped — install VMware Fusion (Settings → Windows)."
+            : " Windows skipped — build the base image (Settings → Windows)."
         }
         // A Linux combo was enabled but the runtime/image isn't ready → say which.
         if !linuxCombos.isEmpty, linuxFactory == nil {
-          statusMessage = (statusMessage ?? "") + " Linux skipped — \(linuxSkipStatusReason)."
+          tail += " Linux skipped — \(linuxSkipStatusReason)."
         }
+        var status = OnlineStatus(lead: lead, macOSRequested: macOSRequested, tail: tail)
+        status.written = onlineStatusText(status)
+        onlineStatus = status
+        statusMessage = status.written
         startDiscoveryIfNeeded(token: token, epoch: myEpoch)
       } catch {
         guard fleetEpoch == myEpoch else { return }  // went offline: teardown stopped the anchor
@@ -1100,6 +1093,41 @@ final class AppState: ObservableObject {
         pendingRestart = false
       }
     }
+  }
+
+  /// The go-online status line in parts. The macOS part sits between `lead`
+  /// and `tail` and is rebuilt from the live budget whenever it changes,
+  /// because free disk moves while online; the rest is fixed for the session.
+  private struct OnlineStatus {
+    let lead: String
+    /// Σ per-combo macOS caps the plan could ask for (0 = macOS not wanted).
+    let macOSRequested: Int
+    let tail: String
+    /// The line as last written. Once anything else replaces it, a budget
+    /// change leaves the newer message alone.
+    var written = ""
+  }
+  /// Set when go-online writes the status line; cleared with the fleet.
+  private var onlineStatus: OnlineStatus?
+
+  private func onlineStatusText(_ status: OnlineStatus) -> String {
+    guard let note = macOSStatusNote(requested: status.macOSRequested) else {
+      return status.lead + status.tail
+    }
+    return "\(status.lead) \(note)\(status.tail)"
+  }
+
+  /// Rebuild the go-online status line after a macOS budget change, unless
+  /// something newer has replaced it.
+  private func refreshOnlineStatusLine() {
+    guard state == .online, var status = onlineStatus, statusMessage == status.written else {
+      return
+    }
+    let text = onlineStatusText(status)
+    guard text != status.written else { return }
+    status.written = text
+    onlineStatus = status
+    statusMessage = text
   }
 
   func goOffline() {
@@ -1200,6 +1228,7 @@ final class AppState: ObservableObject {
     repoLaunchPaused = [:]
     pendingRestart = false  // nothing live to be out of sync with
     errorBanner = nil  // a prior blocking error is moot once we're cleanly offline
+    onlineStatus = nil
     state = .offline
     statusMessage = "Offline."
     ControlPlaneLog.log("fleet.stop.end")
@@ -2299,9 +2328,11 @@ final class AppState: ObservableObject {
     NSWorkspace.shared.open(dir)
   }
 
-  /// A read-only capacity snapshot for the dashboard. This is the STATIC budget
-  /// `goOnline` uses (host RAM + the Windows VM cap), plus live runner counts —
-  /// NOT live per-VM memory sampling (that's a later phase). Computed on demand.
+  /// A read-only capacity snapshot for the dashboard: the budgets `goOnline`
+  /// uses (host RAM, the Windows VM cap, the macOS cap as of the last
+  /// free-disk reading), plus live runner counts — NOT live per-VM memory
+  /// sampling (that's a later phase). Computed on demand from cached values
+  /// only: views read it on every render, so it must never touch the disk.
   struct CapacitySnapshot {
     let hostRAMBytes: UInt64
     /// Soft host-wide admission cap for bare-host macOS runner processes.
@@ -2337,10 +2368,7 @@ final class AppState: ObservableObject {
     let ram = ProcessInfo.processInfo.physicalMemory
     return CapacitySnapshot(
       hostRAMBytes: ram,
-      macOSMaxConcurrentRunners: MacOSLocalBudget.maxConcurrentRunners(
-        physicalMemoryBytes: ram,
-        activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount,
-        availableStorageBytes: Self.availableStorageBytes(for: HostCleanup.mactionsRoot())),
+      macOSMaxConcurrentRunners: macOSBudget.maxConcurrentRunners,
       windowsPerVMGB: perVM,
       windowsMaxConcurrentVMs: windowsImageReady
         ? WindowsVMBudget.maxConcurrentVMs(physicalMemoryBytes: ram, perVMGB: perVM)
@@ -2354,7 +2382,11 @@ final class AppState: ObservableObject {
       liveWindowsRunners: runners.filter { $0.os == .windows }.count)
   }
 
-  static func availableStorageBytes(for url: URL, fileManager: FileManager = .default) -> UInt64? {
+  /// Free disk on the volume holding `url`. Takes 10–30 ms (measured
+  /// 2026-11-02), so call it off the main actor (`sampleAvailableStorage`).
+  nonisolated static func availableStorageBytes(
+    for url: URL, fileManager: FileManager = .default
+  ) -> UInt64? {
     var probe = url
     while !fileManager.fileExists(atPath: probe.path) {
       let parent = probe.deletingLastPathComponent()
@@ -2372,6 +2404,104 @@ final class AppState: ObservableObject {
       let free = attrs[.systemFreeSize] as? NSNumber
     else { return nil }
     return free.uint64Value
+  }
+
+  // MARK: macOS budget (follows free disk)
+
+  /// The macOS admission budget from RAM, cores and the last free-disk
+  /// reading. `capacity` and the inspector read it, so a render never touches
+  /// the disk; while online, the live `HostBudget` follows it.
+  @Published private(set) var macOSBudget = AppState.macOSAssessment(
+    availableStorageBytes: nil, runnersInUse: 0)
+  private var lastAvailableStorageBytes: UInt64?
+  private var storageSamplingTask: Task<Void, Never>?
+
+  nonisolated static func macOSAssessment(
+    availableStorageBytes: UInt64?, runnersInUse: Int
+  ) -> MacOSLocalBudget.Assessment {
+    MacOSLocalBudget.assess(
+      physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+      activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount,
+      availableStorageBytes: availableStorageBytes,
+      runnersInUse: runnersInUse)
+  }
+
+  /// Free disk moves the macOS budget, so re-read it every 30 s while the
+  /// fleet is up (the live ledger follows it) or the dashboard is open (the
+  /// inspector shows it). Called on every fleet state and window visibility
+  /// change. Idempotent.
+  private func updateStorageSampling() {
+    guard state != .offline || dashboardVisible else {
+      storageSamplingTask?.cancel()
+      storageSamplingTask = nil
+      return
+    }
+    guard storageSamplingTask == nil else { return }
+    storageSamplingTask = Task { [weak self] in
+      while !Task.isCancelled {
+        guard let self else { break }
+        await self.sampleAvailableStorage()
+        try? await Task.sleep(nanoseconds: 30_000_000_000)
+      }
+    }
+  }
+
+  /// Read free disk off the main actor, then apply it here.
+  private func sampleAvailableStorage() async {
+    let bytes = await Task.detached {
+      Self.availableStorageBytes(for: HostCleanup.mactionsRoot())
+    }.value
+    lastAvailableStorageBytes = bytes
+    refreshMacOSBudget()
+  }
+
+  /// Recompute the macOS budget from the last free-disk reading. While macOS
+  /// is armed, the live ledger's limit follows it: a raise nudges the macOS
+  /// fleets so a job waiting for disk space starts now rather than at its
+  /// next tick, and a cut admits nothing new while running jobs finish.
+  private func refreshMacOSBudget() {
+    let assessment = Self.macOSAssessment(
+      availableStorageBytes: lastAvailableStorageBytes,
+      runnersInUse: fleetBudget?.inUse(.macOS) ?? 0)
+    if assessment != macOSBudget { macOSBudget = assessment }
+    if fleetFactories[.macOS] != nil, let budget = fleetBudget {
+      let limit = budget.limit(for: .macOS) ?? 0
+      if limit != assessment.maxConcurrentRunners {
+        budget.setLimit(assessment.maxConcurrentRunners, for: .macOS)
+        ControlPlaneLog.log(
+          "budget.limit_changed",
+          [
+            "os": RunnerOS.macOS.rawValue, "from": String(limit),
+            "to": String(assessment.maxConcurrentRunners),
+            "freeGB": assessment.availableStorageGB.map(String.init) ?? "unknown",
+          ])
+        if assessment.maxConcurrentRunners > limit { nudgeFleets(os: .macOS) }
+      }
+    }
+    refreshOnlineStatusLine()
+  }
+
+  /// The macOS part of the online status line: nil unless the budget sits
+  /// below what the plan could ask for (`requested`, Σ per-combo caps).
+  private func macOSStatusNote(requested: Int) -> String? {
+    let budget = macOSBudget
+    guard requested > 0, budget.maxConcurrentRunners < requested else { return nil }
+    if budget.hardwareMaxConcurrentRunners == 0 {
+      return "macOS off — this Mac's \(budget.limitedBy == .cpu ? "CPU" : "RAM") can't safely "
+        + "run a macOS job."
+    }
+    let freeGB = budget.availableStorageGB ?? 0
+    if budget.maxConcurrentRunners == 0 {
+      return "macOS waiting for disk space — \(freeGB) GB free, a macOS job needs "
+        + "\(budget.storageGBForNextRunner) GB."
+    }
+    let why: String
+    switch budget.limitedBy {
+    case .memory: why = "RAM budget"
+    case .cpu: why = "CPU budget"
+    case .storage: why = "\(freeGB) GB of disk free"
+    }
+    return "macOS capped at \(budget.maxConcurrentRunners)/\(requested) (\(why))."
   }
 
   // MARK: Live memory sampling (dashboard Memory tab)
@@ -2394,6 +2524,7 @@ final class AppState: ObservableObject {
     guard dashboardVisible != visible else { return }
     dashboardVisible = visible
     if visible { startMemorySampling() } else { stopMemorySampling() }
+    updateStorageSampling()
   }
 
   /// Start the live memory sampler. Driven by the dashboard window opening (see

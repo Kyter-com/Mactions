@@ -10,6 +10,8 @@ import Foundation
 /// ceilings still come from the pure budget formulas (`MacOSLocalBudget`,
 /// `WindowsVMBudget`, `LinuxContainerBudget`) computed against the host's
 /// physical RAM/CPU/storage; this type just makes spending them dynamic.
+/// macOS's ceiling also moves while online, because its disk term follows
+/// free space (`setLimit`).
 ///
 /// `@MainActor` rather than an `actor` on purpose: every caller — `AppState`
 /// and each `RunnerOrchestrator` — is already main-actor-isolated, which keeps
@@ -19,7 +21,7 @@ import Foundation
 public final class HostBudget {
   /// Concurrent-runner ceiling per OS. A missing key = uncapped; AppState
   /// normally supplies a limit for every currently armed OS.
-  private let limits: [RunnerOS: Int]
+  private var limits: [RunnerOS: Int]
   private var used: [RunnerOS: Int] = [:]
 
   public init(limits: [RunnerOS: Int]) {
@@ -29,6 +31,13 @@ public final class HostBudget {
   /// The configured ceiling for `os`, or `nil` when uncapped. For status copy
   /// and (later) UI "recommended max" seeding.
   public func limit(for os: RunnerOS) -> Int? { limits[os] }
+
+  /// Move `os`'s ceiling while online (macOS's follows free disk). A cut
+  /// below what is in use revokes nothing: running runners finish, and
+  /// nothing new is admitted until enough of them exit.
+  public func setLimit(_ limit: Int, for os: RunnerOS) {
+    limits[os] = limit
+  }
 
   public func inUse(_ os: RunnerOS) -> Int { used[os, default: 0] }
 
