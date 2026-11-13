@@ -940,6 +940,220 @@ final class WindowsImageTests: XCTestCase {
       "fusion-windows-base must copy bootstrap.log while the VM is still running, before guest-ops disappear")
   }
 
+  /// PowerShell v7.7.0 (2026-11-10) ships no .msi at all, so resolving
+  /// `releases/latest` and filtering for the win-arm64 MSI skipped pwsh and the
+  /// required-tools gate failed every rebuild. Track the newest LTS the way
+  /// actions/runner-images does (tools/metadata.json LTSReleaseTag), install its
+  /// MSI only after checking hashes.sha256, and fall back to the same release's
+  /// zip if a future LTS drops the MSI too.
+  func testBootstrapInstallsNewestLTSPowerShellLikeHosted() throws {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let script = try String(
+      contentsOf: repoRoot.appendingPathComponent("scripts/bootstrap.ps1"), encoding: .utf8)
+
+    XCTAssertNil(
+      script.range(of: "repos/PowerShell/PowerShell/releases/latest"),
+      "pwsh must not follow releases/latest: 7.7+ ships no MSI and is not the LTS hosted images use")
+    for required in [
+      "https://raw.githubusercontent.com/PowerShell/PowerShell/master/tools/metadata.json",
+      "@($pwshMeta.LTSReleaseTag)",
+      "repos/PowerShell/PowerShell/releases/tags/v$pwshVersion",
+      "\"PowerShell-$pwshVersion-win-arm64.msi\"",
+      "\"PowerShell-$pwshVersion-win-arm64.zip\"",
+      "Where-Object { $_.name -eq 'hashes.sha256' }",
+      "[System.IO.Compression.ZipFile]::ExtractToDirectory($pwshFile, $pwshDir)",
+      "$InstallFailures += \"PowerShell 7: $($_.Exception.Message)\"",
+      "'pwsh' = (Join-Path $env:ProgramFiles 'PowerShell\\7\\pwsh.exe')",
+    ] {
+      XCTAssertNotNil(script.range(of: required), "missing PowerShell 7 install fragment: \(required)")
+    }
+
+    // The checksum must gate BOTH installers, so it has to come before either.
+    let hashCheck = try XCTUnwrap(
+      script.range(of: "Get-FileHash -LiteralPath $pwshFile -Algorithm SHA256"))
+    let mismatch = try XCTUnwrap(
+      script.range(of: "if ($pwshActual -ne $pwshExpected) {\n    throw"))
+    let msiInstall = try XCTUnwrap(script.range(of: "Start-Process msiexec.exe"))
+    let zipInstall = try XCTUnwrap(
+      script.range(of: "[System.IO.Compression.ZipFile]::ExtractToDirectory($pwshFile"))
+    XCTAssertLessThan(hashCheck.lowerBound, mismatch.lowerBound)
+    XCTAssertLessThan(mismatch.lowerBound, msiInstall.lowerBound)
+    XCTAssertLessThan(mismatch.lowerBound, zipInstall.lowerBound)
+  }
+
+  /// A failed bootstrap used to power off 5 s after its warning, sooner than the
+  /// host's 30 s transcript copy, so the build failed with only "powered off
+  /// WITHOUT the provisioning sentinel" and a transcript that stopped several
+  /// steps earlier (2026-11-12). Every failure path, including errors nothing
+  /// catches, must leave its reason where the host polls for it and give the
+  /// host the same 60 s window the sentinel gets.
+  func testBootstrapReportsFailureReasonToHostBeforePowerOff() throws {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let script = try String(
+      contentsOf: repoRoot.appendingPathComponent("scripts/bootstrap.ps1"), encoding: .utf8)
+
+    XCTAssertNotNil(script.range(of: "$FailureMarker = 'C:\\setup\\logs\\bootstrap-failed.txt'"))
+    let function = try XCTUnwrap(
+      script.range(of: "function Stop-BootstrapWithFailure([string]$Reason) {"))
+    let body = script[function.upperBound...]
+    let stopTranscript = try XCTUnwrap(body.range(of: "try { Stop-Transcript | Out-Null } catch { }"))
+    let markerWrite = try XCTUnwrap(
+      body.range(of: "Set-Content -LiteralPath $FailureMarker -Value $Reason -Encoding ASCII -Force"))
+    let powerOff = try XCTUnwrap(body.range(of: "shutdown /s /t 60"))
+    let exit = try XCTUnwrap(body.range(of: "exit 1"))
+    XCTAssertLessThan(stopTranscript.lowerBound, markerWrite.lowerBound,
+      "the marker must land after the transcript is closed, so the host copies a complete log")
+    XCTAssertLessThan(markerWrite.lowerBound, powerOff.lowerBound)
+    XCTAssertLessThan(powerOff.lowerBound, exit.lowerBound)
+
+    XCTAssertNotNil(
+      script.range(of: "trap {\n  Stop-BootstrapWithFailure (\"unhandled error: {0}\" -f $_.Exception.Message)\n  break\n}"),
+      "an error nothing handles must be reported and power off, not leave the VM up for 90 min")
+    let guardLock = try XCTUnwrap(script.range(of: "C:\\setup\\.bootstrap-started"))
+    XCTAssertLessThan(function.lowerBound, guardLock.lowerBound,
+      "the failure handler must exist before the first statement that can fail")
+
+    XCTAssertNotNil(script.range(of: "Stop-BootstrapWithFailure $reason"),
+      "the required-tools gate must report through the failure channel")
+    XCTAssertNotNil(
+      script.range(of: "Stop-BootstrapWithFailure ('required runner settings missing after provisioning"),
+      "the required-settings gate must report through the failure channel")
+    XCTAssertNil(script.range(of: "shutdown /s /t 5 "),
+      "a 5 s failure power-off beats the host's poll and hides the reason")
+  }
+
+  /// fusion-windows-base must read bootstrap.ps1's failure report while VMware
+  /// Tools are still up and fail the build with it, so the app's banner names
+  /// the guest's reason.
+  func testFusionBaseFailsWithGuestReportedReason() throws {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let script = try String(
+      contentsOf: repoRoot.appendingPathComponent("scripts/fusion-windows-base"), encoding: .utf8)
+    let bootstrap = try String(
+      contentsOf: repoRoot.appendingPathComponent("scripts/bootstrap.ps1"), encoding: .utf8)
+
+    // Both sides must agree on where the reason lives.
+    XCTAssertNotNil(script.range(of: "GUEST_FAILURE_MARKER='C:\\setup\\logs\\bootstrap-failed.txt'"))
+    XCTAssertNotNil(bootstrap.range(of: "$FailureMarker = 'C:\\setup\\logs\\bootstrap-failed.txt'"))
+
+    let probe = try XCTUnwrap(
+      script.range(of: "fileExistsInGuest \"$VMX\" \"$GUEST_FAILURE_MARKER\""))
+    let loopEnd = try XCTUnwrap(script.range(of: "\ndone\n", range: probe.upperBound..<script.endIndex))
+    let guestReason = try XCTUnwrap(script.range(of: "die \"guest bootstrap failed: ${GUEST_FAILURE%.}"))
+    let generic = try XCTUnwrap(script.range(of: "die \"guest powered off WITHOUT the provisioning sentinel"))
+    XCTAssertLessThan(probe.lowerBound, loopEnd.lowerBound, "the marker must be polled inside the watch loop")
+    XCTAssertLessThan(loopEnd.lowerBound, guestReason.lowerBound)
+    XCTAssertLessThan(guestReason.lowerBound, generic.lowerBound,
+      "a reported reason must win over the generic no-sentinel error")
+    XCTAssertNotNil(script.range(of: "$((NOW - GUEST_FAILURE_SEEN)) -ge 180"),
+      "a guest that reported a failure but never powers off must be stopped, not waited out for 90 min")
+  }
+
+  /// `read_guest_failure` folds the guest's CRLF text into one line for the
+  /// error message. Exercised against a stand-in vmrun.
+  func testFusionBaseReadGuestFailureFoldsCRLFIntoOneLine() throws {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let scriptPath = repoRoot.appendingPathComponent("scripts/fusion-windows-base").path
+    let dir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("mactions-readfailure-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let fakeVmrun = dir.appendingPathComponent("vmrun")
+    // copyFileFromGuestToHost <vmx> <guest path> <host path>: write the "guest" file.
+    try "#!/bin/bash\nfor last; do :; done\nprintf 'required runner tools missing: pwsh\\r\\n  - install errors: PowerShell 7: no MSI. \\r\\n' > \"$last\"\n"
+      .write(to: fakeVmrun, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeVmrun.path)
+
+    let harness = """
+      set -euo pipefail
+      eval "$(awk '/^read_guest_failure\\(\\) \\{/{p=1} p{print} p&&/^}/{exit}' "$1")"
+      VMRUN="$2"; VMX=/nonexistent.vmx; GUEST_USER=u; GUEST_PW=p
+      GUEST_FAILURE_MARKER='C:\\setup\\logs\\bootstrap-failed.txt'
+      printf '[%s]' "$(read_guest_failure)"
+      """
+    let result = try Shell.run(
+      "/bin/bash", ["-c", harness, "harness", scriptPath, fakeVmrun.path], timeout: 30)
+    XCTAssertTrue(result.ok, result.stderr)
+    XCTAssertEqual(
+      result.stdout,
+      "[required runner tools missing: pwsh - install errors: PowerShell 7: no MSI.]")
+  }
+
+  /// MACTIONS_KEEP_FAILED (the "Keep a failed build's disk" option) used to leave
+  /// the failed, snapshot-less disk IN PLACE of the base while the app still
+  /// showed the old base as ready (2026-11-12). It must now move the failed
+  /// build aside, where HostCleanup's `.bak.` sweep reclaims it, and still
+  /// restore the prior base. Runs the script's real backup helpers in a temp dir.
+  func testFusionBaseKeepFailedMovesFailedBuildAsideAndRestoresPriorBase() throws {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let scriptPath = repoRoot.appendingPathComponent("scripts/fusion-windows-base").path
+
+    func run(keepFailed: Bool, buildStarted: Bool) throws -> (fusion: URL, output: String) {
+      let fusion = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mactions-keepfailed-\(UUID().uuidString)", isDirectory: true)
+      try FileManager.default.createDirectory(at: fusion, withIntermediateDirectories: true)
+      let harness = """
+        set -uo pipefail
+        FUSION_DIR="$2"; NAME=win11-runner-base
+        eval "$(awk '/^base_files\\(\\) \\{/{p=1} /^trap on_exit EXIT/{exit} p{print}' "$1")"
+        mkdir -p "$FUSION_DIR/.$NAME.bak.4242" "$FUSION_DIR/mactions-live-clone"
+        echo good > "$FUSION_DIR/.$NAME.bak.4242/$NAME.vmx"
+        echo good > "$FUSION_DIR/.$NAME.bak.4242/$NAME.vmdk"
+        echo snap > "$FUSION_DIR/.$NAME.bak.4242/$NAME-Snapshot1.vmsn"
+        echo failed > "$FUSION_DIR/$NAME.vmx"
+        echo failed > "$FUSION_DIR/$NAME.vmdk"
+        BACKUP_DIR="$FUSION_DIR/.$NAME.bak.4242"
+        BUILD_STARTED=$3
+        if [[ "$4" == 1 ]]; then export MACTIONS_KEEP_FAILED=1; else unset MACTIONS_KEEP_FAILED; fi
+        (exit 1); on_exit 2>&1
+        """
+      let result = try Shell.run(
+        "/bin/bash",
+        ["-c", harness, "harness", scriptPath, fusion.path, buildStarted ? "1" : "0", keepFailed ? "1" : "0"],
+        timeout: 30)
+      XCTAssertTrue(result.ok, result.stderr)
+      return (fusion, result.stdout)
+    }
+    func contents(_ url: URL) -> String? {
+      (try? String(contentsOf: url, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    func keptDirs(_ fusion: URL) -> [URL] {
+      HostCleanup.windowsBaseBackupDirectories(in: fusion)
+        .filter { $0.lastPathComponent.hasPrefix(".win11-runner-base.bak.failed-") }
+    }
+
+    // Keep on: the failed build is set aside and the prior base comes back.
+    let kept = try run(keepFailed: true, buildStarted: true)
+    defer { try? FileManager.default.removeItem(at: kept.fusion) }
+    XCTAssertEqual(contents(kept.fusion.appendingPathComponent("win11-runner-base.vmx")), "good")
+    XCTAssertEqual(contents(kept.fusion.appendingPathComponent("win11-runner-base-Snapshot1.vmsn")), "snap")
+    XCTAssertFalse(FileManager.default.fileExists(
+      atPath: kept.fusion.appendingPathComponent(".win11-runner-base.bak.4242").path))
+    XCTAssertTrue(FileManager.default.fileExists(
+      atPath: kept.fusion.appendingPathComponent("mactions-live-clone").path))
+    let keptDir = try XCTUnwrap(keptDirs(kept.fusion).first, kept.output)
+    XCTAssertEqual(contents(keptDir.appendingPathComponent("win11-runner-base.vmx")), "failed")
+    XCTAssertEqual(contents(keptDir.appendingPathComponent("win11-runner-base.vmdk")), "failed")
+    XCTAssertTrue(kept.output.contains("failed build's disk kept for diagnosis at"), kept.output)
+
+    // Keep off: the failed build is discarded, the prior base restored.
+    let discarded = try run(keepFailed: false, buildStarted: true)
+    defer { try? FileManager.default.removeItem(at: discarded.fusion) }
+    XCTAssertEqual(contents(discarded.fusion.appendingPathComponent("win11-runner-base.vmx")), "good")
+    XCTAssertTrue(keptDirs(discarded.fusion).isEmpty)
+
+    // A failure before this run wrote any files: nothing to keep, base restored.
+    let early = try run(keepFailed: true, buildStarted: false)
+    defer { try? FileManager.default.removeItem(at: early.fusion) }
+    XCTAssertEqual(contents(early.fusion.appendingPathComponent("win11-runner-base.vmx")), "good")
+    XCTAssertTrue(keptDirs(early.fusion).isEmpty)
+  }
+
   // MARK: Base health stamp (informational; written by fusion-windows-base)
 
   func testBaseHealthFileLivesAtMactionsRootNotUnderRuns() {

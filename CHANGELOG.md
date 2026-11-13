@@ -5,6 +5,25 @@ All notable changes to Mactions are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Rebuilding the Windows base works again.** PowerShell 7.7, released on
+  2026-11-10, ships no MSI installer, so every rebuild failed about five
+  minutes in with "guest powered off WITHOUT the provisioning sentinel". The
+  base now installs the newest LTS PowerShell (7.6, the same line GitHub's
+  hosted Windows images use) from its MSI after checking the release's
+  published SHA-256, and falls back to the zip if a future LTS has no MSI.
+- **A failed Windows rebuild says why.** The guest reports its reason before
+  powering off, and the error shows it ("guest bootstrap failed: …") instead of
+  only "powered off WITHOUT the provisioning sentinel". An error the guest
+  didn't anticipate now fails the build within a minute instead of waiting out
+  the 90-minute timeout.
+- **"Keep a failed build's disk for diagnosis" no longer replaces the working
+  base.** The failed disk was left in place of the base, so Windows jobs
+  couldn't start while the app still showed the old base as ready. The failed
+  disk now goes to a separate folder, removed after the next successful
+  rebuild, and the previous base is restored.
+
 ## [0.2.2] - 2026-11-02
 
 ### Improved

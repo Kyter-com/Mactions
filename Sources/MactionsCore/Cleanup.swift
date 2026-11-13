@@ -10,8 +10,9 @@ import Foundation
 ///   - Per launch / go-online: `purgeRuns()` plus provider-specific sweeps clear
 ///     anything a crash or force-quit orphaned last time.
 ///   - After a successful Windows base rebuild: old `.win11-runner-base.bak.*`
-///     rescue copies are removed, reclaiming the multi-GB failed-build backups
-///     that `MACTIONS_KEEP_FAILED=1` intentionally preserved for post-mortem.
+///     directories are removed, reclaiming the multi-GB failed builds that
+///     `MACTIONS_KEEP_FAILED=1` set aside for post-mortem (`.bak.failed-<pid>`)
+///     and any prior-base backup an interrupted rebuild left behind.
 ///   - On demand: `purgeAll()` removes everything Mactions ever wrote to disk
 ///     (including the cached agent) for a clean uninstall.
 ///
@@ -138,9 +139,11 @@ public enum HostCleanup {
     }
   }
 
-  /// Old rescue copies produced by `fusion-windows-base` when a rebuild fails
-  /// with `MACTIONS_KEEP_FAILED=1`. Once a later rebuild succeeds, these are just
-  /// stale multi-GB diagnostics and should be reclaimed automatically.
+  /// `.win11-runner-base.bak.*` directories `fusion-windows-base` leaves in the
+  /// Fusion root: failed builds that `MACTIONS_KEEP_FAILED=1` set aside
+  /// (`.bak.failed-<pid>`; the prior base is restored either way), or a prior-base
+  /// backup an interrupted rebuild never restored. Once a later rebuild succeeds,
+  /// these are stale multi-GB copies and are reclaimed automatically.
   public static func windowsBaseBackupDirectories(in fusionRoot: URL) -> [URL] {
     let fm = FileManager.default
     guard let entries = try? fm.contentsOfDirectory(

@@ -22,6 +22,8 @@ final class CleanupTests: XCTestCase {
     for name in [
       ".win11-runner-base.bak.1",
       ".win11-runner-base.bak.2",
+      // A failed build kept aside by MACTIONS_KEEP_FAILED (fusion-windows-base).
+      ".win11-runner-base.bak.failed-77",
       "mactions-live-clone",
       "win11-runner-base.vmx",
     ] {
@@ -34,7 +36,7 @@ final class CleanupTests: XCTestCase {
 
     XCTAssertEqual(
       HostCleanup.windowsBaseBackupDirectories(in: root).map(\.lastPathComponent),
-      [".win11-runner-base.bak.1", ".win11-runner-base.bak.2"])
+      [".win11-runner-base.bak.1", ".win11-runner-base.bak.2", ".win11-runner-base.bak.failed-77"])
   }
 
   // NOTE: we deliberately do NOT call purgeRuns()/purgeAll() from tests. They

@@ -57,10 +57,14 @@ The automated build:
 3. Installs Windows 11 Pro ARM unattended, creates local administrator `runner`,
    auto-logs in, and starts `bootstrap.ps1`.
 4. Installs VMware Tools, the latest ARM64 Actions runner, PortableGit with bash
-   and Git LFS, PowerShell 7, the run-once task, and the narrow hosted-semantic
-   settings documented in PARITY.md.
+   and Git LFS, the newest LTS PowerShell 7, the run-once task, and the narrow
+   hosted-semantic settings documented in PARITY.md.
 5. Writes `.mactions-provisioned` only after required tools and settings verify,
-   powers off, disconnects install media, and snapshots `base-provisioned`.
+   powers off, disconnects install media, and snapshots `base-provisioned`. A
+   failed check or an error nothing handles writes its reason to
+   `C:\setup\logs\bootstrap-failed.txt` instead and powers off a minute later;
+   the host reads it while VMware Tools still answer, fails the build with that
+   reason, and restores the previous base.
 
 Typical direct use is:
 
@@ -87,6 +91,12 @@ converter prerequisites; VMware Fusion itself remains a manual install.
   passed its guest verification checks.
 - Preserve the v14 rule that guest power-off without a success outcome is an
   infrastructure failure.
+- Fail the guest bootstrap through `Stop-BootstrapWithFailure`, never a bare
+  `shutdown`, so the host can show the reason.
+- A failed rebuild always restores the previous base. `MACTIONS_KEEP_FAILED=1`
+  (the app's "Keep a failed build's disk") only sets the failed disk aside in a
+  `.win11-runner-base.bak.failed-<pid>` directory, which the app removes after
+  the next successful rebuild.
 
 A missing base blocks Windows provisioning, while a stale base can still run
 jobs and only triggers the app's rebuild nudge; recipe-only rebuilds reuse the
@@ -108,6 +118,28 @@ The Swift `WindowsVMCLI` protocol remains as a test seam, with `VMwareCLI` as it
 sole conformer and `scripts/mactions-fusion-vm` as the lifecycle helper.
 
 ## Historical incidents and permanent lessons
+
+### 2026-11-12: PowerShell 7.7 shipped without an MSI
+
+Every rebuild failed about five minutes in with "guest powered off WITHOUT the
+provisioning sentinel". PowerShell v7.7.0, published 2026-11-10, ships no `.msi`
+for Windows (only `.zip` and `.msixbundle`; the whole 7.7 preview line had
+none). `bootstrap.ps1` took `releases/latest`, found no win-arm64 MSI, skipped
+pwsh, and the required-tools gate powered the guest off without the sentinel.
+
+The gate logged its reason only 5 s before powering off, and the host copied the
+guest transcript every 30 s, so the captured log stopped at the runner download,
+before the real error. With "Keep a failed build's disk" on, each failed
+attempt also stayed in place of the base: the app still showed the 2026-11-02
+base as ready while the VM on disk had no snapshot to clone from, and the
+second attempt backed up the first failed disk as the "prior base".
+
+Now pwsh tracks the newest LTS, resolved from PowerShell's `tools/metadata.json`
+`LTSReleaseTag` exactly as actions/runner-images does (7.6 today, the line
+hosted pins), installs from the MSI after checking the release's
+`hashes.sha256`, and falls back to the same release's zip if a future LTS ships
+no MSI. Bootstrap failures report their reason to the host, and a failed
+rebuild always restores the previous base.
 
 ### 2026-07-11: power-off was falsely accepted as success
 

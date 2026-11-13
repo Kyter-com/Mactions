@@ -39,6 +39,39 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'   # PS 5.1 IWR progress bar throttles large -OutFile downloads ~10x
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# Failure channel for the HOST. fusion-windows-base polls for this file through
+# VMware Tools once Tools are up (every ~10s), copies it plus the transcript, and
+# fails the build WITH this reason instead of the bare "powered off WITHOUT the
+# provisioning sentinel". The marker lands after Stop-Transcript, so the copied
+# transcript is complete, and the 60s power-off delay is the same window the
+# sentinel gets. Before this, a failed gate powered off after 5s - sooner than
+# the host's 30s transcript copy - so the 2026-11-12 PowerShell 7 failure reached
+# the app as a transcript that stopped several steps before the real error.
+$FailureMarker = 'C:\setup\logs\bootstrap-failed.txt'
+function Stop-BootstrapWithFailure([string]$Reason) {
+  Write-Warning "Mactions base bootstrap FAILED: $Reason"
+  try { Stop-Transcript | Out-Null } catch { }
+  try {
+    New-Item -ItemType Directory -Force -Path (Split-Path $FailureMarker) | Out-Null
+    Set-Content -LiteralPath $FailureMarker -Value $Reason -Encoding ASCII -Force
+  } catch { }
+  shutdown /s /t 60 /c "Mactions base bootstrap FAILED - see C:\setup\logs\bootstrap-failed.txt"
+  exit 1
+}
+# An error nothing below handles (a required download out of retries, a
+# hosted-parity value that did not persist, no outbound network) used to end the
+# script and leave the VM running until the host's 90-min install timeout, with
+# no reason given. Report it and power off instead. `break` stops the script even
+# if the handler itself fails, rather than resuming after the failed statement.
+trap {
+  Stop-BootstrapWithFailure ("unhandled error: {0}" -f $_.Exception.Message)
+  break
+}
+# Why an optional install (Git, PowerShell 7) failed, carried into the
+# required-tools gate's failure reason so the host shows the cause, not just the
+# missing file.
+$InstallFailures = @()
+
 # Single-run guard. At BUILD time this script is launched by TWO independent paths so a
 # single fragile trigger can't leave the base un-provisioned: the specialize-pass RunOnce
 # (the reliable launcher) and the oobeSystem FirstLogonCommands (fragile on Win11 24H2/25H2
@@ -193,6 +226,7 @@ try {
     Select-Object -First 1
   if (-not $gitAsset) {
     Write-Warning "No PortableGit ARM64 asset in release $($gitRel.tag_name); skipping Git install."
+    $InstallFailures += "Git: no PortableGit ARM64 asset in release $($gitRel.tag_name)"
   } else {
     # Hosted-parity LOCATION (recipe v13): extract to C:\Program Files\Git - the
     # exact layout the official installer produces on GitHub-hosted Windows - so
@@ -289,62 +323,119 @@ try {
   }
 } catch {
   Write-Warning "Git install failed (continuing): $_"
+  $InstallFailures += "Git: $($_.Exception.Message)"
 }
 
-# PowerShell 7 (ARM64) - the official win-arm64 .msi. GitHub Actions' `shell: pwsh`
-# (and actions like azure/trusted-signing-action) need PowerShell 7; Windows ships
-# only PS 5.1. The MSI is the supported UNATTENDED install: `/quiet` is fully silent
-# (no GUI to stall the headless FirstLogonCommands session) and `ADD_PATH=1` puts
-# %ProgramFiles%\PowerShell\7 on the MACHINE PATH, so the runner service resolves
-# `pwsh` on every clone boot - no manual PATH edit (which the zip would require).
-# Resolve the latest release at build time (no pin), same as PortableGit / the
-# runner agent. Inline headers because $ghHeaders isn't defined until the agent
-# section below. Non-fatal: the runner still comes up without it.
-Write-Host 'Installing PowerShell 7 (ARM64, official MSI)...'
+# PowerShell 7 (ARM64). GitHub Actions' `shell: pwsh` (and actions like
+# azure/trusted-signing-action) need PowerShell 7; Windows ships only PS 5.1.
+#
+# Version: the newest LTS, which is what GitHub-hosted Windows images ship.
+# actions/runner-images' Install-PowershellCore.ps1 pins the toolset's pwsh
+# major.minor (7.6 in toolset-2022/2025) and resolves the release from
+# PowerShell's own tools/metadata.json LTSReleaseTag, as below. Recipes <=v14
+# took `releases/latest` instead. That was the 7.6 LTS until v7.7.0 shipped on
+# 2026-11-10 as the first release with NO .msi at all (Windows gets only .zip and
+# .msixbundle), so bootstrap found no MSI, skipped pwsh, and the required-tools
+# gate below refused to stamp the base: every rebuild failed.
+#
+# Installer: the release's win-arm64 MSI, as hosted, checked against the
+# release's hashes.sha256 first, as hosted. `/quiet` is fully silent (no GUI to
+# stall the headless session) and ADD_PATH=1 puts %ProgramFiles%\PowerShell\7 on
+# the MACHINE PATH, so the runner resolves `pwsh` on every clone boot. Should a
+# future LTS ship no MSI either, install its win-arm64 .zip to the same directory
+# with the same MACHINE PATH entry: the same `pwsh` for CI, minus the MSI's
+# registry and Start-menu entries, and an upstream packaging change can't fail the
+# base build again. Inline headers because $ghHeaders isn't defined until the
+# agent section below.
+Write-Host 'Installing PowerShell 7 (ARM64, newest LTS like GitHub-hosted)...'
 try {
-  $pwshRel = Invoke-WithRetry -What 'PowerShell release lookup' {
-    Invoke-RestMethod 'https://api.github.com/repos/PowerShell/PowerShell/releases/latest' `
+  $pwshMeta = Invoke-WithRetry -What 'PowerShell LTS metadata lookup' {
+    Invoke-RestMethod 'https://raw.githubusercontent.com/PowerShell/PowerShell/master/tools/metadata.json' `
+      -Headers @{ 'User-Agent' = 'mactions' }
+  }
+  $pwshVersion = @($pwshMeta.LTSReleaseTag) |
+    Where-Object { $_ -match '^v?\d+\.\d+\.\d+$' } |
+    ForEach-Object { [version]($_ -replace '^v', '') } |
+    Sort-Object -Descending |
+    Select-Object -First 1
+  if (-not $pwshVersion) {
+    throw "no LTS release in PowerShell's tools/metadata.json (LTSReleaseTag: '$($pwshMeta.LTSReleaseTag)')"
+  }
+  $pwshRel = Invoke-WithRetry -What "PowerShell v$pwshVersion release lookup" {
+    Invoke-RestMethod "https://api.github.com/repos/PowerShell/PowerShell/releases/tags/v$pwshVersion" `
       -Headers @{ 'User-Agent' = 'mactions'; 'Accept' = 'application/vnd.github+json' }
   }
-  $pwshAsset = $pwshRel.assets |
-    Where-Object { $_.name -match '^PowerShell-.*-win-arm64\.msi$' } |
-    Select-Object -First 1
+  $pwshMsiAsset = $pwshRel.assets |
+    Where-Object { $_.name -eq "PowerShell-$pwshVersion-win-arm64.msi" } | Select-Object -First 1
+  $pwshZipAsset = $pwshRel.assets |
+    Where-Object { $_.name -eq "PowerShell-$pwshVersion-win-arm64.zip" } | Select-Object -First 1
+  $pwshHashAsset = $pwshRel.assets |
+    Where-Object { $_.name -eq 'hashes.sha256' } | Select-Object -First 1
+  $pwshAsset = if ($pwshMsiAsset) { $pwshMsiAsset } else { $pwshZipAsset }
   if (-not $pwshAsset) {
-    Write-Warning "No win-arm64 .msi in PowerShell release $($pwshRel.tag_name); skipping pwsh install."
-  } else {
-    $pwshMsi = Join-Path $env:TEMP 'powershell-arm64.msi'
-    if (Test-Path $pwshMsi) { Remove-Item $pwshMsi -Force }
-    # Retry - pwsh is REQUIRED (verified before the sentinel below): actions like
-    # azure/trusted-signing-action default to `shell: pwsh`, absent in stock Windows.
-    Invoke-WithRetry -What 'PowerShell 7 download' {
-      Invoke-WebRequest -Uri $pwshAsset.browser_download_url -OutFile $pwshMsi -UseBasicParsing
+    throw "PowerShell v$pwshVersion ships neither PowerShell-$pwshVersion-win-arm64.msi nor .zip"
+  }
+  if (-not $pwshHashAsset) {
+    throw "PowerShell v$pwshVersion has no hashes.sha256 to verify $($pwshAsset.name) against"
+  }
+  $pwshFile = Join-Path $env:TEMP $pwshAsset.name
+  $pwshHashFile = Join-Path $env:TEMP "PowerShell-$pwshVersion-hashes.sha256"
+  Remove-Item -LiteralPath $pwshFile, $pwshHashFile -Force -ErrorAction SilentlyContinue
+  # Retry - pwsh is REQUIRED (verified before the sentinel below).
+  Invoke-WithRetry -What "PowerShell 7 download ($($pwshAsset.name))" {
+    Invoke-WebRequest -Uri $pwshAsset.browser_download_url -OutFile $pwshFile -UseBasicParsing
+  }
+  Invoke-WithRetry -What 'PowerShell hashes.sha256 download' {
+    Invoke-WebRequest -Uri $pwshHashAsset.browser_download_url -OutFile $pwshHashFile -UseBasicParsing
+  }
+  # hashes.sha256 is UTF-16LE with a BOM, one "<sha256> *<file name>" per line;
+  # Get-Content honors the BOM.
+  $pwshExpected = $null
+  foreach ($line in (Get-Content -LiteralPath $pwshHashFile)) {
+    if ($line -match ('^\s*([0-9A-Fa-f]{64})\s+\*?' + [regex]::Escape($pwshAsset.name) + '\s*$')) {
+      $pwshExpected = $Matches[1]
+      break
     }
+  }
+  if (-not $pwshExpected) {
+    throw "hashes.sha256 of PowerShell v$pwshVersion lists no SHA256 for $($pwshAsset.name)"
+  }
+  $pwshActual = (Get-FileHash -LiteralPath $pwshFile -Algorithm SHA256).Hash
+  if ($pwshActual -ne $pwshExpected) {
+    throw "SHA256 mismatch for $($pwshAsset.name): expected $pwshExpected, got $pwshActual"
+  }
+  $pwshDir = Join-Path $env:ProgramFiles 'PowerShell\7'
+  if ($pwshMsiAsset) {
     # /quiet = no UI (safe headless); ADD_PATH=1 = add %ProgramFiles%\PowerShell\7
     # to the MACHINE PATH; /norestart = never reboot mid-build.
     $proc = Start-Process msiexec.exe -Wait -PassThru -ArgumentList `
-      '/i', $pwshMsi, '/quiet', '/norestart', 'ADD_PATH=1'
-    Remove-Item $pwshMsi -Force
+      '/i', $pwshFile, '/quiet', '/norestart', 'ADD_PATH=1'
     if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
-      throw "PowerShell 7 MSI failed with exit code $($proc.ExitCode)"
+      throw "PowerShell 7 MSI ($($pwshAsset.name)) failed with exit code $($proc.ExitCode)"
     }
-    $pwshDir = Join-Path $env:ProgramFiles 'PowerShell\7'
-    $pwshExe = Join-Path $pwshDir 'pwsh.exe'
-    if (-not (Test-Path $pwshExe)) {
-      throw "pwsh.exe not found under $pwshDir after MSI install"
-    }
-    # ADD_PATH=1 already wrote the MACHINE PATH; belt-and-suspenders (idempotent),
-    # exactly like the PortableGit cmd/bin dirs above, so per-clone runner sessions
-    # resolve `pwsh`.
-    $machPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-    if ($machPath -notlike "*$pwshDir*") {
-      $machPath = $machPath.TrimEnd(';') + ';' + $pwshDir
-      [Environment]::SetEnvironmentVariable('Path', $machPath, 'Machine')
-    }
-    $env:Path = $env:Path + ';' + $pwshDir
-    & $pwshExe -NoProfile -Command '$PSVersionTable.PSVersion.ToString()' | Write-Host
+  } else {
+    Write-Host "PowerShell v$pwshVersion ships no win-arm64 MSI; extracting $($pwshAsset.name) to $pwshDir instead."
+    if (Test-Path $pwshDir) { Remove-Item $pwshDir -Recurse -Force }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($pwshFile, $pwshDir)
   }
+  Remove-Item -LiteralPath $pwshFile, $pwshHashFile -Force -ErrorAction SilentlyContinue
+  $pwshExe = Join-Path $pwshDir 'pwsh.exe'
+  if (-not (Test-Path $pwshExe)) {
+    throw "pwsh.exe not found under $pwshDir after installing $($pwshAsset.name)"
+  }
+  # The MSI's ADD_PATH=1 already wrote the MACHINE PATH (the zip relies on this);
+  # idempotent either way, exactly like the PortableGit cmd/bin dirs above.
+  $machPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+  if ($machPath -notlike "*$pwshDir*") {
+    $machPath = $machPath.TrimEnd(';') + ';' + $pwshDir
+    [Environment]::SetEnvironmentVariable('Path', $machPath, 'Machine')
+  }
+  $env:Path = $env:Path + ';' + $pwshDir
+  & $pwshExe -NoProfile -Command '$PSVersionTable.PSVersion.ToString()' | Write-Host
 } catch {
-  Write-Warning "PowerShell 7 install failed (continuing): $_"
+  Write-Warning "PowerShell 7 install failed (continuing; the required-tools gate decides): $_"
+  $InstallFailures += "PowerShell 7: $($_.Exception.Message)"
 }
 
 # --- 1. win-arm64 actions-runner agent --------------------------------------
@@ -828,10 +919,12 @@ foreach ($name in $required.Keys) {
   if (-not (Test-Path $required[$name])) { $missing += ("{0} ({1})" -f $name, $required[$name]) }
 }
 if ($missing.Count) {
-  Write-Warning ("REQUIRED runner tools missing after provisioning: {0}. NOT writing the provisioning sentinel; powering off so the base build fails fast (a transient download failure is the usual cause - re-run the base build)." -f ($missing -join '; '))
-  try { Stop-Transcript | Out-Null } catch { }
-  shutdown /s /t 5 /c "Mactions base bootstrap FAILED: missing required tools/settings"
-  exit 1
+  # NOT writing the provisioning sentinel. The install errors name the cause (a
+  # transient download failure, or an upstream packaging change like PowerShell
+  # 7.7's dropped MSI) so the host's failure banner says why, not just what.
+  $reason = 'required runner tools missing after provisioning: {0}' -f ($missing -join '; ')
+  if ($InstallFailures.Count) { $reason += ' - install errors: {0}' -f ($InstallFailures -join '; ') }
+  Stop-BootstrapWithFailure $reason
 }
 
 $gitSafeDirs = & (Join-Path $env:ProgramFiles 'Git\cmd\git.exe') config --system --get-all safe.directory 2>$null
@@ -859,10 +952,7 @@ if ($agentToolsDirectory -ne 'C:\hostedtoolcache\windows') {
   $missing += "AGENT_TOOLSDIRECTORY Machine env (expected C:\hostedtoolcache\windows, got '$agentToolsDirectory')"
 }
 if ($missing.Count) {
-  Write-Warning ("REQUIRED runner settings missing after provisioning: {0}. NOT writing the provisioning sentinel; powering off so the base build fails fast." -f ($missing -join '; '))
-  try { Stop-Transcript | Out-Null } catch { }
-  shutdown /s /t 5 /c "Mactions base bootstrap FAILED: missing required tools/settings"
-  exit 1
+  Stop-BootstrapWithFailure ('required runner settings missing after provisioning: {0}' -f ($missing -join '; '))
 }
 Write-Host 'Verified required runner tools/settings present: git, bash, pwsh, git safe.directory, GCM_INTERACTIVE, ImageOS, RUNNER_TOOL_CACHE, AGENT_TOOLSDIRECTORY.'
 

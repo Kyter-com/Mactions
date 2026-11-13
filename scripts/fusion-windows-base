@@ -112,6 +112,7 @@ base_files() {
 remove_base_files() { rm -f $(base_files) 2>/dev/null || true; }
 
 BACKUP_DIR=""
+BUILD_STARTED=0   # 1 once this run writes the NEW base's files (after the backup)
 restore_backup() {
   [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]] || return 0
   echo "==> Rebuild failed — restoring the previous base VM '$NAME'" >&2
@@ -119,18 +120,31 @@ restore_backup() {
   mv "$BACKUP_DIR"/* "$FUSION_DIR"/ 2>/dev/null || true
   rm -rf "$BACKUP_DIR"; BACKUP_DIR=""
 }
+# MACTIONS_KEEP_FAILED=1 moves the failed build's files aside for a post-mortem
+# (offline-mount the .vmdk to read C:\setup\logs\bootstrap.log / C:\Windows\Panther)
+# and the prior base is STILL restored. The aside dir keeps the .bak. prefix, so
+# the app reclaims it after the next successful rebuild. Until 2026-11-12 the failed
+# disk stayed in place of the base: the base had no snapshot to clone from while the
+# app still showed the old one as ready, and the next attempt backed up that failed
+# disk as the "prior base", leaving the working one in an older .bak dir nothing
+# restored.
+keep_failed_build() {
+  local kept="${FUSION_DIR}/.${NAME}.bak.failed-$$"
+  rm -rf "$kept"; mkdir -p "$kept"
+  for f in $(base_files); do
+    [[ -e "$f" ]] && mv "$f" "$kept"/ 2>/dev/null || true
+  done
+  echo "==> MACTIONS_KEEP_FAILED set — failed build's disk kept for diagnosis at ${kept}" >&2
+}
 # Restore the prior base on ANY non-zero exit (die, set -e abort, signal) once the
 # backup exists. Success deletes the backup explicitly + exits 0 → no restore.
-# MACTIONS_KEEP_FAILED=1 leaves the failed disk in place instead (for post-mortems —
-# offline-mount it to read C:\setup\logs\bootstrap.log / C:\Windows\Panther).
 on_exit() {
   local rc=$?
   [[ $rc -ne 0 ]] || return 0
-  if [[ -n "${MACTIONS_KEEP_FAILED:-}" ]]; then
-    echo "==> MACTIONS_KEEP_FAILED set — NOT restoring; failed disk kept at ${FUSION_DIR}/${NAME}.vmdk (prior base backed up at ${BACKUP_DIR})." >&2
-  else
-    restore_backup
+  if [[ -n "${MACTIONS_KEEP_FAILED:-}" && $BUILD_STARTED -eq 1 ]]; then
+    keep_failed_build
   fi
+  restore_backup
 }
 trap on_exit EXIT
 
@@ -153,6 +167,7 @@ rm -rf "${FUSION_DIR}/caches" 2>/dev/null || true
 mkdir -p "$FUSION_DIR"
 
 # --- create the NVMe data disk ------------------------------------------------
+BUILD_STARTED=1   # from here on, $NAME's flat files belong to THIS (new) build
 echo "==> Creating ${DISK_GB} GB disk: $DISK"
 # -t 0 = single growable sparse file; -a lsilogic is an advisory descriptor hint
 # (we attach via NVMe in the .vmx, which the proven base does too).
@@ -251,6 +266,12 @@ GUEST_PW="${MACTIONS_GUEST_PW:-P@ssw0rd-throwaway}"   # matches autounattend.xml
 SENTINEL='C:\actions-runner\.mactions-provisioned'
 GUEST_BOOTSTRAP_LOG="${MACTIONS_ROOT}/logs/base-build-bootstrap.log"
 GUEST_BOOTSTRAP_TIMEOUT_LOG="${MACTIONS_ROOT}/logs/base-build-bootstrap-timeout.log"
+# bootstrap.ps1's failure report: it writes the reason here, then powers off
+# after 60s (Stop-BootstrapWithFailure). Read it while Tools are still up, so the
+# build fails with the guest's own reason, not just "no sentinel".
+GUEST_FAILURE_MARKER='C:\setup\logs\bootstrap-failed.txt'
+GUEST_FAILURE=""
+GUEST_FAILURE_SEEN=0
 PROVISIONED=0
 TOOLS_UP=0   # set once a guest-ops call succeeds (VMware Tools running → guest reached bootstrap)
 
@@ -259,6 +280,19 @@ copy_guest_bootstrap_log() {
   mkdir -p "${MACTIONS_ROOT}/logs"
   "$VMRUN" -T fusion -gu "$GUEST_USER" -gp "$GUEST_PW" copyFileFromGuestToHost "$VMX" \
     'C:\setup\logs\bootstrap.log' "$dest" >/dev/null 2>&1
+}
+
+# One line of the guest's failure reason (CR/LF folded), or nothing if the copy
+# failed.
+read_guest_failure() {
+  local tmp reason=""
+  tmp="$(mktemp "${TMPDIR:-/tmp}/mactions-bootstrap-failed.XXXXXX")"
+  if "$VMRUN" -T fusion -gu "$GUEST_USER" -gp "$GUEST_PW" copyFileFromGuestToHost "$VMX" \
+    "$GUEST_FAILURE_MARKER" "$tmp" >/dev/null 2>&1; then
+    reason="$(tr '\r\n' '  ' < "$tmp" | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//')"
+  fi
+  rm -f "$tmp"
+  printf '%s' "$reason"
 }
 
 START="$(date +%s)"
@@ -293,6 +327,23 @@ while vmrun_list_contains "$VMX"; do
       *exist*)         TOOLS_UP=1 ;;   # Tools answered (sentinel not there yet) — bootstrap is running
     esac
   fi
+  if [[ $PROVISIONED -eq 0 && $TOOLS_UP -eq 1 && $GUEST_FAILURE_SEEN -eq 0 ]]; then
+    fout="$("$VMRUN" -T fusion -gu "$GUEST_USER" -gp "$GUEST_PW" fileExistsInGuest "$VMX" "$GUEST_FAILURE_MARKER" 2>/dev/null || true)"
+    if [[ "$fout" == *"file exists"* ]]; then
+      GUEST_FAILURE_SEEN="$NOW"
+      GUEST_FAILURE="$(read_guest_failure)"
+      [[ -n "$GUEST_FAILURE" ]] || GUEST_FAILURE="bootstrap.ps1 reported a failure; see the guest log"
+      echo "    [${ELAPSED}s] guest bootstrap reported a failure: ${GUEST_FAILURE}"
+      copy_guest_bootstrap_log "$GUEST_BOOTSTRAP_LOG" || true
+      LAST_GUEST_LOG_COPY="$NOW"
+    fi
+  fi
+  # The guest powers itself off 60s after reporting a failure; don't wait out the
+  # 90-min install timeout if it somehow doesn't.
+  if [[ $GUEST_FAILURE_SEEN -ne 0 && $((NOW - GUEST_FAILURE_SEEN)) -ge 180 ]]; then
+    "$VMRUN" -T fusion stop "$VMX" hard >/dev/null 2>&1 || true
+    break
+  fi
   if [[ $PROVISIONED -eq 0 && $TOOLS_UP -eq 1 && $((NOW - LAST_GUEST_LOG_COPY)) -ge 30 ]]; then
     # A bootstrap script can fail and power off before the sentinel is ever
     # observed. Copy its live transcript periodically while Tools are available;
@@ -322,6 +373,9 @@ while vmrun_list_contains "$VMX"; do
 done
 
 if [[ $PROVISIONED -eq 0 ]]; then
+  if [[ -n "$GUEST_FAILURE" ]]; then
+    die "guest bootstrap failed: ${GUEST_FAILURE%.} — refusing to snapshot a broken base. Guest log: ${GUEST_BOOTSTRAP_LOG}"
+  fi
   die "guest powered off WITHOUT the provisioning sentinel ($SENTINEL) — Setup/bootstrap did NOT complete. Refusing to snapshot a broken base. Guest log (if captured): ${GUEST_BOOTSTRAP_LOG}; else boot the VM in Fusion or read $FUSION_DIR/vmware.log to diagnose, then re-run."
 fi
 echo "==> Guest powered off after $(( $(date +%s) - START ))s — provisioning verified, install + bootstrap done"

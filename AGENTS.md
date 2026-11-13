@@ -120,6 +120,10 @@ Current contributor invariants:
 - Keep guest PowerShell pure ASCII with a UTF-8 BOM, write the provisioning
   sentinel last, and bump the script and Swift recipe constants together when a
   guest change makes existing bases stale.
+- Fail the guest bootstrap through `Stop-BootstrapWithFailure` so the build fails
+  with the guest's reason, and keep a failed rebuild restoring the previous base
+  even when `MACTIONS_KEEP_FAILED=1` keeps the failed disk (2026-11-12:
+  PowerShell 7.7 dropped its MSI, and every rebuild failed with no reason given).
 - A missing base blocks the Windows fleet, while a stale base remains usable and
   surfaces a rebuild nudge.
 - Workflows must use `runs-on: [self-hosted, Windows, mactions]`; hosted labels
@@ -167,7 +171,7 @@ Friendly by design — no env vars, no hand-copied long tokens.
 
 ```bash
 swift build          # compiles MactionsCore + the app
-swift test           # 360 unit tests (requests, Actions job/run pagination/direct refresh + ETags, device-flow guard, queued-jobs polling, repo lister, scale-from-zero orchestrator + interrupted-job records, launch gate, macOS disk budget, network-change filter + kickable wait, sleep/wake/restart ordering, host budget, shared repo control plane + discovery ledger + parallel discovery polls, cleanup, run-scoped agent teardown, time-limited shell commands, test-only control-plane log, Windows VM command shapes + image/preflight logic, Linux container command shapes + budget + setup-progress + network probe + network anchor + command time limits, RunnerOS labels)
+swift test           # 365 unit tests (requests, Actions job/run pagination/direct refresh + ETags, device-flow guard, queued-jobs polling, repo lister, scale-from-zero orchestrator + interrupted-job records, launch gate, macOS disk budget, network-change filter + kickable wait, sleep/wake/restart ordering, host budget, shared repo control plane + discovery ledger + parallel discovery polls, cleanup, run-scoped agent teardown, time-limited shell commands, test-only control-plane log, Windows VM command shapes + image/preflight logic + base-build failure reporting + failed-rebuild restore, Linux container command shapes + budget + setup-progress + network probe + network anchor + command time limits, RunnerOS labels)
 swift run Mactions   # launches the app for dev
 ```
 

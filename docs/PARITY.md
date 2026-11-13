@@ -181,8 +181,10 @@ just like hosted (appended, so System32's `find`/`sort` still win on both).
   installed (the Azure Trusted Signing fix — see AGENTS.md).
 - **Same-on-both, no action**: Docker/Windows containers/`services:` (GitHub
   doesn't support them on any Windows runner), WSL 1+2, nested virt, zstd.
-- **pwsh tracks latest** (hosted pins 7.4.x); runner agent self-updates in-job
-  if the baked one is stale (seconds).
+- **pwsh tracks the newest LTS**, resolved the way hosted resolves it (7.6
+  today, the line hosted pins). Hosted moves only when its toolset is bumped, so
+  a rebuild right after a new LTS ships can run ahead of hosted for a while.
+  Runner agent self-updates in-job if the baked one is stale (seconds).
 - **tmate-style debugging** would connect (outbound tunnel) but the session is
   bounded by the one-job lifecycle + watchdog, and tmate's win-arm64 binary is
   unverified.

@@ -148,6 +148,10 @@ final class WindowsSetupProgressTests: XCTestCase {
     // The new git/bash/pwsh verification failure is LOCAL (a broken build), NOT transient.
     XCTAssertFalse(WindowsSetupProgress.isLikelyTransientFailure(
       "REQUIRED runner tools missing after provisioning: git (C:\\Program Files\\Git\\cmd\\git.exe)"))
+    // The guest-reported reason fusion-windows-base now fails with (2026-11-12:
+    // PowerShell 7.7 shipped no MSI) is a broken build too, not a network blip.
+    XCTAssertFalse(WindowsSetupProgress.isLikelyTransientFailure(
+      "error: guest bootstrap failed: required runner tools missing after provisioning: pwsh (C:\\Program Files\\PowerShell\\7\\pwsh.exe) - install errors: PowerShell 7: PowerShell v7.7.0 ships neither PowerShell-7.7.0-win-arm64.msi nor .zip — refusing to snapshot a broken base. Guest log: /Users/me/.mactions/logs/base-build-bootstrap.log"))
   }
 }
 

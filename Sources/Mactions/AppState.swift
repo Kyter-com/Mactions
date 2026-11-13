@@ -1701,6 +1701,8 @@ final class AppState: ObservableObject {
             String($0.dropFirst("error: ".count)).trimmingCharacters(in: .whitespaces)
           }
           ?? "the prep script failed"
+        // Most script errors already end in a period; don't print "re-run..".
+        let sentence = detail.hasSuffix(".") ? detail : detail + "."
         // Classify: an upstream/network cause (UUP dump down, a 522) isn't the
         // user's setup and is safe to retry (the ~8 GB download resumes); a local
         // cause (missing tool, Fusion absent) is theirs to fix. Drives a tinted
@@ -1711,11 +1713,11 @@ final class AppState: ObservableObject {
         windowsSetupFailure =
           transient
           ? "The last rebuild hit a transient issue (an upstream service / network blip, or the flaky Win11 OOBE handoff stalling) — not a problem with your Mac or setup. It's safe to retry. (\(detail))"
-          : "The last rebuild failed: \(detail)."
+          : "The last rebuild failed: \(sentence)"
         statusMessage =
           (transient
             ? "Windows rebuild hit a transient issue — safe to retry."
-            : "Windows setup failed: \(detail)")
+            : "Windows setup failed: \(sentence)")
           + (buildLog.map { " Log: \($0)" } ?? "")
       }
     }
