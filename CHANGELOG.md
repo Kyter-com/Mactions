@@ -5,6 +5,8 @@ All notable changes to Mactions are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-12
+
 ### Fixed
 
 - **Rebuilding the Windows base works again.** PowerShell 7.7, released on
